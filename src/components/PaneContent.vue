@@ -51,12 +51,11 @@ function focusCurrentPane() {
   if (props.pane.activeUiId !== null) markTabViewed(props.pane.activeUiId)
 }
 
-// 本 pane 的 ChatView / SessionsView 实例登记进注册表，App.vue 按聚焦 paneId 取用
-// （flashMessage / onLiveAppend / 列表 scrollEl）。子实例挂载后 ref 变化会重登记。
+// 本 pane 的 ChatView 实例登记进注册表，App.vue 按聚焦 paneId 取用
+// （flashMessage / onLiveAppend）。子实例挂载后 ref 变化会重登记。
 const chatView = ref<InstanceType<typeof ChatView> | null>(null)
-const sessionsView = ref<InstanceType<typeof SessionsView> | null>(null)
 watchEffect(() => {
-  registerPaneViews(props.pane.id, { chatView: chatView.value, sessionsView: sessionsView.value })
+  registerPaneViews(props.pane.id, { chatView: chatView.value })
 })
 onUnmounted(() => unregisterPaneViews(props.pane.id))
 
@@ -120,6 +119,21 @@ const liveChatSourceSession = computed<SessionMeta | null>(() => {
   if (!tab || tab.type !== 'chat') return null
   return tab.sourceSession
 })
+/** 列表层此刻是否该露出来 —— 等价于原来那条 v-if 链走到 SessionsView 分支的条件。
+ *
+ * 列表被从链里摘出来单独挂载，靠 v-show 藏：打开会话详情时它只是 display:none，
+ * 不再整个卸载。卸载会把滚动位置连同 DOM 一起丢掉，点回 List 只能事后再"恢复"，
+ * 而这个列表没有虚拟滚动，几十上百张卡的高度在单次 nextTick 时还没稳定，恢复必然
+ * 对不准。不卸载就没有"恢复"这个动作 —— scrollTop 由 WebView 自己保着。
+ * （ChatView 是虚拟化的，display:none 会让它收到 0 高测量，所以那几个分支保持原样。） */
+const showSessionsList = computed(() => {
+  const tab = paneViewTab.value
+  if (tab?.type === 'chat' && liveChat.value) return false
+  if (tab?.type === 'session' && openSession.value) return false
+  if (tab?.type === 'git' && tab.gitCwd) return false
+  return !!props.activeProject
+})
+
 const liveChatMeta = computed<SessionMeta>(() => {
   const c = liveChat.value
   const source = liveChatSourceSession.value
@@ -255,45 +269,47 @@ const liveChatMeta = computed<SessionMeta>(() => {
           @path-change="(p: string | null) => { if (paneViewTab) paneViewTab.gitSelectedPath = p }"
         />
 
-        <SessionsView
-          v-else-if="activeProject"
-          ref="sessionsView"
-          :agent="agent"
-          :project="activeProject"
-          :sessions="sessions"
-          :session-total="sessionTotal"
-          :loading="loadingList"
-          :loading-more="loadingMore"
-          :show-exit-pane="paneCount > 1"
-          @open="actions.openChat"
-          @rename="actions.openRename"
-          @resume="actions.resumeHere"
-          @chat="actions.chatFromList"
-          @archived-block="actions.notifyArchivedBlock"
-          @reveal="actions.reveal"
-          @delete="actions.deleteSession"
-          @copy="actions.copyText"
-          @export="actions.exportFromList"
-          @refresh="actions.refreshSessions"
-          @create-worktree="actions.createWorktree"
-          @new-session="actions.newSession"
-          @new-shell="actions.newShellSession"
-          @exit-pane="actions.exitPane(pane.id)"
-          @load-more="actions.loadMore"
-          @scroll="actions.onListScroll"
-          @batch-delete="actions.batchDeleteSessions"
-          @batch-export="actions.batchExportSessions"
-          @new-gui-session="actions.newGuiSession"
-        />
-
         <WelcomeView
-          v-else
+          v-else-if="!activeProject"
           :agent="agent"
           :projects="projects"
           @select-project="actions.selectProject"
           @switch-agent="actions.switchAgent"
           @open-repo="actions.openRepo"
         />
+
+        <!-- 列表层：选中项目后常驻挂载，只用 v-show 藏（理由见 showSessionsList）。
+             外面这层 div 不能省 —— SessionsView 是多根组件（list-head + 滚动区），
+             v-show 落不到根元素上会静默失效，变成列表和详情一起占着高度。 -->
+        <div v-if="activeProject" v-show="showSessionsList" class="list-layer">
+          <SessionsView
+            :agent="agent"
+            :project="activeProject"
+            :sessions="sessions"
+            :session-total="sessionTotal"
+            :loading="loadingList"
+            :loading-more="loadingMore"
+            :show-exit-pane="paneCount > 1"
+            @open="actions.openChat"
+            @rename="actions.openRename"
+            @resume="actions.resumeHere"
+            @chat="actions.chatFromList"
+            @archived-block="actions.notifyArchivedBlock"
+            @reveal="actions.reveal"
+            @delete="actions.deleteSession"
+            @copy="actions.copyText"
+            @export="actions.exportFromList"
+            @refresh="actions.refreshSessions"
+            @create-worktree="actions.createWorktree"
+            @new-session="actions.newSession"
+            @new-shell="actions.newShellSession"
+            @exit-pane="actions.exitPane(pane.id)"
+            @load-more="actions.loadMore"
+            @batch-delete="actions.batchDeleteSessions"
+            @batch-export="actions.batchExportSessions"
+            @new-gui-session="actions.newGuiSession"
+          />
+        </div>
       </div>
 
       <!-- TUI 层 -->

@@ -75,7 +75,6 @@ const emit = defineEmits<{
   /** 退出当前分屏格子（关闭并释放该格所有 tab）。 */
   (e: 'exit-pane'): void
   (e: 'load-more'): void
-  (e: 'scroll', scrollTop: number): void
   /** 批量删除：原本由 SessionsTopbar 触发，现已挪到 list-head 顶栏里。 */
   (e: 'batch-delete'): void
   /** 批量导出：同上。 */
@@ -478,9 +477,9 @@ function markScrolling() {
 // 在加载状态切换的间隙里重复触发。loadingMore / 全部加载完 也各有一道 guard。
 let loadLockUntil = 0
 
-// 滚动 → 一帧最多触发一次：
-//   - emit('scroll', …) 用于父组件持久化滚动位置
-//   - 接近底部 (<280px) 且没在加载、没全部加载完、且不在 300ms 锁内时 load-more
+// 滚动 → 一帧最多触发一次：接近底部 (<280px) 且没在加载、没全部加载完、
+// 且不在 300ms 锁内时 load-more。
+// 滚动位置不用往上报：列表不再卸载，scrollTop 由 WebView 自己保着。
 let scrollRaf = 0
 function onScroll(e: Event) {
   markScrolling()
@@ -488,7 +487,6 @@ function onScroll(e: Event) {
   const el = e.target as HTMLElement
   scrollRaf = requestAnimationFrame(() => {
     scrollRaf = 0
-    emit('scroll', el.scrollTop)
     if (props.loadingMore) return
     if (props.sessions.length >= props.sessionTotal) return
     if (Date.now() < loadLockUntil) return
@@ -597,8 +595,6 @@ function onNewMenuDocClick(e: MouseEvent) {
 }
 onMounted(() => document.addEventListener('click', onNewMenuDocClick))
 onUnmounted(() => document.removeEventListener('click', onNewMenuDocClick))
-
-defineExpose({ scrollEl })
 </script>
 
 <template>
@@ -780,7 +776,11 @@ defineExpose({ scrollEl })
       </template>
     </div>
   </div>
-  <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
+  <!-- 只在"手上什么都没有"时才用 loading 占位顶掉列表：占位一出现，
+       .scroll-area 就被销毁重建，滚动位置随之清零。刷新（点回 List / 手动刷新 /
+       全局 refreshAll）时列表里本来就有数据，原地换内容即可，不该闪一下再回到顶部。
+       切项目时 selectProject 会先把 sessions 清空，于是这里照旧显示占位。 -->
+  <div v-if="loading && !sessions.length" class="loading">{{ t('common.loading') }}</div>
   <div v-else-if="!sessions.length" class="empty" @contextmenu.prevent="openContextMenu">
     <div class="big"><IconInbox /></div>
     <div>{{ t('list.empty') }}</div>

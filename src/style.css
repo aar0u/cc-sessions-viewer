@@ -5141,6 +5141,15 @@ body.is-tab-reordering * {
   visibility: hidden;
   pointer-events: none;
 }
+/* 列表层：SessionsView 是多根组件，v-show 需要一层单根宿主来承载 display:none。
+   排布必须和 .view-layer 一模一样，好让 .list-head + .scroll-area 两个子节点的
+   flex 行为跟没套这层时完全一致。 */
+.list-layer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .tui-layer {
   position: absolute;
   inset: 0;

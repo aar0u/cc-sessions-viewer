@@ -320,7 +320,6 @@ async function refreshAll() {
       }).catch(() => {}),
     )
   } else if (activeDir.value) {
-    const keepScroll = listScrollEl.value?.scrollTop ?? savedListScroll
     // 保留当前已加载数量，避免分页回退
     const n = Math.max(sessions.value.length, PAGE_SIZE)
     const scope = sessionScope()
@@ -331,9 +330,6 @@ async function refreshAll() {
           if (sessionScope() !== scope) return
           sessions.value = page.sessions
           sessionTotal.value = page.total
-          nextTick(() => {
-            if (listScrollEl.value) listScrollEl.value.scrollTop = keepScroll
-          })
         })
         .catch(() => {}),
     )
@@ -529,10 +525,6 @@ const sessionStatsFrom = ref<'chat' | 'global' | null>(null)
 const focusedPaneViews = computed(() => paneViewsOf(focusedPane.value?.id))
 const chatViewRef = computed(() => focusedPaneViews.value?.chatView ?? null)
 const sidebarRef = ref<InstanceType<typeof Sidebar> | null>(null)
-const listScrollEl = computed<HTMLElement | undefined>(
-  () => focusedPaneViews.value?.sessionsView?.scrollEl,
-)
-let savedListScroll = 0
 const TUI_TITLE_SYNC_INTERVAL_MS = 4000
 let tuiTitleSyncTimer = 0
 let syncingTuiTitles = false
@@ -560,11 +552,6 @@ watch(openSession, (val, old) => {
         api.watchSession(tab.agent, val.path, tab.msgs.length).catch(() => {})
       }
     }
-  }
-  if (!val && old) {
-    nextTick(() => {
-      if (listScrollEl.value) listScrollEl.value.scrollTop = savedListScroll
-    })
   }
 })
 
@@ -1715,7 +1702,6 @@ async function selectProject(dir: string, opts: { activateTerminal?: boolean } =
   }
   sessions.value = []
   sessionTotal.value = 0
-  savedListScroll = 0
   resetSessionsToolbar()
   loadingList.value = true
   const scope = sessionScope(dir)
@@ -1758,10 +1744,6 @@ async function loadMore() {
   } finally {
     loadingMore.value = false
   }
-}
-
-function onListScroll(scrollTop: number) {
-  savedListScroll = scrollTop
 }
 
 // 一次性把当前项目剩余的会话全部拉进来。分页窗口只覆盖已滚动到的部分，
@@ -4523,7 +4505,6 @@ provide<PaneActions>(PaneActionsKey, {
   splitV: () => splitFocusedPane('col'),
   openGitChanges: openGitChangesTab,
   loadMore,
-  onListScroll,
   batchDeleteSessions,
   batchExportSessions,
   selectProject,
