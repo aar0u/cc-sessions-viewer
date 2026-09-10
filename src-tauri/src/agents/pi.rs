@@ -567,9 +567,11 @@ fn image_src(value: &Value) -> Option<String> {
         }
     }
     let source = value.get("source").unwrap_or(value);
+    // Pi 的内联图片块用 `mimeType`；它同时也会写 Anthropic 形状的 `source.media_type`。
     let media = source
         .get("media_type")
         .or_else(|| source.get("mediaType"))
+        .or_else(|| source.get("mimeType"))
         .and_then(Value::as_str)
         .unwrap_or("image/png");
     let data = source.get("data").and_then(Value::as_str)?;
@@ -580,6 +582,90 @@ fn image_src(value: &Value) -> Option<String> {
         Some(data.to_string())
     } else {
         Some(format!("data:{media};base64,{data}"))
+    }
+}
+
+/// Pi 贴图时只把 `$TMPDIR` 里的文件路径写进 user 消息，图片字节本身不落进会话；而 macOS
+/// 每三天清一次那个目录（`com.apple.bsd.dirhelper` 的 `CLEAN_FILES_OLDER_THAN_DAYS=3`），
+/// 旧会话再打开时那条路径已经指向空气。
+///
+/// 但图并没有真丢：Pi 随后必定对同一条路径调 `read` 工具，工具结果里带着完整 base64。
+/// 这里把整份会话里 `read` 的「入参路径 → 图片」配成对，供
+/// `recover_missing_clipboard_images` 回填。用 `parsed.entries` 而不是当前分支，
+/// 这样 fork 出来的分支也能借到另一支读到的那张图 —— 路径是绝对路径，不会认错人。
+fn read_tool_images_by_path(entries: &[PiEntry]) -> HashMap<String, String> {
+    let mut path_by_call: HashMap<&str, &str> = HashMap::new();
+    let mut images: HashMap<String, String> = HashMap::new();
+    for entry in entries {
+        let Some(message) = entry.value.get("message") else {
+            continue;
+        };
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        match message.get("role").and_then(Value::as_str).unwrap_or("") {
+            "assistant" => {
+                for item in content {
+                    if item.get("type").and_then(Value::as_str) != Some("toolCall")
+                        || item.get("name").and_then(Value::as_str) != Some("read")
+                    {
+                        continue;
+                    }
+                    let (Some(id), Some(path)) = (
+                        item.get("id").and_then(Value::as_str),
+                        item.pointer("/arguments/path").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    path_by_call.insert(id, path);
+                }
+            }
+            "toolResult" => {
+                let Some(path) = message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .and_then(|call_id| path_by_call.get(call_id))
+                else {
+                    continue;
+                };
+                let Some(src) = content
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+                    .find_map(image_src)
+                else {
+                    continue;
+                };
+                images.entry((*path).to_string()).or_insert(src);
+            }
+            _ => {}
+        }
+    }
+    images
+}
+
+/// 把文件已消失的贴图块换成 Pi 自己 `read` 回来的那份字节（理由见
+/// `read_tool_images_by_path`）。补不上的照旧留着 `image_unavailable`，界面显示占位卡。
+/// 换进去的是 `data:` URL，命令层的 `image_cache::externalize` 会照常把它落盘。
+fn recover_missing_clipboard_images(messages: &mut [Msg], images: &HashMap<String, String>) {
+    if images.is_empty() {
+        return;
+    }
+    for message in messages {
+        for block in &mut message.blocks {
+            if block.kind != "image" || block.image_unavailable != Some(true) {
+                continue;
+            }
+            let recovered = block
+                .image_src
+                .as_deref()
+                .and_then(|path| images.get(path))
+                .cloned();
+            let Some(src) = recovered else {
+                continue;
+            };
+            block.image_src = Some(src);
+            block.image_unavailable = None;
+        }
     }
 }
 
@@ -1557,6 +1643,11 @@ impl SessionSource for PiSource {
         // text. Reuse the shared attachment pass used by Kimi/Claude/Codex so
         // those paths become image blocks and [Image #N] placeholders.
         crate::util::post_process_session_msgs(&mut messages);
+        // 贴图文件常已被系统清掉，只剩死路径；用 Pi 自己 read 回来的字节补上。
+        recover_missing_clipboard_images(
+            &mut messages,
+            &read_tool_images_by_path(&parsed.entries),
+        );
         // Image extraction can move a leading absolute clipboard path out of
         // the text block. Run skill normalization once more so an image + skill
         // prompt follows the same compact rendering as a plain skill prompt.
@@ -2481,6 +2572,122 @@ Use tmux-bridge for pane control.
         assert_eq!(
             messages[0].blocks[1].text.as_deref(),
             Some("hihhi [Image #1] 无需读取图片，直接回答我hi即可")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovers_a_purged_clipboard_image_from_the_read_tool_result() {
+        // 贴图文件被 macOS 清掉后只剩死路径，但 Pi 随后 read 过它，字节还在会话里。
+        let root = temp_root("clipboard-purged");
+        let image = root.join("clipboard-2026-09-06-195215-7AF250C3.png");
+        // 故意不写这个文件 —— 就是被系统清掉之后的样子。
+        let path = write_session(
+            &root,
+            "purged.jsonl",
+            &[
+                header(3, "purged-session", "/tmp/project"),
+                serde_json::json!({
+                    "type":"message","id":"u1",
+                    "message":{"role":"user","content":[
+                        {"type":"text","text":format!("{} 这个是不是要撤回？", image.display())}
+                    ]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"a1","parentId":"u1",
+                    "message":{"role":"assistant","content":[
+                        {"type":"toolCall","id":"call_read_1","name":"read",
+                         "arguments":{"path":image.to_str().unwrap()}}
+                    ]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"r1","parentId":"a1",
+                    "message":{"role":"toolResult","toolCallId":"call_read_1","toolName":"read","content":[
+                        {"type":"text","text":"Read image file [image/png]"},
+                        {"type":"image","data":"AQID","mimeType":"image/png"}
+                    ]}
+                }),
+            ],
+        );
+        let messages = PiSource
+            .read_session_at(path.to_str().unwrap(), None)
+            .unwrap();
+        let block = &messages[0].blocks[0];
+        assert_eq!(block.kind, "image");
+        assert_eq!(
+            block.image_src.as_deref(),
+            Some("data:image/png;base64,AQID")
+        );
+        assert_eq!(block.image_unavailable, None);
+        assert_eq!(block.inline_placeholder.as_deref(), Some("[Image #1]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeps_a_purged_clipboard_image_unavailable_when_nothing_read_it() {
+        // 没有对应的 read 工具结果就补不回来；此时必须老实标记不可用，不能张冠李戴。
+        let root = temp_root("clipboard-unrecoverable");
+        let image = root.join("clipboard-2026-09-06-195232-6EFC4201.png");
+        let other = root.join("clipboard-2026-09-06-195215-7AF250C3.png");
+        let path = write_session(
+            &root,
+            "unrecoverable.jsonl",
+            &[
+                header(3, "unrecoverable-session", "/tmp/project"),
+                serde_json::json!({
+                    "type":"message","id":"u1",
+                    "message":{"role":"user","content":[
+                        {"type":"text","text":format!("{} 看看这个", image.display())}
+                    ]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"a1","parentId":"u1",
+                    "message":{"role":"assistant","content":[
+                        {"type":"toolCall","id":"call_read_1","name":"read",
+                         "arguments":{"path":other.to_str().unwrap()}}
+                    ]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"r1","parentId":"a1",
+                    "message":{"role":"toolResult","toolCallId":"call_read_1","toolName":"read","content":[
+                        {"type":"image","data":"AQID","mimeType":"image/png"}
+                    ]}
+                }),
+            ],
+        );
+        let messages = PiSource
+            .read_session_at(path.to_str().unwrap(), None)
+            .unwrap();
+        let block = &messages[0].blocks[0];
+        assert_eq!(block.kind, "image");
+        assert_eq!(block.image_src.as_deref(), image.to_str());
+        assert_eq!(block.image_unavailable, Some(true));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn honors_the_pi_mime_type_key_on_inline_images() {
+        // Pi 的内联图片块写的是 `mimeType`；认成默认的 image/png 会让 JPEG 带错标注。
+        let root = temp_root("inline-mime-type");
+        let path = write_session(
+            &root,
+            "mime.jsonl",
+            &[
+                header(3, "mime-session", "/tmp/project"),
+                serde_json::json!({
+                    "type":"message","id":"u1",
+                    "message":{"role":"user","content":[
+                        {"type":"image","data":"AQID","mimeType":"image/jpeg"}
+                    ]}
+                }),
+            ],
+        );
+        let messages = PiSource
+            .read_session_at(path.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            messages[0].blocks[0].image_src.as_deref(),
+            Some("data:image/jpeg;base64,AQID")
         );
         let _ = fs::remove_dir_all(root);
     }
