@@ -532,8 +532,9 @@ fn claude_runtime_info() -> Result<ClaudeRuntimeInfo, String> {
 }
 
 /// Codex 运行时信息：检测是否通过第三方 API key / 自定义端点使用（config.toml 里
-/// `model_provider` 为 "custom" 或存在 `[model_providers.*]` 配置）。前端据此隐藏
-/// 仅官方订阅可用的模型（如 GPT-5.3-Codex-Spark）。
+/// `model_provider` 为 "custom" 或存在 `[model_providers.*]` 配置）。自定义 provider 下
+/// 新会话的初始模型 / effort 取自用户自己的 config.toml，而不是内置模型菜单
+/// —— 那份菜单只对官方端点成立。
 #[tauri::command]
 fn codex_runtime_info() -> CodexRuntimeInfo {
     let config_path = util::home().join(".codex").join("config.toml");

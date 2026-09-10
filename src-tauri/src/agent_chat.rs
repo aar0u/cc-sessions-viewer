@@ -1108,7 +1108,7 @@ mod codex_side_tests {
             "source-thread",
             "/workspace/app",
             "approve",
-            Some("gpt-5.4"),
+            Some("gpt-5.5"),
             true,
             None,
             true,
@@ -1116,7 +1116,7 @@ mod codex_side_tests {
 
         assert_eq!(params["threadId"], "source-thread");
         assert_eq!(params["cwd"], "/workspace/app");
-        assert_eq!(params["model"], "gpt-5.4");
+        assert_eq!(params["model"], "gpt-5.5");
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["excludeTurns"], true);
         assert!(params.get("lastTurnId").is_none());

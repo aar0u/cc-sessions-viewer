@@ -299,8 +299,10 @@ describe('SessionsView', () => {
         },
       })
       // 目录已不存在 → 新建会话 / 刷新都没意义；单格（showExitPane 未传）也无「退出分屏」。
-      // 没有会话 (sessions=[]) → 「批量选择」入口也不渲染 → 顶栏动作区为空。
-      expect(wrapper.findAll('.list-head-actions .icon-btn')).toHaveLength(0)
+      // 没有会话 (sessions=[]) → 「批量选择」入口也不渲染。
+      // 只剩水平/垂直分屏两个 —— 分屏是格子布局操作，跟项目目录在不在无关
+      // （TerminalStrip 里那两个同样不看 project.exists），目录丢了照样能拆格子去开别的项目。
+      expect(wrapper.findAll('.list-head-actions .icon-btn')).toHaveLength(2)
       expect(wrapper.find('.list-head-actions .new-menu-wrap').exists()).toBe(false)
       expect(wrapper.find('.list-head-actions .icon-btn[aria-label^="Reload"]').exists()).toBe(
         false,

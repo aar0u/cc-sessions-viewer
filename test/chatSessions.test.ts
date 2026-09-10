@@ -559,7 +559,7 @@ describe('chatSessions Codex custom provider compatibility', () => {
         {
           role: 'assistant',
           sidechain: false,
-          model: 'gpt-5.4',
+          model: 'gpt-5.6-luna',
           blocks: [{ kind: 'text', text: 'older', isError: false }],
         },
       ],
@@ -567,7 +567,7 @@ describe('chatSessions Codex custom provider compatibility', () => {
 
     expect(s.model).toBe('gpt-5.5')
     expect(s.effort).toBe('high')
-    expect(s.lastModel).toBe('gpt-5.4')
+    expect(s.lastModel).toBe('gpt-5.6-luna')
     expect(invokeMock).not.toHaveBeenCalledWith('codex_runtime_info')
     expect(invokeMock).toHaveBeenCalledWith(
       'agent_chat_start',
@@ -607,7 +607,7 @@ describe('reconnectChats — restored live messages', () => {
         turnState: 'idle',
         turnStartedAtMs: null,
         permissionMode: 'approve',
-        model: 'gpt-5.4',
+        model: 'gpt-5.6-luna',
         effort: 'high',
         processModel: 'codexAppServer',
       },
@@ -616,8 +616,8 @@ describe('reconnectChats — restored live messages', () => {
     const [session] = await reconnectChats()
 
     expect(session.msgs[0].timestamp).toBe('2026-07-09T12:58:00.000Z')
-    expect(session.msgs[0].model).toBe('gpt-5.4')
-    expect(session.lastModel).toBe('gpt-5.4')
+    expect(session.msgs[0].model).toBe('gpt-5.6-luna')
+    expect(session.lastModel).toBe('gpt-5.6-luna')
   })
 })
 

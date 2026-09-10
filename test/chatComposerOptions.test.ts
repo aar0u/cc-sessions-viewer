@@ -184,7 +184,7 @@ describe('chatComposerOptions', () => {
     expect(effortLevelsFor('claude', 'claude-opus-4-6')).toEqual(base)
     expect(effortLevelsFor('claude', 'claude-sonnet-5')).toEqual(base)
     expect(effortLevelsFor('claude', undefined)).toEqual(base)
-    expect(effortLevelsFor('codex', 'gpt-5.4')).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(effortLevelsFor('codex', 'gpt-5.5')).toEqual(['low', 'medium', 'high', 'xhigh'])
     expect(effortLevelsFor('codex', 'gpt-5.6-luna')).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     expect(effortLevelsFor('codex', 'gpt-5.6-terra')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
     expect(effortLevelsFor('codex', 'gpt-5.6-sol')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
@@ -229,7 +229,7 @@ describe('chatComposerOptions', () => {
 
   it('Codex: 权限模式无禁用限制', () => {
     expect(permissionModeDisabled('codex', 'fullAccess', 'gpt-5.5')).toBe(false)
-    expect(permissionModeDisabled('codex', 'ask', 'gpt-5.4')).toBe(false)
+    expect(permissionModeDisabled('codex', 'ask', 'gpt-5.6-luna')).toBe(false)
   })
 
   it('fallbackPermissionMode：Claude Haiku+auto → bypassPermissions，其余原样返回', () => {
@@ -247,7 +247,7 @@ describe('chatComposerOptions', () => {
     expect(defaultEffort('codex')).toBe('high')
   })
 
-  it('Codex 模型列表：6-astra 为首、旧模型在 More', () => {
+  it('Codex 模型列表：与 codex-cli model/list 一致，无 More 分组', () => {
     expect(CHAT_MODEL_MENU.codex.primary.map((m) => m.value)).toEqual([
       'gpt-6-astra',
       'gpt-5.6-sol',
@@ -255,18 +255,14 @@ describe('chatComposerOptions', () => {
       'gpt-5.6-luna',
       'gpt-5.5',
     ])
-    expect(CHAT_MODEL_MENU.codex.more.map((m) => m.value)).toEqual([
-      'gpt-5.4',
-      'gpt-5.4-mini',
-      'gpt-5.3-codex-spark',
-    ])
+    expect(CHAT_MODEL_MENU.codex.more).toEqual([])
     expect(CHAT_MODEL_MENU.codex.showFastMode).toBe(false)
   })
 
   it('Codex modelLabel 返回展示名', () => {
     expect(modelLabel('codex', 'gpt-6-astra')).toBe('GPT-6-Astra')
     expect(modelLabel('codex', 'gpt-5.5')).toBe('GPT-5.5')
-    expect(modelLabel('codex', 'gpt-5.4-mini')).toBe('GPT-5.4-Mini')
+    expect(modelLabel('codex', 'gpt-6-astra')).toBe('GPT-6-Astra')
     expect(modelLabel('codex', 'unknown-model')).toBe('unknown-model')
   })
 
@@ -291,17 +287,23 @@ describe('chatComposerOptions', () => {
       expect(sanitizeModel('codex', 'gpt-5.3-codex')).toBe('gpt-5.5')
     })
 
+    it('codex 已下架的 5.4 系列 / codex-spark → 回退 gpt-5.5', () => {
+      expect(sanitizeModel('codex', 'gpt-5.4')).toBe('gpt-5.5')
+      expect(sanitizeModel('codex', 'gpt-5.4-mini')).toBe('gpt-5.5')
+      expect(sanitizeModel('codex', 'gpt-5.3-codex-spark')).toBe('gpt-5.5')
+    })
+
     it('codex 任意不在菜单的模型 → 回退 gpt-5.5(= defaultModel)', () => {
       expect(sanitizeModel('codex', 'gpt-4o')).toBe(defaultModel('codex'))
       expect(sanitizeModel('codex', 'totally-unknown')).toBe('gpt-5.5')
     })
 
-    it('codex 在菜单内的模型原样保留(primary 与 more 都算)', () => {
+    it('codex 在菜单内的模型原样保留', () => {
       expect(sanitizeModel('codex', 'gpt-6-astra')).toBe('gpt-6-astra')
       expect(sanitizeModel('codex', 'gpt-5.6-sol')).toBe('gpt-5.6-sol')
+      expect(sanitizeModel('codex', 'gpt-5.6-terra')).toBe('gpt-5.6-terra')
+      expect(sanitizeModel('codex', 'gpt-5.6-luna')).toBe('gpt-5.6-luna')
       expect(sanitizeModel('codex', 'gpt-5.5')).toBe('gpt-5.5')
-      expect(sanitizeModel('codex', 'gpt-5.4-mini')).toBe('gpt-5.4-mini')
-      expect(sanitizeModel('codex', 'gpt-5.3-codex-spark')).toBe('gpt-5.3-codex-spark')
     })
 
     it('claude 不在菜单的模型 → 回退 opus-5', () => {

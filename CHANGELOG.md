@@ -6,6 +6,33 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [v0.3.27]
+
+### Features
+
+- **Turn-status hook reset** — Settings can now remove the turn-status hooks this app installed into Claude, Codex, AGY, Grok Build, Kimi Code, and Pi configurations, leaving hooks you wrote yourself untouched.
+- **Storage panel** — per-location disk usage for Viewer-owned data, with reveal-in-Finder and confirmation-gated clearing.
+- **Runtime diagnostics panel** — live resident memory and per-cache attribution for tracking down growth.
+- **Trash retention** — deleted sessions are purged after 30 days by default, announced by a notice before the first purge runs.
+- **Split-pane buttons in the session list** — horizontal and vertical split are now reachable from the list header. They previously lived only in the tab strip, which is hidden while a project has no open tabs.
+
+### Improvements
+
+- **Codex session lists load about 20x faster** — listing a project dropped from roughly 800ms to under 40ms. The `codex app-server` subprocess and JSON-RPC handshake behind the list-rank badge ran on every single list call for a snapshot that is global rather than per-project; it is now fetched once and refreshed in the background. `(mtime, size)` fingerprint caches keep the list from reopening every rollout file on disk.
+- **Codex chat model list matches the CLI** — GPT-5.4, GPT-5.4-Mini, and GPT-5.3-Codex-Spark have been delisted by Codex and are no longer offered. Sessions that remember one of them fall back to GPT-5.5.
+- **Bounded caches and off-thread I/O** — Shiki highlighting is limited by byte size and its cache capped by bytes rather than entry count, inline base64 images moved out of the JS heap into an on-disk image cache, backend global caches are bounded, and heavy I/O commands run off the main thread.
+- **Quieter background work** — tray rescans, desktop-pet IPC, and cross-window event broadcasts are throttled; watcher polling threads are capped and `session:reset` storms coalesced.
+
+### Bug Fixes
+
+- **Memory growth to 24GB and unbounded disk usage** — inactive view tabs are evicted to a snapshot instead of keeping whole transcripts resident, temp clipboard images are reclaimed, and `turn-signals.jsonl` and `panic.log` now rotate.
+- **Session-list scroll position** — returning to the list from a session detail keeps your place. The list is no longer unmounted when a session opens, and a refresh that already has data swaps content in place instead of rebuilding the scroll container.
+- **Switching projects while a list is loading** — a slower project's response can no longer overwrite the project you switched to; list writes are scoped to the agent and project that requested them.
+
+### Tests
+
+- Added coverage for turn-status hook removal round-trips, the Codex fallback for delisted models, and session-list header actions.
+
 ## [v0.3.26]
 
 ### Features

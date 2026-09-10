@@ -34,6 +34,8 @@ import {
   IconSelect,
   IconClose,
   IconExitPane,
+  IconSplitH,
+  IconSplitV,
   IconChat,
   IconGitBranch,
 } from '../components/icons'
@@ -764,6 +766,22 @@ onUnmounted(() => document.removeEventListener('click', onNewMenuDocClick))
           @click="emit('refresh')"
         >
           <IconRefresh />
+        </button>
+        <!-- 分屏：TerminalStrip 里也有这两个，但那条 strip 只在本格子有 tab 时才渲染，
+             纯列表态（刚选中项目、一个 tab 都没开）根本看不到，所以这里补一份。 -->
+        <button
+          class="icon-btn"
+          v-tooltip="t('pane.splitH')"
+          @click="pickSplitH"
+        >
+          <IconSplitH />
+        </button>
+        <button
+          class="icon-btn"
+          v-tooltip="t('pane.splitV')"
+          @click="pickSplitV"
+        >
+          <IconSplitV />
         </button>
         <button
           v-if="showExitPane"

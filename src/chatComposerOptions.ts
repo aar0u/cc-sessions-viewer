@@ -30,7 +30,6 @@ export interface ModelMenuConfig {
 export interface ModelMenuOptions {
   claudeAliasMode?: boolean
   claudeAliasTargets?: Partial<Record<'opus' | 'sonnet' | 'haiku' | 'fable', string>>
-  codexApiKeyMode?: boolean
 }
 
 /** 该 agent 是否支持 GUI chat。入口 v-if / quick-open 守卫统一用此函数。 */
@@ -69,11 +68,10 @@ export const CHAT_MODEL_MENU: Record<Agent, ModelMenuConfig> = {
       { value: 'gpt-5.6-luna', label: 'GPT-5.6-Luna' },
       { value: 'gpt-5.5', label: 'GPT-5.5' },
     ],
-    more: [
-      { value: 'gpt-5.4', label: 'GPT-5.4' },
-      { value: 'gpt-5.4-mini', label: 'GPT-5.4-Mini' },
-      { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark' },
-    ],
+    // 上面这 5 个就是全部：codex-cli 0.154.0 的 `model/list` 只返回它们。
+    // 5.4 系列与 5.3-codex-spark 均已被 Codex 下架（spark 连字符串都不在 CLI 二进制里了），
+    // 选中会被 CLI 拒。旧会话记着的已下架模型由 sanitizeModel 回退到 defaultModel。
+    more: [],
     showFastMode: false,
   },
   agy: { unavailable: [], primary: [], more: [], showFastMode: false },
@@ -102,13 +100,6 @@ function withAliasTargetLabel(base: ModelOption, target?: string): ModelOption {
   return { ...base, label: `${base.label} (${clean})` }
 }
 
-/** 仅官方订阅可用的 Codex 模型 —— API key / 第三方端点模式下从菜单隐藏。 */
-const CODEX_SUBSCRIPTION_ONLY = new Set(['gpt-5.3-codex-spark'])
-
-export function codexIsSubscriptionOnly(model: string): boolean {
-  return CODEX_SUBSCRIPTION_ONLY.has(model)
-}
-
 export function modelMenuFor(agent: Agent, opts: ModelMenuOptions = {}): ModelMenuConfig {
   if (agent === 'claude' && opts.claudeAliasMode) {
     return {
@@ -121,12 +112,7 @@ export function modelMenuFor(agent: Agent, opts: ModelMenuOptions = {}): ModelMe
       ),
     }
   }
-  const base = CHAT_MODEL_MENU[agent]
-  if (agent === 'codex' && opts.codexApiKeyMode) {
-    const hide = (arr: ModelOption[]) => arr.filter((m) => !CODEX_SUBSCRIPTION_ONLY.has(m.value))
-    return { ...base, primary: hide(base.primary), more: hide(base.more) }
-  }
-  return base
+  return CHAT_MODEL_MENU[agent]
 }
 
 function claudeKnownModels(): ModelOption[] {
