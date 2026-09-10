@@ -214,10 +214,25 @@ fn install_bundled_codex_pets(output_directory: &Path) -> Result<(), String> {
             .map(|bytes| validate_spritesheet(&bytes, 2).is_ok())
             .unwrap_or(false);
         if !existing_is_valid {
-            fs::write(spritesheet, bundled_spritesheet).map_err(|error| error.to_string())?;
+            write_if_changed(&spritesheet, bundled_spritesheet)?;
         }
     }
     Ok(())
+}
+
+/// 内容一致就不写盘。
+///
+/// `desktop_pet_catalog` 每次被调用都会走一遍导入，而这些 spritesheet 加起来有 11 MB：
+/// 无条件重写等于每次打开宠物设置都把 11 MB 重新落一遍盘（SSD 写放大 + 目录 mtime 抖动）。
+/// 先比长度、再比内容 —— 长度不同就不必读整个文件了。
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool, String> {
+    let unchanged = fs::metadata(path).is_ok_and(|meta| meta.len() == bytes.len() as u64)
+        && fs::read(path).is_ok_and(|existing| existing == bytes);
+    if unchanged {
+        return Ok(false);
+    }
+    fs::write(path, bytes).map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 fn import_codex_pets(asar_path: &Path, output_directory: &Path) -> Result<(), String> {
@@ -234,8 +249,7 @@ fn import_codex_pets(asar_path: &Path, output_directory: &Path) -> Result<(), St
 
         let pet_directory = output_directory.join(id);
         fs::create_dir_all(&pet_directory).map_err(|error| error.to_string())?;
-        fs::write(pet_directory.join("spritesheet.webp"), bytes)
-            .map_err(|error| error.to_string())?;
+        write_if_changed(&pet_directory.join("spritesheet.webp"), &bytes)?;
     }
     Ok(())
 }
@@ -642,6 +656,30 @@ mod tests {
             let installed = fs::read(directory.join(id).join("spritesheet.webp")).unwrap();
             assert_eq!(installed, *bundled_spritesheet);
         }
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn write_if_changed_skips_an_identical_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "cc-sessions-viewer-write-if-changed-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("spritesheet.webp");
+
+        assert!(write_if_changed(&path, b"sheet").unwrap());
+        let written = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // 内容一致 —— 不写盘，mtime 保持不动。
+        assert!(!write_if_changed(&path, b"sheet").unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written);
+
+        // 长度相同但内容不同的也要认出来。
+        assert!(write_if_changed(&path, b"other").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"other");
 
         let _ = fs::remove_dir_all(directory);
     }

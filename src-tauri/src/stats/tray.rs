@@ -8,12 +8,143 @@
 // daily timeline 等高开销维度。大约比 stream::run_worker 快 2–3×。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{Datelike, Duration as CDuration, Local, TimeZone};
 
 use crate::agents;
 use crate::types::{TrayAgentSummary, TrayStats};
+
+// ============================ 按 (path, mtime) 缓存的逐调用记录 ============================
+//
+// 托盘每 5 分钟重算一次，原实现每次都把「近 30 天内改过的所有会话」整份 read_turns
+// 一遍。本机语料 2.5 GB，等于每 5 分钟烧 5 分钟 CPU + 海量短命分配（主进程 RSS 只升
+// 不降的一大来源）。
+//
+// 绝大多数会话在两次刷新之间根本没动，所以按 (路径, mtime) 缓存解析结果：第二轮起
+// 只有真正被写过的文件才重新解析。
+//
+// 缓存的是「托盘用得上的最小信息」而不是完整 `Turn` —— Turn 还带 tools /
+// bash_commands / mcp_servers，托盘一个都用不到。
+
+/// 一次模型调用在托盘口径下的最小投影。
+#[derive(Clone)]
+struct TrayCall {
+    ts_ms: u64,
+    /// 跨文件去重用（Claude 的 fork / continue 会把同一条 assistant 消息复制到多个
+    /// JSONL）。去重必须逐调用进行，所以这里不能预先按时间窗口求和。
+    message_id: Option<String>,
+    tokens: u64,
+    cost: f64,
+    call_weight: u64,
+    pricing_missing: bool,
+    pricing_estimated: bool,
+}
+
+struct TrayFileEntry {
+    mtime: u64,
+    seq: u64,
+    calls: Arc<[TrayCall]>,
+}
+
+#[derive(Default)]
+struct TrayCallCache {
+    entries: HashMap<String, TrayFileEntry>,
+    calls: usize,
+    next_seq: u64,
+}
+
+/// 缓存的调用条数上限（约 30 MB 量级）。修内存问题时引入的缓存自己不能变成新的
+/// 内存问题；超限按插入序淘汰，被淘汰的文件下一轮重新解析即可。
+const TRAY_CACHE_MAX_CALLS: usize = 300_000;
+
+static TRAY_CALL_CACHE: Mutex<Option<TrayCallCache>> = Mutex::new(None);
+
+fn cached_tray_calls(path: &str, mtime: u64) -> Option<Arc<[TrayCall]>> {
+    let guard = TRAY_CALL_CACHE.lock().ok()?;
+    let cache = guard.as_ref()?;
+    let entry = cache.entries.get(path)?;
+    (entry.mtime == mtime).then(|| entry.calls.clone())
+}
+
+fn store_tray_calls(path: &str, mtime: u64, calls: Arc<[TrayCall]>) {
+    let Ok(mut guard) = TRAY_CALL_CACHE.lock() else {
+        return;
+    };
+    let cache = guard.get_or_insert_with(TrayCallCache::default);
+    let len = calls.len();
+    let seq = cache.next_seq;
+    cache.next_seq += 1;
+    let replaced = cache
+        .entries
+        .insert(path.to_string(), TrayFileEntry { mtime, seq, calls });
+    if let Some(previous) = replaced {
+        cache.calls = cache.calls.saturating_sub(previous.calls.len());
+    }
+    cache.calls = cache.calls.saturating_add(len);
+    evict_tray_calls(cache);
+}
+
+/// 超出条数上限时按插入序淘汰到 75%。留出余量是为了避免在上限附近来回抖动、
+/// 每次插入都触发一轮淘汰。
+fn evict_tray_calls(cache: &mut TrayCallCache) {
+    if cache.calls <= TRAY_CACHE_MAX_CALLS {
+        return;
+    }
+    let target = TRAY_CACHE_MAX_CALLS / 4 * 3;
+    let mut by_seq: Vec<(u64, String)> = cache
+        .entries
+        .iter()
+        .map(|(key, entry)| (entry.seq, key.clone()))
+        .collect();
+    by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, key) in by_seq {
+        if cache.calls <= target {
+            break;
+        }
+        if let Some(entry) = cache.entries.remove(&key) {
+            cache.calls = cache.calls.saturating_sub(entry.calls.len());
+        }
+    }
+}
+
+/// 拿到一个会话文件的逐调用投影：命中缓存直接返回，否则解析一次再存。
+/// `modified` 既是缓存键的一部分，也是 turn 自身没带时间戳时的回退时刻。
+fn tray_calls(
+    src: &(dyn agents::SessionSource + Sync),
+    path: &str,
+    modified: u64,
+) -> Arc<[TrayCall]> {
+    if let Some(cached) = cached_tray_calls(path, modified) {
+        return cached;
+    }
+    let turns = src.read_turns(path).unwrap_or_default();
+    let mut calls: Vec<TrayCall> = Vec::new();
+    for turn in &turns {
+        let ts_ms = if turn.timestamp_ms > 0 {
+            turn.timestamp_ms as u64
+        } else {
+            modified
+        };
+        for call in &turn.calls {
+            if call.call_count == 0 {
+                continue;
+            }
+            calls.push(TrayCall {
+                ts_ms,
+                message_id: call.message_id.clone(),
+                tokens: call.usage.total,
+                cost: call.cost_usd,
+                call_weight: call.call_count,
+                pricing_missing: call.pricing_missing,
+                pricing_estimated: call.pricing_estimated,
+            });
+        }
+    }
+    let calls: Arc<[TrayCall]> = calls.into();
+    store_tray_calls(path, modified, calls.clone());
+    calls
+}
 
 struct Boundaries {
     today_ms: u64,
@@ -176,62 +307,49 @@ pub fn quick_stats() -> Result<TrayStats, String> {
                 if s.modified < earliest {
                     continue;
                 }
-                let turns = match src.read_turns(&s.path) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
                 let mut has_data = false;
-                for turn in &turns {
-                    let ts = if turn.timestamp_ms > 0 {
-                        turn.timestamp_ms as u64
-                    } else {
-                        s.modified
-                    };
+                for call in tray_calls(src.as_ref(), &s.path, s.modified).iter() {
+                    let ts = call.ts_ms;
                     if ts < earliest {
                         continue;
                     }
-                    for call in &turn.calls {
-                        if call.call_count == 0 {
+                    if let Some(id) = &call.message_id {
+                        if !acc.seen_ids.insert(id.clone()) {
                             continue;
                         }
-                        if let Some(id) = &call.message_id {
-                            if !acc.seen_ids.insert(id.clone()) {
-                                continue;
-                            }
+                    }
+                    has_data = true;
+                    let tokens = call.tokens;
+                    let cost = call.cost;
+                    let call_weight = call.call_weight;
+                    if ts >= bounds.month_ms {
+                        acc.month_tokens += tokens;
+                        acc.month_cost += cost;
+                        if call.pricing_missing {
+                            acc.month_unpriced_calls += call_weight;
                         }
-                        has_data = true;
-                        let tokens = call.usage.total;
-                        let cost = call.cost_usd;
-                        let call_weight = call.call_count;
-                        if ts >= bounds.month_ms {
-                            acc.month_tokens += tokens;
-                            acc.month_cost += cost;
-                            if call.pricing_missing {
-                                acc.month_unpriced_calls += call_weight;
-                            }
-                            if call.pricing_estimated {
-                                acc.month_estimated_calls += call_weight;
-                            }
+                        if call.pricing_estimated {
+                            acc.month_estimated_calls += call_weight;
                         }
-                        if ts >= bounds.week_ms {
-                            acc.week_tokens += tokens;
-                            acc.week_cost += cost;
-                            if call.pricing_missing {
-                                acc.week_unpriced_calls += call_weight;
-                            }
-                            if call.pricing_estimated {
-                                acc.week_estimated_calls += call_weight;
-                            }
+                    }
+                    if ts >= bounds.week_ms {
+                        acc.week_tokens += tokens;
+                        acc.week_cost += cost;
+                        if call.pricing_missing {
+                            acc.week_unpriced_calls += call_weight;
                         }
-                        if ts >= bounds.today_ms {
-                            acc.today_tokens += tokens;
-                            acc.today_cost += cost;
-                            if call.pricing_missing {
-                                acc.today_unpriced_calls += call_weight;
-                            }
-                            if call.pricing_estimated {
-                                acc.today_estimated_calls += call_weight;
-                            }
+                        if call.pricing_estimated {
+                            acc.week_estimated_calls += call_weight;
+                        }
+                    }
+                    if ts >= bounds.today_ms {
+                        acc.today_tokens += tokens;
+                        acc.today_cost += cost;
+                        if call.pricing_missing {
+                            acc.today_unpriced_calls += call_weight;
+                        }
+                        if call.pricing_estimated {
+                            acc.today_estimated_calls += call_weight;
                         }
                     }
                 }
@@ -253,6 +371,66 @@ pub fn quick_stats() -> Result<TrayStats, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tray_entry(seq: u64, calls: usize) -> TrayFileEntry {
+        let call = TrayCall {
+            ts_ms: 1,
+            message_id: None,
+            tokens: 1,
+            cost: 0.0,
+            call_weight: 1,
+            pricing_missing: false,
+            pricing_estimated: false,
+        };
+        TrayFileEntry {
+            mtime: 1,
+            seq,
+            calls: vec![call; calls].into(),
+        }
+    }
+
+    fn seed_tray_cache(calls_per_entry: usize, count: u64) -> TrayCallCache {
+        let mut cache = TrayCallCache::default();
+        for seq in 0..count {
+            cache.entries.insert(
+                format!("/tmp/tray-{seq}.jsonl"),
+                tray_entry(seq, calls_per_entry),
+            );
+            cache.calls += calls_per_entry;
+        }
+        cache.next_seq = count;
+        cache
+    }
+
+    #[test]
+    fn evict_tray_calls_is_a_no_op_below_the_cap() {
+        let mut cache = seed_tray_cache(10, 4);
+        evict_tray_calls(&mut cache);
+        assert_eq!(cache.entries.len(), 4);
+        assert_eq!(cache.calls, 40);
+    }
+
+    #[test]
+    fn evict_tray_calls_drops_the_oldest_entries_down_to_three_quarters() {
+        // 每条 1/8 上限 => 10 条超限；淘汰到 <= 75% 需要掉到 6 条。
+        let per_entry = TRAY_CACHE_MAX_CALLS / 8;
+        let mut cache = seed_tray_cache(per_entry, 10);
+        evict_tray_calls(&mut cache);
+
+        assert!(cache.calls <= TRAY_CACHE_MAX_CALLS / 4 * 3);
+        assert_eq!(cache.entries.len(), 6);
+        assert_eq!(cache.calls, 6 * per_entry, "calls 必须与留下的条目对得上");
+        for seq in 0..4 {
+            assert!(!cache
+                .entries
+                .contains_key(&format!("/tmp/tray-{seq}.jsonl")));
+        }
+        for seq in 4..10 {
+            assert!(cache
+                .entries
+                .contains_key(&format!("/tmp/tray-{seq}.jsonl")));
+        }
+    }
 
     #[test]
     fn tray_visibility_accepts_supported_agents_and_excludes_agy() {

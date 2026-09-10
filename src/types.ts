@@ -497,6 +497,31 @@ export interface AccountUsage {
   sevenDaySonnet?: UsageWindow | null
 }
 
+/** 设置页「存储占用」的一行。`key` 同时是 `clearStorage` 的入参。 */
+export interface StorageUsageEntry {
+  key: string
+  path: string
+  bytes: number
+  /** false = 用户资产（背景素材等），只报大小不给清理按钮。 */
+  clearable: boolean
+}
+
+/** 设置页「运行诊断」：内存 / 线程 / 各缓存与目录占用。 */
+export interface RuntimeDiagnostics {
+  mainRssBytes: number
+  webviewRssBytes: number
+  threads: number
+  userTextCacheBytes: number
+  usageCacheEntries: number
+  scanCacheEntries: number
+  watchMapEntries: number
+  activeChats: number
+  desktopTasks: number
+  imageCacheBytes: number
+  attachmentsBytes: number
+  trashBytes: number
+}
+
 export interface TrashItem {
   trashFile: string
   agent: Agent

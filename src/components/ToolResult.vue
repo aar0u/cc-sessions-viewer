@@ -7,6 +7,12 @@ import { IconChevronRight, IconInfo } from './icons'
 import { highlightJsonInPlace, looksLikeJson } from '../jsonHighlight'
 import { highlightDiff, looksLikeDiff } from '../diffHighlight'
 import { renderCodexFileChangeHtml } from '../codexApplyPatch'
+import { formatSize } from '../format'
+import {
+  DIFF_HIGHLIGHT_MAX_CHARS,
+  JSON_HIGHLIGHT_MAX_CHARS,
+  OVERSIZE_BLOCK_CHARS,
+} from '../renderLimits'
 
 const props = withDefaults(defineProps<{ block: Block; inUser?: boolean; persistOpen?: boolean; cwd?: string }>(), {
   persistOpen: undefined,
@@ -19,17 +25,34 @@ const emit = defineEmits<{ toggle: [open: boolean] }>()
 //   3. JSON（含 Read .json 文件的 cat-n 行号格式）→ token 上色
 //   4. 其它 → 原样 <pre>
 // 判断顺序很重要：JSON 文件的 diff 既像 diff 又像 JSON，应该按 diff 渲染。
+//
+// 每一级都有体积闸门（见 renderLimits.ts）：超限就跳过染色退回纯 <pre>。染色是按行
+// 建 DOM 的，一个 5 MB 的 tool 输出能生成百万级 <span>，内存是原文的几十倍，而在
+// 那个体积下配色对阅读也没有任何帮助。内容本身一个字都不会少。
+const rawText = computed(() => props.block.text ?? '')
+
+/** 文本形态的 diff —— 与是否染色无关。标题、自动展开、增删统计都看它，
+ *  所以超限跳过染色时这个判断必须保持不变。 */
+const isTextDiff = computed(() => looksLikeDiff(rawText.value))
+
 const diffHtml = computed(() => {
-  const txt = props.block.text ?? ''
-  if (!looksLikeDiff(txt)) return null
-  return highlightDiff(txt)
+  if (!isTextDiff.value) return null
+  if (rawText.value.length > DIFF_HIGHLIGHT_MAX_CHARS) return null
+  return highlightDiff(rawText.value)
 })
-const isTextDiff = computed(() => diffHtml.value !== null)
 const jsonHtml = computed(() => {
-  const txt = props.block.text ?? ''
+  // diff 优先：JSON 文件的 diff 两种判断都为真，必须按 diff 渲染。
+  if (isTextDiff.value) return null
+  const txt = rawText.value
+  if (txt.length > JSON_HIGHLIGHT_MAX_CHARS) return null
   if (!looksLikeJson(txt)) return null
   return highlightJsonInPlace(txt)
 })
+
+/** 超大块：默认折叠，并在标题上标注体积，免得用户对着一个转圈的窗口猜发生了什么。 */
+const oversizeLabel = computed(() =>
+  rawText.value.length > OVERSIZE_BLOCK_CHARS ? formatSize(rawText.value.length) : '',
+)
 
 function baseName(p?: string): string {
   if (!p) return ''
@@ -78,7 +101,9 @@ const hasRenderableText = computed(() => {
   return !!(props.block.text ?? '').trim()
 })
 
-const shouldAutoOpen = computed(() => !!props.block.diff || !!props.block.filePath || isTextDiff.value)
+const shouldAutoOpen = computed(
+  () => !oversizeLabel.value && (!!props.block.diff || !!props.block.filePath || isTextDiff.value),
+)
 const fileChangeHtml = computed(() => {
   if (!props.block.filePath) return null
   return renderCodexFileChangeHtml(
@@ -113,12 +138,18 @@ const fileChangeHtml = computed(() => {
       <template v-if="block.isError">
         <IconInfo class="thinking-icon" aria-hidden="true" />
         <span class="thinking-label">{{ label }}</span>
+        <span v-if="oversizeLabel" class="oversize-hint">{{
+          t('tool.largeContent', { size: oversizeLabel })
+        }}</span>
         <span class="thinking-chev"><IconChevronRight /></span>
       </template>
       <template v-else>
         <span class="chev"><IconChevronRight /></span>
         <span class="label">{{ label }}</span>
         <span v-if="diffStat" class="diff-stat">{{ diffStat }}</span>
+        <span v-if="oversizeLabel" class="oversize-hint">{{
+          t('tool.largeContent', { size: oversizeLabel })
+        }}</span>
       </template>
     </summary>
     <div :class="block.isError ? 'thinking-content tool-result-error-content' : 'block-body'">

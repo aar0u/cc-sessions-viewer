@@ -270,6 +270,96 @@ pub fn is_jsonl(p: &Path) -> bool {
     p.extension().map(|x| x == "jsonl").unwrap_or(false)
 }
 
+/// 只读文件**尾部**最多 `max_bytes` 字节，并丢掉开头那半行（除非已经读到文件头）。
+///
+/// 用于「关心的记录总是追加在末尾」的廉价扫描（`/rename` 写的 custom-title /
+/// session_info 等）。整文件读一个上百 MB 的 rollout 只为拿一个标题，是内存峰值的
+/// 主要来源之一；这里把峰值钉死在 `max_bytes`。
+pub fn read_tail_text(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if start == 0 {
+        return Some(text);
+    }
+    // 起点大概率落在某一行中间；丢到第一个换行为止，只留完整行。
+    Some(match text.find('\n') {
+        Some(index) => text[index + 1..].to_string(),
+        None => String::new(),
+    })
+}
+
+/// 从文件尾部向前**分块**扫描完整行，对每一行（从后往前）调用 `visit`，
+/// 返回第一个 `Some`。
+///
+/// 相比 `fs::read` 整文件读入再 `rsplit`，峰值内存是「一个 chunk + 当前跨块残行」
+/// 而不是整个文件 —— 会话 JSONL 动辄上百 MB，后者是内存暴涨的直接原因。
+/// 命中即停，绝大多数调用只会真正读到尾部很小一段。
+pub fn scan_lines_backwards<T>(
+    path: &Path,
+    mut visit: impl FnMut(&[u8]) -> Option<T>,
+) -> Option<T> {
+    use std::io::{Read, Seek, SeekFrom};
+    /// 每次向前读的块大小。
+    const CHUNK: u64 = 1 << 20;
+    /// 跨块残行的上限：单行超过它就放弃（返回 None），避免退化成整文件读入。
+    const MAX_PARTIAL: usize = 64 << 20;
+
+    let mut file = fs::File::open(path).ok()?;
+    let mut end = file.metadata().ok()?.len();
+    // 当前块开头那段不完整的行，需要拼到**更靠前**的下一块尾部。
+    let mut partial: Vec<u8> = Vec::new();
+
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let size = (end - start) as usize;
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = vec![0u8; size];
+        file.read_exact(&mut buf).ok()?;
+        buf.extend_from_slice(&partial);
+
+        let mut cursor = buf.len();
+        while let Some(index) = buf[..cursor].iter().rposition(|&byte| byte == b'\n') {
+            let line = trim_ascii_ends(&buf[index + 1..cursor]);
+            if !line.is_empty() {
+                if let Some(found) = visit(line) {
+                    return Some(found);
+                }
+            }
+            cursor = index;
+        }
+
+        if start == 0 {
+            let line = trim_ascii_ends(&buf[..cursor]);
+            if !line.is_empty() {
+                return visit(line);
+            }
+            return None;
+        }
+        if cursor > MAX_PARTIAL {
+            return None;
+        }
+        partial = buf[..cursor].to_vec();
+        end = start;
+    }
+    None
+}
+
+fn trim_ascii_ends(mut bytes: &[u8]) -> &[u8] {
+    while let [b'\n' | b'\r' | b' ' | b'\t', rest @ ..] = bytes {
+        bytes = rest;
+    }
+    while let [rest @ .., b'\n' | b'\r' | b' ' | b'\t'] = bytes {
+        bytes = rest;
+    }
+    bytes
+}
+
 /// 把首条用户消息清洗成简短标题：去掉 <...> 标记块、折叠空白、截断。
 pub fn clean_title(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -293,9 +383,8 @@ pub fn clean_title(raw: &str) -> String {
 /// 从用户消息提取副标题：取第一行非空文本，去掉 @file 引用、markdown 语法，截断到 120 字符。
 pub fn truncate_subtitle(raw: &str) -> String {
     use once_cell::sync::Lazy;
-    static RE_STRIP: Lazy<regex_lite::Regex> = Lazy::new(|| {
-        regex_lite::Regex::new(r"@\[?[A-Za-z0-9_./-]+\]?|\!\[[^\]]*\]").unwrap()
-    });
+    static RE_STRIP: Lazy<regex_lite::Regex> =
+        Lazy::new(|| regex_lite::Regex::new(r"@\[?[A-Za-z0-9_./-]+\]?|\!\[[^\]]*\]").unwrap());
     static RE_IMAGE_ONLY: Lazy<regex_lite::Regex> =
         Lazy::new(|| regex_lite::Regex::new(r"^\[Image #\d+\]$").unwrap());
     // Claude Code writes a second, metadata-only user record for pasted images.
@@ -338,9 +427,7 @@ pub fn truncate_subtitle(raw: &str) -> String {
     // Image content can be serialized as its own text block, followed by the
     // user's text in another block. Keep both in the list subtitle instead of
     // reducing the message to the standalone image token.
-    let line = if candidates.len() >= 2
-        && RE_IMAGE_ONLY.is_match(&candidates[0])
-    {
+    let line = if candidates.len() >= 2 && RE_IMAGE_ONLY.is_match(&candidates[0]) {
         candidates.join(" ")
     } else {
         candidates.into_iter().next().unwrap_or_default()
@@ -758,6 +845,66 @@ fn path_ends_with_segments(path: &Path, want: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    fn temp_file(name: &str, body: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cssv-util-{}-{}-{name}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_tail_text_returns_whole_file_when_it_fits() {
+        let path = temp_file("small", b"a\nb\nc\n");
+        assert_eq!(read_tail_text(&path, 1024).unwrap(), "a\nb\nc\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    /// 尾部读取必须丢掉开头那半行 —— 否则调用方会把一段被截断的 JSON 当成完整记录。
+    #[test]
+    fn read_tail_text_drops_the_partial_first_line() {
+        let path = temp_file("partial", b"first-line\nsecond-line\nthird\n");
+        // 只读最后 12 字节，起点落在 "second-line" 中间。
+        let tail = read_tail_text(&path, 12).unwrap();
+        assert!(!tail.contains("second"), "被截断的半行必须丢掉: {tail:?}");
+        assert_eq!(tail, "third\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_lines_backwards_visits_lines_from_the_end() {
+        let path = temp_file("order", b"one\ntwo\nthree\n");
+        let mut seen: Vec<String> = Vec::new();
+        let found = scan_lines_backwards(&path, |line| {
+            seen.push(String::from_utf8_lossy(line).into_owned());
+            (line == b"two").then_some(true)
+        });
+        assert_eq!(found, Some(true));
+        assert_eq!(seen, vec!["three".to_string(), "two".to_string()]);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// 跨越内部 1 MB 分块边界的行也必须被完整拼回来，不能被切成两半。
+    #[test]
+    fn scan_lines_backwards_stitches_lines_across_chunk_boundaries() {
+        let long = "x".repeat(3 * 1024 * 1024);
+        let body = format!("needle\n{long}\n");
+        let path = temp_file("chunks", body.as_bytes());
+        let found = scan_lines_backwards(&path, |line| (line == b"needle").then_some(line.len()));
+        assert_eq!(found, Some(6));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_lines_backwards_returns_none_without_a_match() {
+        let path = temp_file("nomatch", b"alpha\nbeta\n");
+        let found: Option<()> = scan_lines_backwards(&path, |_| None);
+        assert!(found.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn truncate_subtitle_preserves_image_tokens() {
         assert_eq!(
@@ -783,9 +930,7 @@ mod tests {
     #[test]
     fn truncate_subtitle_normalizes_clipboard_paths_on_unix_and_windows() {
         assert_eq!(
-            truncate_subtitle(
-                "/var/folders/8h/T/clipboard-2026-08-24.png 请总结图片内容"
-            ),
+            truncate_subtitle("/var/folders/8h/T/clipboard-2026-08-24.png 请总结图片内容"),
             "[Image #1] 请总结图片内容"
         );
         assert_eq!(
@@ -1134,25 +1279,20 @@ fn bind_inline_image_placeholders(msg: &mut Msg) {
         .filter_map(|block| block.text.as_deref())
         .flat_map(|text| {
             image_token_re.captures_iter(text).filter_map(|caps| {
-                caps.get(1)
-                    .or_else(|| caps.get(2))
-                    .and_then(|value| {
-                        value
-                            .as_str()
-                            .parse::<usize>()
-                            .ok()
-                            .map(|number| (number, caps.get(0).unwrap().as_str().to_string()))
-                    })
+                caps.get(1).or_else(|| caps.get(2)).and_then(|value| {
+                    value
+                        .as_str()
+                        .parse::<usize>()
+                        .ok()
+                        .map(|number| (number, caps.get(0).unwrap().as_str().to_string()))
+                })
             })
         })
         .collect();
     if image_tokens.is_empty() {
         return;
     }
-    let image_numbers: HashSet<usize> = image_tokens
-        .iter()
-        .map(|(number, _)| *number)
-        .collect();
+    let image_numbers: HashSet<usize> = image_tokens.iter().map(|(number, _)| *number).collect();
 
     // Agent-specific readers may already have recovered an exact binding from the
     // source protocol (Claude's interleaved content is one such case). Keep those
@@ -2022,7 +2162,9 @@ Only after the original task is complete, process this follow-up in the order re
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].image_src.as_deref(), Some(first));
         assert_eq!(blocks[1].image_src.as_deref(), Some(second));
-        assert!(blocks.iter().all(|block| block.image_unavailable == Some(true)));
+        assert!(blocks
+            .iter()
+            .all(|block| block.image_unavailable == Some(true)));
         assert_eq!(remaining, "请看  hihhi ，一共几张图？");
     }
 

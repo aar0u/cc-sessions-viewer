@@ -12,6 +12,7 @@ const {
   openCodexSideChatMock,
   agentChatInterruptMock,
   agentChatSteerMock,
+  readFileBase64Mock,
 } = vi.hoisted(() => ({
   claudeRuntimeInfoMock: vi.fn().mockResolvedValue({ hasCustomBaseUrl: false }),
   listProjectFilesMock: vi.fn().mockResolvedValue([]),
@@ -19,6 +20,7 @@ const {
   openCodexSideChatMock: vi.fn().mockResolvedValue(null),
   agentChatInterruptMock: vi.fn().mockResolvedValue(undefined),
   agentChatSteerMock: vi.fn().mockResolvedValue(undefined),
+  readFileBase64Mock: vi.fn(),
 }))
 
 vi.mock('../../src/api', () => ({
@@ -28,6 +30,7 @@ vi.mock('../../src/api', () => ({
   claudeRuntimeInfo: claudeRuntimeInfoMock,
   codexRuntimeInfo: vi.fn().mockResolvedValue({ usesApiKey: false }),
   listProjectFiles: listProjectFilesMock,
+  readFileBase64: readFileBase64Mock,
 }))
 
 vi.mock('../../src/sideChat', () => ({
@@ -978,6 +981,93 @@ describe('ChatComposer /btw side chat', () => {
     await wrapper.vm.$nextTick()
     expect(el.value).toBe('older')
     expect(wrapper.text()).toContain('History 1/2')
+  })
+
+  // 会话图片走磁盘缓存后，历史里的图片块只剩一条本地路径（Codex 的 @文件、剪贴板
+  // 截图一直就是这个形态）。↑ 回填时要把字节读回来，否则重发出去的是一张空图。
+  it('reads a path-only history image back from disk before attaching it', async () => {
+    setLang('en')
+    let release: (bytes: { mediaType: string; data: string }) => void = () => {}
+    readFileBase64Mock.mockReturnValue(new Promise((resolve) => { release = resolve }))
+    const msg = {
+      role: 'user' as const,
+      sidechain: false,
+      blocks: [
+        { kind: 'image' as const, isError: false, imageSrc: '/cache/abc.png' },
+        { kind: 'text' as const, text: 'look', isError: false },
+      ],
+    }
+    const wrapper = mount(ChatComposer, {
+      props: { session: baseSession({ msgs: [msg] }) },
+      global: { directives: { tooltip: vTooltip } },
+    })
+    const ta = wrapper.find('textarea')
+
+    await ta.trigger('keydown', { key: 'ArrowUp' })
+    await wrapper.vm.$nextTick()
+    // 读盘未完成前不能先挂一个空壳上去。
+    expect(wrapper.findAll('.cc-thumb')).toHaveLength(0)
+
+    release({ mediaType: 'image/png', data: 'QUJD' })
+    await flushPromises()
+    expect(readFileBase64Mock).toHaveBeenCalledWith('/cache/abc.png')
+    const thumb = wrapper.find('.cc-thumb img')
+    expect(thumb.attributes('src')).toBe('data:image/png;base64,QUJD')
+  })
+
+  it('drops a history image whose file can no longer be read', async () => {
+    setLang('en')
+    readFileBase64Mock.mockRejectedValue(new Error('ENOENT'))
+    const msg = {
+      role: 'user' as const,
+      sidechain: false,
+      blocks: [
+        { kind: 'image' as const, isError: false, imageSrc: '/cache/gone.png' },
+        { kind: 'text' as const, text: 'look', isError: false },
+      ],
+    }
+    const wrapper = mount(ChatComposer, {
+      props: { session: baseSession({ msgs: [msg] }) },
+      global: { directives: { tooltip: vTooltip } },
+    })
+    const ta = wrapper.find('textarea')
+
+    await ta.trigger('keydown', { key: 'ArrowUp' })
+    await flushPromises()
+    expect(wrapper.findAll('.cc-thumb')).toHaveLength(0)
+    expect((ta.element as HTMLTextAreaElement).value).toBe('look')
+  })
+
+  it('discards an in-flight history image read once the user pages on', async () => {
+    setLang('en')
+    let release: (bytes: { mediaType: string; data: string }) => void = () => {}
+    readFileBase64Mock.mockReturnValue(new Promise((resolve) => { release = resolve }))
+    const withImage = {
+      role: 'user' as const,
+      sidechain: false,
+      blocks: [
+        { kind: 'image' as const, isError: false, imageSrc: '/cache/slow.png' },
+        { kind: 'text' as const, text: 'newer', isError: false },
+      ],
+    }
+    const plain = {
+      role: 'user' as const,
+      sidechain: false,
+      blocks: [{ kind: 'text' as const, text: 'older', isError: false }],
+    }
+    const wrapper = mount(ChatComposer, {
+      props: { session: baseSession({ msgs: [plain, withImage] }) },
+      global: { directives: { tooltip: vTooltip } },
+    })
+    const ta = wrapper.find('textarea')
+
+    await ta.trigger('keydown', { key: 'ArrowUp' })   // → newer（开始读盘）
+    await ta.trigger('keydown', { key: 'ArrowUp' })   // → older（读盘还没回来）
+    release({ mediaType: 'image/png', data: 'QUJD' })
+    await flushPromises()
+
+    expect((ta.element as HTMLTextAreaElement).value).toBe('older')
+    expect(wrapper.findAll('.cc-thumb')).toHaveLength(0)
   })
 
   it('does not hijack ↑ when there is no message history', async () => {

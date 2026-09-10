@@ -95,6 +95,14 @@ const chatMsgs = computed<Msg[]>(() => {
   if (tab.type === 'chat') return tab.chatSession?.msgs ?? []
   return []
 })
+// 只读会话的 msgs 是按需装载的（启动恢复只建壳，后台闲置会被释放；见 viewTabs.ts）。
+// 一个还没装载的 session tab 必然马上就要读盘，所以直接显示 loading —— 否则会先闪
+// 一下「空会话」再出内容。
+const showMsgsLoading = computed(() => {
+  const tab = paneViewTab.value
+  if (!tab) return false
+  return tab.loadingMsgs || (tab.type === 'session' && !tab.msgsLoaded)
+})
 const liveTailing = computed(() => paneViewTab.value?.liveTailing ?? false)
 const chatAgent = computed<Agent>(
   () =>
@@ -207,7 +215,7 @@ const liveChatMeta = computed<SessionMeta>(() => {
 
         <!-- session tab（只读查看） -->
         <template v-else-if="paneViewTab?.type === 'session' && openSession">
-          <div v-if="paneViewTab.loadingMsgs" class="loading">{{ t('common.loading') }}</div>
+          <div v-if="showMsgsLoading" class="loading">{{ t('common.loading') }}</div>
           <ChatView
             v-else
             :key="paneViewTab.uiId"

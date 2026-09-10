@@ -531,6 +531,50 @@ pub fn empty() -> Result<(), String> {
     empty_in(&trash_dir())
 }
 
+/// 清掉在回收站里躺够 `days` 天的条目。`days == 0` 表示永久保留，直接返回。
+///
+/// 判据是 `.meta` 里的 `deletedAt`（软删时写入的毫秒时间戳），不是文件 mtime —— 恢复
+/// 再删一次会刷新 `deletedAt`，那才是用户视角的「进回收站的时间」。读不到 `deletedAt`
+/// 的条目一律留着：宁可留一份不该留的，也不能删一份不该删的。
+/// 已经过期、下一轮清理会删掉的条目。
+///
+/// 单独拆出来是为了「先告知再删除」：升级后要先弹一次提示，而提示得先知道到底有没有
+/// 东西要被删 —— 没有就别打扰用户。数出来和删掉的必须是同一批，所以两边共用这个函数。
+fn expired_in(directory: &Path, days: u32, now_ms: u64) -> Result<Vec<TrashItem>, String> {
+    if days == 0 || !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let max_age_ms = u64::from(days) * 24 * 60 * 60 * 1000;
+    Ok(list_in(directory)?
+        .into_iter()
+        // `deleted_at == 0` 是没记住删除时间的老条目，永远不自动删。
+        .filter(|item| item.deleted_at != 0)
+        .filter(|item| now_ms.saturating_sub(item.deleted_at) > max_age_ms)
+        .collect())
+}
+
+fn purge_expired_in(directory: &Path, days: u32, now_ms: u64) -> Result<Vec<String>, String> {
+    let mut purged = Vec::new();
+    for item in expired_in(directory, days, now_ms)? {
+        match permanent_delete_in(directory, &item.trash_file) {
+            Ok(()) => purged.push(item.trash_file),
+            Err(error) => eprintln!("Failed to purge expired trash item: {error}"),
+        }
+    }
+    Ok(purged)
+}
+
+pub fn purge_expired(days: u32) -> Result<Vec<String>, String> {
+    purge_expired_in(&trash_dir(), days, now_millis())
+}
+
+/// 有多少条会被下一轮清理删掉。0 表示提示没有意义，不该打扰用户。
+pub fn expired_count(days: u32) -> usize {
+    expired_in(&trash_dir(), days, now_millis())
+        .map(|items| items.len())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +622,93 @@ mod tests {
         assert!(restored.join("summary.json").is_file());
         assert!(restored.join("updates.jsonl").is_file());
         assert!(restored.join("terminal").join("output.log").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 造一条回收站条目：数据文件 + `.meta`（带指定的 `deletedAt`）。
+    fn seed_trash_item(trash: &Path, name: &str, deleted_at: u64) {
+        fs::write(trash.join(name), "{}\n").unwrap();
+        fs::write(
+            trash.join(format!("{name}.meta")),
+            serde_json::json!({
+                "agent": "claude",
+                "originalPath": format!("/tmp/{name}"),
+                "originalRootPath": format!("/tmp/{name}"),
+                "entryRelativePath": "",
+                "storageKind": "file",
+                "projectLabel": "test",
+                "deletedAt": deleted_at
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn purge_expired_only_removes_items_past_the_retention_period() {
+        let root = scratch("purge");
+        let trash = root.join("trash");
+        fs::create_dir_all(&trash).unwrap();
+        let now = 40 * 24 * 60 * 60 * 1000_u64;
+        let day = 24 * 60 * 60 * 1000_u64;
+        seed_trash_item(&trash, "old-session.jsonl", now - 31 * day);
+        seed_trash_item(&trash, "fresh-session.jsonl", now - 3 * day);
+        // `deletedAt` 缺失 / 为 0 的老条目不能被删。
+        seed_trash_item(&trash, "unknown-session.jsonl", 0);
+
+        let purged = purge_expired_in(&trash, 30, now).unwrap();
+
+        assert_eq!(purged, vec!["old-session.jsonl".to_string()]);
+        assert!(!trash.join("old-session.jsonl").exists());
+        assert!(!trash.join("old-session.jsonl.meta").exists());
+        assert!(trash.join("fresh-session.jsonl").is_file());
+        assert!(trash.join("unknown-session.jsonl").is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // 「先告知再删除」依赖这个：数出来的和删掉的必须是同一批，而数的时候一个都不能删。
+    #[test]
+    fn expired_counts_without_deleting_and_matches_what_purge_removes() {
+        let root = scratch("expired-count");
+        let trash = root.join("trash");
+        fs::create_dir_all(&trash).unwrap();
+        let now = 40 * 24 * 60 * 60 * 1000_u64;
+        let day = 24 * 60 * 60 * 1000_u64;
+        seed_trash_item(&trash, "old-a.jsonl", now - 31 * day);
+        seed_trash_item(&trash, "old-b.jsonl", now - 38 * day);
+        seed_trash_item(&trash, "fresh.jsonl", now - 3 * day);
+        seed_trash_item(&trash, "unknown.jsonl", 0);
+
+        let expired = expired_in(&trash, 30, now).unwrap();
+        assert_eq!(expired.len(), 2);
+        // 只是数一数，文件必须还在。
+        assert!(trash.join("old-a.jsonl").is_file());
+        assert!(trash.join("old-b.jsonl").is_file());
+
+        // 保留期为 0（永久）时没有「过期」可言，提示也就不该弹。
+        assert!(expired_in(&trash, 0, now).unwrap().is_empty());
+
+        let mut purged = purge_expired_in(&trash, 30, now).unwrap();
+        purged.sort();
+        assert_eq!(purged, vec!["old-a.jsonl".to_string(), "old-b.jsonl".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_expired_does_nothing_when_retention_is_off() {
+        let root = scratch("purge-off");
+        let trash = root.join("trash");
+        fs::create_dir_all(&trash).unwrap();
+        let now = 40 * 24 * 60 * 60 * 1000_u64;
+        seed_trash_item(&trash, "ancient-session.jsonl", 1);
+
+        assert!(purge_expired_in(&trash, 0, now).unwrap().is_empty());
+        assert!(trash.join("ancient-session.jsonl").is_file());
+        // 目录不存在也不该报错。
+        assert!(purge_expired_in(&root.join("nope"), 30, now).unwrap().is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 

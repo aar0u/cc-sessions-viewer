@@ -16,12 +16,15 @@ mod agent_chat;
 mod agent_command;
 pub mod agents;
 mod app_storage;
+mod attachments;
 mod background_media;
 mod bookmarks;
 mod claude_config;
 mod cli_env;
 mod desktop_pet_assets;
+mod diagnostics;
 mod git;
+mod image_cache;
 #[cfg(target_os = "macos")]
 mod menu;
 mod panic_log;
@@ -29,6 +32,7 @@ mod process_tree;
 mod pty;
 mod runtime;
 pub mod stats;
+mod storage_gc;
 mod trash;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -47,19 +51,34 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_command::AgentCommand;
 use crate::types::{
-    AgentStats, ClaudeRuntimeInfo, CodexRuntimeInfo, Msg, PiTreeNode, ProjectInfo, SearchHit, SessionPage,
-    TrashItem, TrayStats, UsageSummary,
+    AgentStats, ClaudeRuntimeInfo, CodexRuntimeInfo, Msg, PiTreeNode, ProjectInfo, SearchHit,
+    SessionPage, TrashItem, TrayStats, UsageSummary,
 };
 #[allow(unused_imports)]
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 全局搜索的取消代际 —— 每次新搜索把自己的 `request_id` 写进来，正在跑的搜索循环
 /// 不停 check；一旦发现 gen ≠ 自己的 id 就主动 bail。`cancel_search()` 直接 bump 它。
 static SEARCH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// ============================ Tauri 命令：分派层 ============================
+/// 主窗口 label（见 `tauri.conf.json` 的 `app.windows[0].label`）。
+///
+/// 高频事件（PTY 字节流、会话 tail、GUI chat 流式输出）必须用 `emit_to` 单发给它，
+/// 而不是 `emit` 广播：桌宠是另一个 webview，它不听这些事件，却要为每一条付一次
+/// JSON 序列化 + evaluateJavaScript。桌宠自己的事件（`terminal-turn://state`、
+/// `desktop-pet://*`）仍然广播 —— 主窗口和桌宠都要收。
+pub const MAIN_WINDOW_LABEL: &str = "main";
 
-#[tauri::command]
+// ============================ Tauri 命令：分派层 ============================
+//
+// 关于 `#[tauri::command(async)]`：不带 `async` 的同步命令在**主线程**上执行。
+// 会话 JSONL 动辄上百 MB（本机最大的 codex rollout 有 160 MB），在主线程里解析一份
+// 会把窗口整个卡住 1–3 秒，期间 PTY 字节流、桌宠轮询、菜单响应全部排队 —— 这正是
+// 「用久了越来越卡」的直接来源。所有**纯 I/O、不碰窗口/菜单/托盘**的读命令都标
+// `(async)`，让它们跑在 async runtime 的线程池上。
+// 反之，任何需要主线程的命令（窗口操作、菜单、托盘、AppKit 调用）必须保持同步。
+
+#[tauri::command(async)]
 fn list_projects(
     agent: String,
     include_codex_internal: bool,
@@ -249,7 +268,7 @@ fn inject_worktrees(agent: &str, out: &mut Vec<ProjectInfo>) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_sessions(
     agent: String,
     project_key: String,
@@ -278,18 +297,27 @@ fn list_sessions(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_session(agent: String, path: String, leaf_id: Option<String>) -> Result<Vec<Msg>, String> {
-    agents::source(&agent)?.read_session_at(&path, leaf_id.as_deref())
+    let mut msgs = agents::source(&agent)?.read_session_at(&path, leaf_id.as_deref())?;
+    // 内联的大图换成磁盘缓存文件路径（见 image_cache.rs）。放在命令层而不是各 agent 的
+    // 解析里：这里是「一整份 transcript 要过 IPC 进 webview」的唯一出口，也正是内联
+    // base64 最贵的那一步。live chat 的流式消息不走这条路，仍保持内联。
+    image_cache::externalize(&mut msgs);
+    Ok(msgs)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn session_tree(agent: String, path: String) -> Result<Vec<PiTreeNode>, String> {
     agents::source(&agent)?.session_tree(&path)
 }
 
-#[tauri::command]
-fn session_export_json(agent: String, path: String, leaf_id: Option<String>) -> Result<String, String> {
+#[tauri::command(async)]
+fn session_export_json(
+    agent: String,
+    path: String,
+    leaf_id: Option<String>,
+) -> Result<String, String> {
     agents::source(&agent)?.session_export_json(&path, leaf_id.as_deref())
 }
 
@@ -315,11 +343,19 @@ fn codex_archive_session(session_id: String) -> Result<(), String> {
 }
 
 /// 实时 tail：开始监听 path 文件的写入事件。
-/// 同一时刻只允许一个 watch；再次调用会替换上一个 watcher。
-/// 文件不存在返回 Err，前端可以静默降级（仅一次性读取）。
-#[tauri::command]
-fn watch_session(app: tauri::AppHandle, agent: String, path: String) -> Result<(), String> {
-    watch::watch_session(app, agent, path)
+/// 同一时刻只允许一个 watch；换成别的会话会替换上一个 watcher，重复订阅同一个会话
+/// 则是幂等的空操作。文件不存在返回 Err，前端可以静默降级（仅一次性读取）。
+///
+/// `knownCount`：前端刚 `read_session` 拿到的条数。传了就直接当 baseline，省掉后端
+/// 再整份解析一遍同一个文件；只在「确实刚读完同一个 path」时传。
+#[tauri::command(async)]
+fn watch_session(
+    app: tauri::AppHandle,
+    agent: String,
+    path: String,
+    known_count: Option<usize>,
+) -> Result<(), String> {
+    watch::watch_session(app, agent, path, known_count)
 }
 
 /// 停止当前 tail；空操作可重入。前端 unmount / 切会话时调用。
@@ -328,7 +364,7 @@ fn unwatch_session() -> Result<(), String> {
     watch::unwatch_session()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_watched_session(app: tauri::AppHandle) -> Result<(), String> {
     watch::check_watched_session(app)
 }
@@ -357,6 +393,11 @@ fn terminal_turn_signal(
 #[tauri::command]
 fn install_turn_hooks() -> Result<turn::TurnHookInstallResult, String> {
     turn::install_turn_hooks()
+}
+
+#[tauri::command]
+fn uninstall_turn_hooks() -> Result<turn::TurnHookInstallResult, String> {
+    turn::uninstall_turn_hooks()
 }
 
 #[tauri::command]
@@ -562,6 +603,24 @@ fn parse_toml_string_value(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod reveal_tests {
+    use super::nearest_existing;
+    use std::path::Path;
+
+    #[test]
+    fn falls_back_to_the_nearest_existing_ancestor() {
+        let existing = std::env::temp_dir();
+        // 目录本身在，就用它自己。
+        assert_eq!(nearest_existing(&existing).as_deref(), Some(existing.as_path()));
+        // 还没建出来的子目录 → 退到已经存在的那一层。
+        let missing = existing.join("cc-sessions-viewer-not-created").join("deeper");
+        assert_eq!(nearest_existing(&missing).as_deref(), Some(existing.as_path()));
+        // 空路径没有任何祖先，返回 None 让调用方报错而不是 reveal 到奇怪的地方。
+        assert_eq!(nearest_existing(Path::new("")), None);
+    }
+}
+
+#[cfg(test)]
 mod codex_runtime_tests {
     use super::{agent_supports_worktrees, top_level_toml_string};
 
@@ -608,7 +667,7 @@ model = "provider-level"
 
 /// 单个会话的 token 用量汇总（按 path + mtime 缓存）。
 /// 前端 ChatTopbar / SessionsView 卡片懒加载这条。
-#[tauri::command]
+#[tauri::command(async)]
 fn session_usage(agent: String, path: String) -> Result<UsageSummary, String> {
     let src = agents::source(&agent)?;
     agents::session_usage(&*src, &path)
@@ -616,13 +675,13 @@ fn session_usage(agent: String, path: String) -> Result<UsageSummary, String> {
 
 /// 「当前上下文」用量 —— 取会话最后一条 usage（≈末尾上下文规模），而非全程累加。
 /// 续聊（resume）时前端拿它给上下文进度角标做种子，否则刚切过去会显示 0% 与 TUI 不符。
-#[tauri::command]
+#[tauri::command(async)]
 fn session_context_usage(agent: String, path: String) -> Result<UsageSummary, String> {
     let src = agents::source(&agent)?;
     src.context_usage(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn session_last_prompt(agent: String, path: String) -> Result<Option<String>, String> {
     let src = agents::source(&agent)?;
     src.last_prompt(&path)
@@ -631,7 +690,7 @@ fn session_last_prompt(agent: String, path: String) -> Result<Option<String>, St
 /// 当前 agent 的统计概览：顶层标量 + 项目排行（按 token 降序）+ 日活时间轴。
 /// **保留作兼容入口** —— 旧版同步路径仍然可用，但内容比 start_agent_stats 简化（没有
 /// cost / by_model / by_tool 等）。前端默认走流式接口，这里只作兜底。
-#[tauri::command]
+#[tauri::command(async)]
 fn agent_stats(agent: String) -> Result<AgentStats, String> {
     let src = agents::source(&agent)?;
     agents::agent_stats(&*src, &agent)
@@ -817,7 +876,7 @@ fn cleanup_worktree_project_dirs(worktree_path: String) -> Result<(), String> {
     worktrees::cleanup_project_dirs(&worktree_path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_trash() -> Result<Vec<TrashItem>, String> {
     trash::list()
 }
@@ -1748,24 +1807,14 @@ fn write_binary_file(path: String, base64: String) -> Result<String, String> {
     Ok(p.to_string_lossy().to_string())
 }
 
-/// 把前端传来的 base64 图片数据保存到临时文件，返回路径。
+/// 把前端传来的 base64 图片数据保存到附件目录，返回路径。
 /// 用于内嵌终端的 Cmd+V 贴图：xterm 拿到路径后写入 PTY stdin。
 #[tauri::command]
-fn save_clipboard_image(data: String, media_type: String) -> Result<String, String> {
-    let ext = match media_type.as_str() {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "png",
-    };
-    let ts = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
-    let name = format!("clipboard-{ts}.{ext}");
-    let dir = std::env::temp_dir();
-    let path = dir.join(&name);
+fn save_clipboard_image(app: AppHandle, data: String, media_type: String) -> Result<String, String> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
         .map_err(|e| format!("base64 decode failed: {e}"))?;
-    fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    let ext = attachments::extension_for(&media_type);
+    let path = attachments::save(&app, &bytes, ext, "clipboard")?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -1773,7 +1822,7 @@ fn save_clipboard_image(data: String, media_type: String) -> Result<String, Stri
 /// cannot expose screenshots (especially TIFF-backed ones) through the
 /// browser Clipboard API, so the desktop process reads NSPasteboard directly.
 #[tauri::command]
-fn save_macos_clipboard_image() -> Result<Option<String>, String> {
+fn save_macos_clipboard_image(app: AppHandle) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     {
         use objc2::runtime::AnyObject;
@@ -1787,7 +1836,10 @@ fn save_macos_clipboard_image() -> Result<Option<String>, String> {
         let (data, is_tiff) = pasteboard
             .dataForType(unsafe { NSPasteboardTypePNG })
             .map(|data| (data.to_vec(), false))
-            .or_else(|| unsafe { pasteboard.dataForType(NSPasteboardTypeTIFF) }.map(|data| (data.to_vec(), true)))
+            .or_else(|| {
+                unsafe { pasteboard.dataForType(NSPasteboardTypeTIFF) }
+                    .map(|data| (data.to_vec(), true))
+            })
             .ok_or_else(|| "No image on the macOS clipboard".to_string())?;
         if data.is_empty() {
             return Ok(None);
@@ -1809,14 +1861,13 @@ fn save_macos_clipboard_image() -> Result<Option<String>, String> {
         } else {
             data
         };
-        let timestamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S-%f");
-        let path = std::env::temp_dir().join(format!("clipboard-{timestamp}.png"));
-        fs::write(&path, data).map_err(|e| format!("Failed to write clipboard image: {e}"))?;
+        let path = attachments::save(&app, &data, "png", "clipboard")?;
         Ok(Some(path.to_string_lossy().to_string()))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = app;
         Ok(None)
     }
 }
@@ -1842,9 +1893,29 @@ fn read_macos_clipboard_text() -> Result<Option<String>, String> {
     }
 }
 
+/// 往上找第一个真实存在的祖先目录。
+///
+/// 存储面板里的目录可能压根还没被创建过（没存过附件、没缓存过图片），而 `open -R` 对着
+/// 一个不存在的路径是静默失败的 —— 按钮看着就像坏了。退到最近的祖先，至少能把人带到
+/// 该去的地方。
+fn nearest_existing(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
 /// 在系统文件管理器中显示该文件。
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
+    let path = nearest_existing(Path::new(&path))
+        .ok_or_else(|| format!("Path no longer exists: {path}"))?
+        .to_string_lossy()
+        .into_owned();
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
@@ -2122,7 +2193,7 @@ fn open_path_external(
 
 /// 系统图片选择器给的是路径而非字节（没装 fs 插件），这里按路径读出来编成 base64，
 /// 前端拿去做缩略图 + 视觉块（与粘贴/拖拽的图片同形）。仅用于图片附件。
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_base64(path: String) -> Result<crate::types::ChatImageInput, String> {
     use base64::Engine as _;
     let p = PathBuf::from(&path);
@@ -2137,33 +2208,15 @@ fn read_file_base64(path: String) -> Result<crate::types::ChatImageInput, String
     })
 }
 
-/// 粘贴板图片无磁盘路径，存到临时目录供 Codex 等 agent 通过 @"path" 引用。
+/// 粘贴板图片无磁盘路径，存到附件目录供 Codex 等 agent 通过 @"path" 引用。
 #[tauri::command]
-fn save_temp_image(base64: String, media_type: String) -> Result<String, String> {
+fn save_temp_image(app: AppHandle, base64: String, media_type: String) -> Result<String, String> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&base64)
         .map_err(|e| format!("base64 decode: {e}"))?;
-    let ext = if media_type.contains("png") {
-        "png"
-    } else if media_type.contains("gif") {
-        "gif"
-    } else if media_type.contains("webp") {
-        "webp"
-    } else {
-        "jpg"
-    };
-    let dir = std::env::temp_dir().join("cc-sessions-viewer-images");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let name = format!(
-        "chat-img-{}.{ext}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    let path = dir.join(&name);
-    std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
+    let ext = attachments::extension_for(&media_type);
+    let path = attachments::save(&app, &bytes, ext, "chat-img")?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -2214,22 +2267,22 @@ fn git_has_repo(cwd: String) -> bool {
     git::git_has_repo(&cwd)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<crate::types::GitCommit>, String> {
     git::git_log(&cwd, limit)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_status(cwd: String) -> Result<Vec<crate::types::GitFileStatus>, String> {
     git::git_status(&cwd)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_diff_files(cwd: String, git_ref: String) -> Result<Vec<crate::types::GitDiffFile>, String> {
     git::git_diff_files(&cwd, &git_ref)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_diff_file(
     cwd: String,
     git_ref: String,
@@ -2550,8 +2603,8 @@ pub fn run() {
     }));
 
     // 开发期注入 MCP Bridge —— 让 AI 助手经 WebSocket 直接看/控这个 app（截图 /
-    // DOM 快照 / 执行 JS / 监控 IPC）。feature "dev-mcp"（default 但 release
-    // 构建通过 --no-default-features 排除）控制是否编译链接。
+    // DOM 快照 / 执行 JS / 监控 IPC）。feature "dev-mcp" **不在 default 里**，
+    // 必须显式 `--features dev-mcp` 才编进来（`npm run tauri dev` 是没有桥的）。
     // 绑 127.0.0.1（默认是 0.0.0.0），避免把调试端口 9223 暴露到局域网。
     #[cfg(feature = "dev-mcp")]
     let builder = builder.plugin(
@@ -2566,6 +2619,13 @@ pub fn run() {
             app_storage::data_directory,
             app_storage::change_data_directory,
             app_storage::reset_data_directory,
+            app_storage::storage_usage,
+            app_storage::clear_storage,
+            app_storage::trash_retention,
+            app_storage::set_trash_retention,
+            app_storage::trash_retention_notice,
+            app_storage::ack_trash_retention,
+            diagnostics::runtime_diagnostics,
             list_sessions,
             read_session,
             session_tree,
@@ -2575,6 +2635,7 @@ pub fn run() {
             check_watched_session,
             terminal_turn_signal,
             install_turn_hooks,
+            uninstall_turn_hooks,
             turn_hook_status,
             desktop_pet_tasks,
             acknowledge_desktop_pet_task,
@@ -2683,6 +2744,11 @@ pub fn run() {
             // 不阻塞 setup —— init() 自己 spawn 后台线程，离线 / 失败时先用过期
             // 磁盘缓存兜着，前端按 pricing_status 渲染 error placeholder。
             stats::pricing::init();
+            // 会话图片的磁盘缓存目录。要 AppHandle 才能定位数据目录，所以在这里解析一次
+            // 存起来；解析不到就整体停用，图片照旧内联。
+            image_cache::init(app.handle());
+            // 磁盘治理：附件目录、图片缓存、回收站保留期。后台线程，启动 + 每 24 小时。
+            storage_gc::spawn_maintenance(app.handle().clone());
             if let Err(e) = turn::start_signal_watcher(app.handle().clone()) {
                 eprintln!("turn signal watcher failed: {e}");
             }

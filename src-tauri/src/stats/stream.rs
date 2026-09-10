@@ -59,7 +59,8 @@ pub fn start(app: AppHandle, scope: String, range: String, request_id: u64) {
         }
         match result {
             Ok(final_stats) => {
-                let _ = app.emit(
+                let _ = app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
                     "stats://done",
                     StatsDone {
                         request_id,
@@ -68,7 +69,8 @@ pub fn start(app: AppHandle, scope: String, range: String, request_id: u64) {
                 );
             }
             Err(e) => {
-                let _ = app.emit(
+                let _ = app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
                     "stats://error",
                     StatsError {
                         request_id,
@@ -302,7 +304,8 @@ fn emit_progress(
     scope: &str,
 ) {
     let partial = agg.snapshot(scope);
-    let _ = app.emit(
+    let _ = app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "stats://progress",
         StatsProgress {
             request_id,

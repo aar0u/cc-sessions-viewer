@@ -20,6 +20,7 @@ import { highlightDiff, looksLikeDiff } from './diffHighlight'
 import { shouldAttachToolResult, shouldPreferToolResult } from './toolResultRouting'
 import { renderCodexPluginMentionHtmlText } from './codexPluginMentions'
 import { agentLabel } from './agentMeta'
+import { inlineLocalImages } from './imageInline'
 
 function sanitizeFilename(name: string): string {
   const cleaned = name.replace(/[\\/:*?"<>|\n\r\t]/g, '_').trim()
@@ -1575,12 +1576,12 @@ export function buildExportEnvelope(
   )
 }
 
-export function exportMarkdown(
+export async function exportMarkdown(
   session: SessionMeta,
   messages: Msg[],
   agent: Agent,
 ): Promise<string | null> {
-  const md = messagesToMarkdown(session, messages, agent)
+  const md = messagesToMarkdown(session, await inlineLocalImages(messages), agent)
   return pickAndWrite(md, `${sanitizeFilename(session.title)}.md`, 'md')
 }
 
@@ -1590,16 +1591,16 @@ export async function exportHtml(
   agent: Agent,
   hiddenKeys?: string[],
 ): Promise<string | null> {
-  const html = await messagesToHtml(session, messages, agent, hiddenKeys)
+  const html = await messagesToHtml(session, await inlineLocalImages(messages), agent, hiddenKeys)
   return pickAndWrite(html, `${sanitizeFilename(session.title)}.html`, 'html')
 }
 
-export function exportJson(
+export async function exportJson(
   session: SessionMeta,
   messages: Msg[],
   agent: Agent,
 ): Promise<string | null> {
-  const json = buildExportEnvelope(session, messages, agent)
+  const json = buildExportEnvelope(session, await inlineLocalImages(messages), agent)
   return pickAndWrite(json, `${sanitizeFilename(session.title)}.json`, 'json')
 }
 
@@ -1646,7 +1647,7 @@ export async function exportMarkdownToDir(
   agent: Agent,
   dir: string,
 ): Promise<string> {
-  const md = messagesToMarkdown(session, messages, agent)
+  const md = messagesToMarkdown(session, await inlineLocalImages(messages), agent)
   return writeFile(`${dir}/${batchFileName(session, 'md')}`, md)
 }
 
@@ -1657,7 +1658,7 @@ export async function exportHtmlToDir(
   agent: Agent,
   dir: string,
 ): Promise<string> {
-  const html = await messagesToHtml(session, messages, agent)
+  const html = await messagesToHtml(session, await inlineLocalImages(messages), agent)
   return writeFile(`${dir}/${batchFileName(session, 'html')}`, html)
 }
 
@@ -1668,7 +1669,7 @@ export async function exportJsonToDir(
   agent: Agent,
   dir: string,
 ): Promise<string> {
-  const json = buildExportEnvelope(session, messages, agent)
+  const json = buildExportEnvelope(session, await inlineLocalImages(messages), agent)
   return writeFile(`${dir}/${batchFileName(session, 'json')}`, json)
 }
 

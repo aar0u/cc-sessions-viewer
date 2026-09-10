@@ -3,6 +3,7 @@ import { t } from './i18n'
 import { renderCodexPluginLinkHtml } from './codexPluginMentions'
 import { inlineFileMentions } from './inlineFileMentions'
 import type { Msg } from './types'
+import { RENDER_TEXT_CACHE_MAX_CHARS } from './renderLimits'
 
 function escapeHtml(s: string): string {
   return s
@@ -750,8 +751,12 @@ export function stripImagePlaceholders(raw: string): string {
 
 // renderText 是纯函数（只依赖 raw）。虚拟滚动下同一条消息会随滚动反复挂载/卸载,每次模板
 // v-html 都重跑一遍 markdown 解析 —— 用一个带上限的 LRU 缓存按 raw 记住结果,滚动重入零解析。
+//
+// 上限按**字符数**而不是条数：一条 5 MB 的 tool 输出和一条 20 字节的问候在条数上等价，
+// 3000 条的旧上限对前者等于完全没有上限。这里连 key（raw）带 value（html）一起计量，
+// 因为两者都是这个 Map 独占持有的。
 const renderTextCache = new Map<string, string>()
-const RENDER_CACHE_MAX = 3000
+let renderTextCacheChars = 0
 
 /** 渲染 Markdown 子集：围栏代码块、图片、行内强调和 GFM table。 */
 export function renderText(raw: string): string {
@@ -763,13 +768,35 @@ export function renderText(raw: string): string {
     return cached
   }
   const out = renderTextImpl(raw)
+  // 单条就超过整个预算的巨块不进缓存 —— 存进去会把其它所有条目挤干净，
+  // 而它自己下次滚回来时多半也已被淘汰。
+  if (raw.length + out.length > RENDER_TEXT_CACHE_MAX_CHARS) return out
   renderTextCache.set(raw, out)
-  if (renderTextCache.size > RENDER_CACHE_MAX) {
+  renderTextCacheChars += raw.length + out.length
+  evictRenderTextCache()
+  return out
+}
+
+function evictRenderTextCache(): void {
+  while (renderTextCacheChars > RENDER_TEXT_CACHE_MAX_CHARS) {
     // 淘汰最旧一条（Map 迭代序 = 插入序）。
     const oldest = renderTextCache.keys().next().value
-    if (oldest !== undefined) renderTextCache.delete(oldest)
+    if (oldest === undefined) break
+    const dropped = renderTextCache.get(oldest)
+    renderTextCache.delete(oldest)
+    renderTextCacheChars -= oldest.length + (dropped?.length ?? 0)
   }
-  return out
+}
+
+/** 测试用：清空 markdown 渲染缓存。 */
+export function resetRenderTextCache(): void {
+  renderTextCache.clear()
+  renderTextCacheChars = 0
+}
+
+/** 测试用：当前缓存占用的字符数。 */
+export function renderTextCacheSize(): { entries: number; chars: number } {
+  return { entries: renderTextCache.size, chars: renderTextCacheChars }
 }
 
 /** 流式预览专用：每一帧文本都是一次性增长前缀，不写 LRU，避免缓存大量中间 HTML。 */
@@ -927,7 +954,26 @@ function renderTextImpl(raw: string, cacheNested = true): string {
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  // 存储面板和内存卡片上的数字会到 GB 级，停在 `1740.8 MB` 读起来太费劲。
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+}
+
+/**
+ * 中段省略的路径：`/Users/me/Library/Application Support/com.x.app/image-cache`
+ * → `/Users/…/com.x.app/image-cache`。
+ *
+ * 直接交给 CSS 的 `text-overflow: ellipsis` 会从尾巴截，而路径恰恰是尾巴那两段有信息量
+ * （前缀家家一样）。用 `direction: rtl` 倒是能从头截，但会把开头的 `/` 甩到行尾。所以在
+ * 这里按分隔符切，保留首段和末两段。完整路径仍在 tooltip 里。
+ */
+export function elidePath(path: string, keepTail = 2): string {
+  const separator = path.includes('\\') && !path.includes('/') ? '\\' : '/'
+  const segments = path.split(separator)
+  // 绝对路径切出来的首元素是空串（前导分隔符），跟着首段一起原样拼回去。
+  const lead = segments[0] === '' ? 2 : 1
+  if (segments.length <= lead + keepTail) return path
+  return [...segments.slice(0, lead), '…', ...segments.slice(-keepTail)].join(separator)
 }
 
 /** 紧凑 token 数：≤ 999 直接写，1000-999_999 显示 `12.3K`，≥ 1M 显示 `1.2M`。

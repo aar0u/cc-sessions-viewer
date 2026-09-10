@@ -10,6 +10,7 @@ import { ref, computed } from 'vue'
 import type { Agent, SessionMeta, Msg, PiTreeNode } from './types'
 import { closeChat, type ChatSession } from './chatSessions'
 import { sessionPathsEqual, type TabStatusKind } from './tabStatus'
+import { snapshotMsgs } from './msgSnapshot'
 import { activeViewTabId, panes, focusPane, ensureLayout } from './panes'
 
 function normalizeStoredAgent(agent: unknown): Agent | null {
@@ -32,8 +33,14 @@ export interface ViewTab {
   createdAt: number
   // session tab
   session: SessionMeta | null
+  /** 只读快照，永不就地改写 —— 只经 `setTabMsgs` 整体替换（见 msgSnapshot.ts）。 */
   msgs: Msg[]
   loadingMsgs: boolean
+  /** msgs 是否已从磁盘装载。false = 只有壳：启动恢复时没读，或已被淘汰释放，
+   *  等这个 tab 真正被显示时再按需读盘。 */
+  msgsLoaded: boolean
+  /** 最近一次被某个 pane 显示的时刻；淘汰按它排 LRU。 */
+  lastShownAt: number
   /** Pi read-only branch state; omitted for other agents. */
   piTree: PiTreeNode[] | null
   piLeafId: string | null
@@ -97,8 +104,8 @@ export function createViewTab(partial: Partial<ViewTab> & Pick<ViewTab, 'type' |
     uiId,
     title: '',
     session: null,
-    msgs: [],
     loadingMsgs: false,
+    lastShownAt: 0,
     piTree: null,
     piLeafId: null,
     chatSession: null,
@@ -117,6 +124,10 @@ export function createViewTab(partial: Partial<ViewTab> & Pick<ViewTab, 'type' |
     // 仍回落到本项目聚焦格子，而不是被 undefined 覆盖。
     paneId: partial.paneId ?? ensureLayout(partial.agent, partial.projectKey).focusedPaneId,
     createdAt: partial.createdAt ?? Date.now(),
+    // 同样放在 spread 之后：调用方直接带 msgs 建 tab 时（chat 启动失败降级成只读），
+    // 这份消息必须打上快照标记并记成「已装载」，否则会被当成壳去重读、甚至被淘汰释放。
+    msgs: snapshotMsgs(partial.msgs ?? []),
+    msgsLoaded: partial.msgsLoaded ?? partial.msgs !== undefined,
   }
   viewTabs.value.push(tab)
   // Return the reactive proxy, not the plain object, so callers' mutations trigger reactivity
@@ -175,6 +186,71 @@ export function markViewTabViewed(tab: ViewTab) {
       session.turnStartedAt,
     )
   }
+}
+
+// ======================= 只读 transcript 的装载 / 淘汰 =======================
+//
+// 一个 session tab 拿着一整份 transcript，codex 的单个会话在本机能到 160 MB。
+// tab 按设计「切项目时隐藏但不杀」，所以过去打开过且没关的每个 tab 各自常驻一份，
+// 启动时还会把保存的 tab 全部读一遍 —— 攒十几个 tab 就是启动即数 GB。
+//
+// 现在只有**正在被某个 pane 显示**的 tab 需要 msgs：
+//   · 启动恢复只建壳（`msgsLoaded = false`），被显示时才读盘；
+//   · 后台 tab 超过闲置时限、或已装载数超过上限时，释放 msgs 变回壳；
+//   · 再次显示时重新读盘。只读数据，重读结果与释放前一致，用户只多看到一次 loading。
+// chat tab 不参与：它的 msgs 是进程实时推来的，磁盘上没有等价来源，丢了就回不来。
+
+/** 同时保有 msgs 的后台 session tab 上限（正在显示的不计入，也永不淘汰）。 */
+export const LOADED_SESSION_TAB_LIMIT = 8
+/** 后台 session tab 的闲置释放时限。 */
+export const SESSION_TAB_IDLE_MS = 10 * 60 * 1000
+
+/** 整体替换一个 tab 的消息列表。**唯一**的写入口：负责打非响应式快照标记
+ *  （见 msgSnapshot.ts）并把 tab 标记为已装载。 */
+export function setTabMsgs(tab: ViewTab, msgs: Msg[]) {
+  tab.msgs = snapshotMsgs(msgs)
+  tab.msgsLoaded = true
+}
+
+/** 当前真正被渲染的 view tab id —— 每个 pane 的 active tab。分屏下同时可见多个，
+ *  所以「可见」不等于 `activeViewTabId`（那只是**聚焦**格子的投影）。 */
+export function visibleViewTabIds(): Set<number> {
+  const ids = new Set<number>()
+  for (const pane of panes.values()) {
+    if (pane.activeViewTabId != null) ids.add(pane.activeViewTabId)
+  }
+  return ids
+}
+
+/** 释放一个后台 session tab 的 msgs，退回「壳」状态。
+ *
+ *  不动 `loadingMsgs` —— 那个标志的含义是「此刻正有人在读盘」，是 `ensureSessionTabLoaded`
+ *  的重入闸门。壳状态由 `msgsLoaded === false` 表达，UI 的 loading 态也看它。 */
+function releaseTabMsgs(tab: ViewTab) {
+  tab.msgs = snapshotMsgs([])
+  tab.msgsLoaded = false
+}
+
+/** 刷新可见 tab 的 LRU 时间戳，并释放该释放的后台 tab。返回被释放的 tab id。 */
+export function sweepSessionTabs(now = Date.now()): number[] {
+  const visible = visibleViewTabIds()
+  for (const tab of viewTabs.value) {
+    if (visible.has(tab.uiId)) tab.lastShownAt = now
+  }
+  const candidates = viewTabs.value.filter(
+    tab => tab.type === 'session' && tab.msgsLoaded && !visible.has(tab.uiId),
+  )
+  // 最近显示的排前面；先淘汰最久没看的。
+  candidates.sort((a, b) => b.lastShownAt - a.lastShownAt)
+  const released: number[] = []
+  candidates.forEach((tab, index) => {
+    const overLimit = index >= LOADED_SESSION_TAB_LIMIT
+    const idle = now - tab.lastShownAt >= SESSION_TAB_IDLE_MS
+    if (!overLimit && !idle) return
+    releaseTabMsgs(tab)
+    released.push(tab.uiId)
+  })
+  return released
 }
 
 export function removeViewTab(uiId: number): Promise<void> {

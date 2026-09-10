@@ -432,7 +432,10 @@ fn reader_loop(app: AppHandle, id: u64, mut reader: Box<dyn Read + Send>) {
             id,
             base64: B64.encode(&acc),
         };
-        if app.emit("pty://data", payload).is_err() {
+        if app
+            .emit_to(crate::MAIN_WINDOW_LABEL, "pty://data", payload)
+            .is_err()
+        {
             // 事件 emit 失败通常意味着 app 在 teardown —— 直接 break。
             break;
         }
@@ -456,7 +459,11 @@ fn waiter_loop(app: AppHandle, id: u64) {
         match res {
             Ok(Some(status)) => {
                 let code = status.exit_code() as i32;
-                let _ = app.emit("pty://exit", ExitPayload { id, code });
+                let _ = app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
+                    "pty://exit",
+                    ExitPayload { id, code },
+                );
                 if let Ok(mut m) = map().lock() {
                     m.remove(&id);
                 }
@@ -466,7 +473,11 @@ fn waiter_loop(app: AppHandle, id: u64) {
                 thread::sleep(Duration::from_millis(150));
             }
             Err(_) => {
-                let _ = app.emit("pty://exit", ExitPayload { id, code: -1 });
+                let _ = app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
+                    "pty://exit",
+                    ExitPayload { id, code: -1 },
+                );
                 if let Ok(mut m) = map().lock() {
                     m.remove(&id);
                 }

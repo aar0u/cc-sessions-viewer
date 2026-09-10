@@ -634,9 +634,11 @@ fn codex_subtitle_body(text: &str) -> String {
             continue;
         };
         let lower = format!("{name} {path}").to_ascii_lowercase();
-        if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico"]
-            .iter()
-            .any(|ext| lower.ends_with(ext))
+        if [
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
         {
             image_count += 1;
         }
@@ -2504,25 +2506,17 @@ impl SessionSource for CodexSource {
 //     和 `total_token_usage`（自 session 开始累积）。优先取 last_*；老格式没 last_* 时
 //     从 total_* 相对前一帧的差值还原。两个连续帧 total_tokens 相同 → 重复事件，跳过。
 fn last_user_text(fp: &Path) -> Option<String> {
-    let raw = fs::read(fp).ok()?;
-    for line in raw.rsplit(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+    // 分块反向扫描：峰值内存 = 一个 1 MB 块，而不是整个 rollout（本机最大 160 MB）。
+    // 命中即停，绝大多数会话只会真正读到尾部一小段。
+    crate::util::scan_lines_backwards(fp, |line| {
+        let v: Value = serde_json::from_slice(line).ok()?;
+        let text = codex_user_text(&v)?;
+        if is_codex_internal_user_text(&text) {
+            return None;
         }
-        let Ok(v) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        if let Some(t) = codex_user_text(&v) {
-            if is_codex_internal_user_text(&t) {
-                continue;
-            }
-            let clean = crate::util::truncate_subtitle(&codex_subtitle_body(&t));
-            if !clean.is_empty() {
-                return Some(clean);
-            }
-        }
-    }
-    None
+        let clean = crate::util::truncate_subtitle(&codex_subtitle_body(&text));
+        (!clean.is_empty()).then_some(clean)
+    })
 }
 
 fn read_turns(fp: &Path) -> Vec<Turn> {
@@ -3043,8 +3037,7 @@ mod tests {
     fn read_codex_keeps_example_windows_paths_in_protocol_image_message_as_text() {
         let first = r#"C:\Users\Jane Doe\AppData\Local\Temp\pi-clipboard-first.png"#;
         let second = r#"C:\Users\Jane Doe\AppData\Local\Temp\pi-clipboard-second.png"#;
-        let image_header =
-            r#"<image name=[Image #1] path="C:\Users\Jane Doe\AppData\Local\Temp\codex-clipboard.png">"#;
+        let image_header = r#"<image name=[Image #1] path="C:\Users\Jane Doe\AppData\Local\Temp\codex-clipboard.png">"#;
         let text = format!("hi, {first}, ooo, {second}, this is an image test [Image #1]");
         let lines = [
             json!({

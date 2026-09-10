@@ -321,7 +321,8 @@ describe('DesktopPet', () => {
     expect(wrapper.get('.pet-atlas-sprite').attributes('data-look-frame')).toBeUndefined()
 
     cursor = { x: 256, y: 261 }
-    await vi.advanceTimersByTimeAsync(50)
+    // 指针轮询间隔（DesktopPet 的 CURSOR_POLL_MS）。
+    await vi.advanceTimersByTimeAsync(100)
     await flushPromises()
 
     expect(wrapper.get('.pet-atlas-sprite').attributes('data-state')).toBe('review')

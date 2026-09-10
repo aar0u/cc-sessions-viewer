@@ -3,12 +3,16 @@ import type { Block, Msg, SessionMeta } from '../src/types'
 
 // Tauri's save dialog and the filesystem command are unavailable in jsdom —
 // stub them so the落盘 path (exportMarkdown / exportHtml) is testable.
-const { saveMock, writeFileMock } = vi.hoisted(() => ({
+const { saveMock, writeFileMock, readFileBase64Mock } = vi.hoisted(() => ({
   saveMock: vi.fn(),
   writeFileMock: vi.fn(),
+  readFileBase64Mock: vi.fn(),
 }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: saveMock }))
-vi.mock('../src/api', () => ({ writeFile: writeFileMock }))
+vi.mock('../src/api', () => ({
+  writeFile: writeFileMock,
+  readFileBase64: readFileBase64Mock,
+}))
 
 import {
   batchExportFolderName,
@@ -28,6 +32,11 @@ beforeEach(() => {
   setExportShowMessageTime(true)
   saveMock.mockReset()
   writeFileMock.mockReset()
+  readFileBase64Mock.mockReset()
+  readFileBase64Mock.mockImplementation(async () => ({
+    mediaType: 'image/png',
+    data: 'SU1BR0U=',
+  }))
 })
 afterEach(() => {
   document.documentElement.classList.remove('theme-dark')
@@ -529,6 +538,40 @@ describe('exportMarkdown / exportHtml', () => {
     expect(parsed.session.id).toBe('sess-1')
     expect(parsed.messages).toHaveLength(2)
     expect(parsed.messages[0].blocks[0].text).toBe('hi')
+  })
+
+  // 导出产物必须自包含。本地路径图片（会话图片磁盘缓存、Codex 的 @文件、剪贴板截图）
+  // 在别的机器上、以及用普通浏览器打开导出的 HTML 时都解析不到，所以导出前读回 base64。
+  it('inlines a local-path image into the markdown export', async () => {
+    saveMock.mockResolvedValue('/Users/me/out.md')
+    writeFileMock.mockResolvedValue('/Users/me/out.md')
+    const image = { kind: 'image' as const, imageSrc: '/Users/me/cache/abc.png', isError: false }
+    await exportMarkdown(session(), [msg('user', [image])], 'claude')
+
+    const written = writeFileMock.mock.calls[0][1]
+    expect(written).toContain('data:image/png;base64,SU1BR0U=')
+    expect(written).not.toContain('/Users/me/cache/abc.png')
+  })
+
+  it('inlines a local-path image into the html export', async () => {
+    saveMock.mockResolvedValue('/Users/me/out.html')
+    writeFileMock.mockResolvedValue('/Users/me/out.html')
+    const image = { kind: 'image' as const, imageSrc: '/Users/me/cache/abc.png', isError: false }
+    await exportHtml(session(), [msg('user', [image])], 'claude')
+
+    const written = writeFileMock.mock.calls[0][1]
+    expect(written).toContain('data:image/png;base64,SU1BR0U=')
+    expect(written).not.toContain('/Users/me/cache/abc.png')
+  })
+
+  it('inlines a local-path image into the JSON envelope', async () => {
+    saveMock.mockResolvedValue('/Users/me/out.json')
+    writeFileMock.mockResolvedValue('/Users/me/out.json')
+    const image = { kind: 'image' as const, imageSrc: '/Users/me/cache/abc.png', isError: false }
+    await exportJson(session(), [msg('user', [image])], 'claude')
+
+    const parsed = JSON.parse(writeFileMock.mock.calls[0][1])
+    expect(parsed.messages[0].blocks[0].imageSrc).toBe('data:image/png;base64,SU1BR0U=')
   })
 
   it('omits time fields from JSON exports when export times are disabled', () => {

@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { RENDER_TEXT_CACHE_MAX_CHARS } from '../src/renderLimits'
+import { renderTextCacheSize, resetRenderTextCache } from '../src/format'
 import {
   cleanMetaText,
   displaySessionId,
   formatElapsedSeconds,
+  elidePath,
   formatSize,
   formatTime,
   historicalMessageExecutionMs,
@@ -711,6 +714,31 @@ describe('formatSize', () => {
     expect(formatSize(1024 * 1024)).toBe('1.0 MB')
     expect(formatSize(2.5 * 1024 * 1024)).toBe('2.5 MB')
   })
+
+  // 存储面板的合计和内存卡片都会到 GB 级，停在 `1740.8 MB` 读起来费劲。
+  it('formats gibibytes with one decimal', () => {
+    expect(formatSize(1024 * 1024 * 1024 - 1)).toBe('1024.0 MB')
+    expect(formatSize(1024 * 1024 * 1024)).toBe('1.0 GB')
+    expect(formatSize(1.7 * 1024 * 1024 * 1024)).toBe('1.7 GB')
+  })
+})
+
+describe('elidePath', () => {
+  it('keeps short paths whole', () => {
+    expect(elidePath('/Users/me/.claude')).toBe('/Users/me/.claude')
+    expect(elidePath('/data/image-cache')).toBe('/data/image-cache')
+  })
+
+  it('elides the middle of a deep path, keeping the leading slash and the tail', () => {
+    expect(elidePath('/Users/me/Library/Application Support/com.x.app/image-cache'))
+      .toBe('/Users/…/com.x.app/image-cache')
+  })
+
+  it('handles Windows paths and relative paths', () => {
+    expect(elidePath('C:\\Users\\me\\AppData\\Local\\com.x.app\\EBWebView'))
+      .toBe('C:\\…\\com.x.app\\EBWebView')
+    expect(elidePath('a/b/c/d/e')).toBe('a/…/d/e')
+  })
 })
 
 describe('formatTime', () => {
@@ -915,5 +943,34 @@ describe('formatTokens', () => {
   it('rounds sub-1k values to the nearest integer', () => {
     expect(formatTokens(999.4)).toBe('999')
     expect(formatTokens(500.6)).toBe('501')
+  })
+})
+
+// markdown 渲染缓存的总量封顶。原实现按 3000 **条**封顶 —— 一条 5 MB 的 tool 输出
+// 和一条 20 字节的问候等价计数，对前者等于完全没有上限。
+describe('renderText cache', () => {
+  beforeEach(() => resetRenderTextCache())
+  afterEach(() => resetRenderTextCache())
+
+  it('keeps small entries and reuses them', () => {
+    const raw = 'hello **world**'
+    expect(renderText(raw)).toBe(renderText(raw))
+    expect(renderTextCacheSize().entries).toBe(1)
+  })
+
+  it('stays under the byte budget while entries keep arriving', () => {
+    const chunk = 'x'.repeat(Math.ceil(RENDER_TEXT_CACHE_MAX_CHARS / 8))
+    for (let i = 0; i < 40; i++) renderText(`${i} ${chunk}`)
+    const { chars, entries } = renderTextCacheSize()
+    expect(chars).toBeLessThanOrEqual(RENDER_TEXT_CACHE_MAX_CHARS)
+    expect(entries).toBeGreaterThan(0)
+    expect(entries).toBeLessThan(40)
+  })
+
+  it('renders but does not cache a block bigger than the whole budget', () => {
+    const huge = 'y'.repeat(RENDER_TEXT_CACHE_MAX_CHARS + 1)
+    // 存进去会把其它所有条目挤干净，而它自己下次滚回来时多半也已被淘汰。
+    expect(renderText(huge)).toContain('y')
+    expect(renderTextCacheSize().entries).toBe(0)
   })
 })

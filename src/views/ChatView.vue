@@ -11,6 +11,7 @@ import { renderAllMermaid, resetMermaidForTheme } from '../mermaid'
 import { renderAllMath } from '../mathRender'
 import { highlightAllCodeBlocks, rehighlightAllCodeBlocks } from '../shikiHighlight'
 import { decorateCodeBlocks } from '../codeCopy'
+import { shouldVirtualize as shouldVirtualizeMessages } from '../renderLimits'
 import { theme, showToolCalls, showChatRail, chatRailCount } from '../settings'
 import { t } from '../i18n'
 import ToolResult from '../components/ToolResult.vue'
@@ -1202,8 +1203,10 @@ const vlistEl = ref<HTMLElement>()
 const listScrollMargin = ref(0)
 // 小会话的全部行留在普通文档流中。此时虚拟化的「估算高度 → 实测高度」只有成本，图片、视频和
 // Mermaid 完成异步布局时还会改写累计偏移，造成从底部开始阅读时跳位。长会话才需要它来控制 DOM 数量。
-const VIRTUALIZATION_THRESHOLD = 80
-const shouldVirtualize = computed(() => props.messages.length > VIRTUALIZATION_THRESHOLD)
+//
+// 判定同时看条数和正文体积（见 renderLimits.ts）：只看条数会漏掉「20 条 × 每条 500 KB」
+// 这类会话 —— 条数远没到 80，DOM 却一样会被撑爆。
+const shouldVirtualize = computed(() => shouldVirtualizeMessages(props.messages))
 function measureListMargin() {
   const s = scrollEl.value
   const v = vlistEl.value
@@ -2604,6 +2607,7 @@ function onDocClick(e: MouseEvent) {
                 v-else
                 :src="imageSrcUrl(b.imageSrc!)"
                 loading="lazy"
+                decoding="async"
                 alt=""
                 @error="markImageUnavailable(b)"
               />

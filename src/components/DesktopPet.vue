@@ -103,6 +103,8 @@ const windowSize = computed(() => {
 let dragSession: DragSession | null = null
 let pendingWindowPosition: { x: number; y: number } | null = null
 let moveFrame = 0
+/** 全局指针轮询间隔（ms）。见 onMounted 里的说明。 */
+const CURSOR_POLL_MS = 100
 let cursorTimer: ReturnType<typeof setInterval> | null = null
 let wakeTimer: ReturnType<typeof setTimeout> | null = null
 let gazeTimer: ReturnType<typeof setTimeout> | null = null
@@ -319,19 +321,26 @@ function updateLocalLook(event: PointerEvent) {
 
 async function pollGlobalCursor() {
   if (cursorPollPending || !characterArea.value || dragging.value) return
+  // 页面被隐藏 / 桌宠不可见时不轮询：看不见的视线跟随没有意义，白烧 IPC。
+  if (document.hidden) return
   cursorPollPending = true
   try {
-    const [pointer, windowPosition, scaleFactor] = await Promise.all([
-      cursorPosition(),
+    // 先只问指针位置。原实现每一拍都并发三个 IPC（指针 + 窗口位置 + 缩放），
+    // 20 拍/秒 = 60 次 IPC/秒，一直跑。指针没动时后两个纯属浪费 —— 而指针不动
+    // 恰恰是绝大多数时间的状态。
+    const pointer = await cursorPosition()
+    const moved =
+      !lastCursorPosition ||
+      pointer.x !== lastCursorPosition.x ||
+      pointer.y !== lastCursorPosition.y
+    if (!moved) return
+    if (lastCursorPosition) activateGaze()
+    lastCursorPosition = { x: pointer.x, y: pointer.y }
+
+    const [windowPosition, scaleFactor] = await Promise.all([
       currentWindow.outerPosition(),
       currentWindow.scaleFactor(),
     ])
-    if (lastCursorPosition && (
-      pointer.x !== lastCursorPosition.x || pointer.y !== lastCursorPosition.y
-    )) {
-      activateGaze()
-    }
-    lastCursorPosition = { x: pointer.x, y: pointer.y }
     const bounds = characterArea.value.getBoundingClientRect()
     const centerX = windowPosition.x + (bounds.left + bounds.width / 2) * scaleFactor
     const centerY = windowPosition.y + (bounds.top + bounds.height / 2) * scaleFactor
@@ -371,7 +380,9 @@ onMounted(async () => {
   await refreshTasks()
   await syncWindowSize()
   await currentWindow.show().catch(() => {})
-  cursorTimer = setInterval(pollGlobalCursor, 50)
+  // 100ms（10 拍/秒）足够让视线跟随看起来是连续的；50ms 那一档带来的平滑度肉眼
+  // 分辨不出，代价却是常驻的双倍 IPC。
+  cursorTimer = setInterval(pollGlobalCursor, CURSOR_POLL_MS)
   wakeTimer = setTimeout(() => { baseState.value = 'idle' }, 8000)
   window.addEventListener('pointerup', endDrag)
   window.addEventListener('pointercancel', cancelDrag)

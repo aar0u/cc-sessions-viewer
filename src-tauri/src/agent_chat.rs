@@ -25,7 +25,7 @@
 //
 // webview 刷新时后端进程不杀 —— 前端重连（list_running_chats → reconnect）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -107,6 +107,52 @@ struct CodexAppUserInput {
     questions: Vec<CodexAppUserInputQuestion>,
 }
 
+/// 只记住最近 N 条的去重集合。
+///
+/// `emitted_plan_*` 是「这条计划渲染过没有」的判据，防的是重复渲染，所以不能像
+/// 本轮台账那样每轮清空。但它们每轮至少加一条、从不删 —— 一个连开几天的 chat
+/// 会话就这么一直涨（`emitted_plan_turns` 的 key 还是整段计划正文，一条能有几 KB）。
+///
+/// 去重实际只需要最近的历史：几百轮之前发过的那条计划不可能再飞回来。所以按插入序
+/// 保留最近 `cap` 条，更早的丢掉。内存有上限，去重效果不变。
+struct RecentSet {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl RecentSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// 与 `HashSet::insert` 同义：true = 之前没见过（该渲染）。
+    fn insert(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// 去重集合保留的条数。一轮最多往每张表里加一条，512 轮的历史远超任何可能的重放窗口。
+const RECENT_EMIT_CAP: usize = 512;
+
 struct CodexAppServerShared {
     app: AppHandle,
     stdin: Mutex<ChildStdin>,
@@ -117,9 +163,9 @@ struct CodexAppServerShared {
     pending_approvals: Mutex<HashMap<String, CodexAppApproval>>,
     pending_user_inputs: Mutex<HashMap<String, CodexAppUserInput>>,
     streaming_agent_items: Mutex<HashSet<String>>,
-    emitted_plan_turns: Mutex<HashSet<String>>,
+    emitted_plan_turns: Mutex<RecentSet>,
     plan_item_texts: Mutex<HashMap<String, String>>,
-    emitted_plan_items: Mutex<HashSet<String>>,
+    emitted_plan_items: Mutex<RecentSet>,
     responses: Mutex<HashMap<String, serde_json::Value>>,
     response_cv: Condvar,
     next_request_id: AtomicU64,
@@ -145,6 +191,14 @@ struct ChatMeta {
 type ChatEntry = (Arc<ChatHandle>, Arc<ChatMeta>);
 
 static CHATS: OnceLock<Mutex<HashMap<u64, ChatEntry>>> = OnceLock::new();
+
+/// 诊断用：当前活着的 GUI chat 进程数。
+pub fn active_chat_count() -> usize {
+    CHATS
+        .get()
+        .and_then(|chats| chats.lock().ok().map(|guard| guard.len()))
+        .unwrap_or(0)
+}
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn map() -> &'static Mutex<HashMap<u64, ChatEntry>> {
@@ -194,6 +248,57 @@ fn release_and_remove_chat(id: u64) -> bool {
     };
     release_session_lease(&meta.session_lease);
     true
+}
+
+#[cfg(test)]
+mod recent_set_tests {
+    use super::{RecentSet, RECENT_EMIT_CAP};
+
+    #[test]
+    fn insert_reports_first_sighting_like_a_hashset() {
+        let mut set = RecentSet::new(4);
+        assert!(set.insert("a".into()));
+        assert!(!set.insert("a".into()));
+        assert!(set.insert("b".into()));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn forgets_the_oldest_entries_past_the_cap() {
+        let mut set = RecentSet::new(3);
+        for key in ["a", "b", "c", "d"] {
+            assert!(set.insert(key.into()));
+        }
+        assert_eq!(set.len(), 3);
+        // "a" 被挤掉了，所以它会被当成没见过 —— 这是有意的取舍：
+        // 几百轮之前发过的那条计划不可能再飞回来。
+        assert!(set.insert("a".into()));
+        // 最近的几条仍然被记着，重复不会漏掉。
+        assert!(!set.insert("d".into()));
+        assert!(!set.insert("c".into()));
+    }
+
+    #[test]
+    fn re_inserting_a_known_key_does_not_grow_the_queue() {
+        let mut set = RecentSet::new(2);
+        set.insert("a".into());
+        for _ in 0..100 {
+            assert!(!set.insert("a".into()));
+        }
+        assert_eq!(set.len(), 1);
+        assert!(set.insert("b".into()));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_shipped_cap_is_big_enough_to_be_invisible() {
+        let mut set = RecentSet::new(RECENT_EMIT_CAP);
+        for i in 0..RECENT_EMIT_CAP {
+            set.insert(format!("plan-{i}"));
+        }
+        assert_eq!(set.len(), RECENT_EMIT_CAP);
+        assert!(!set.insert("plan-0".into()), "满载但未超限时不该丢任何一条");
+    }
 }
 
 #[cfg(test)]
@@ -1722,9 +1827,9 @@ fn start_codex_app_server(
         pending_approvals: Mutex::new(HashMap::new()),
         pending_user_inputs: Mutex::new(HashMap::new()),
         streaming_agent_items: Mutex::new(HashSet::new()),
-        emitted_plan_turns: Mutex::new(HashSet::new()),
+        emitted_plan_turns: Mutex::new(RecentSet::new(RECENT_EMIT_CAP)),
         plan_item_texts: Mutex::new(HashMap::new()),
-        emitted_plan_items: Mutex::new(HashSet::new()),
+        emitted_plan_items: Mutex::new(RecentSet::new(RECENT_EMIT_CAP)),
         responses: Mutex::new(HashMap::new()),
         response_cv: Condvar::new(),
         next_request_id: AtomicU64::new(1),
@@ -1859,7 +1964,8 @@ fn emit_codex_init_if_needed(id: u64, shared: &CodexAppServerShared) {
         return;
     }
     *emitted = true;
-    let _ = shared.app.emit(
+    let _ = shared.app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://init",
         InitPayload {
             chat_id: id,
@@ -1891,7 +1997,8 @@ fn emit_codex_agent_delta(
         .map(|mut seen| seen.insert(item_id))
         .unwrap_or(false);
     if is_first {
-        let _ = app.emit(
+        let _ = app.emit_to(
+            crate::MAIN_WINDOW_LABEL,
             "agent-chat://delta",
             DeltaPayload {
                 chat_id: id,
@@ -1904,7 +2011,8 @@ fn emit_codex_agent_delta(
             },
         );
     }
-    let _ = app.emit(
+    let _ = app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://delta",
         DeltaPayload {
             chat_id: id,
@@ -1946,7 +2054,8 @@ fn emit_codex_plan_delta(
         .map(|mut seen| seen.insert(item_id))
         .unwrap_or(false);
     if is_first {
-        let _ = app.emit(
+        let _ = app.emit_to(
+            crate::MAIN_WINDOW_LABEL,
             "agent-chat://delta",
             DeltaPayload {
                 chat_id: id,
@@ -1959,7 +2068,8 @@ fn emit_codex_plan_delta(
             },
         );
     }
-    let _ = app.emit(
+    let _ = app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://delta",
         DeltaPayload {
             chat_id: id,
@@ -2063,7 +2173,11 @@ fn emit_codex_plan_updated(
         }
     }
     remember_msg(meta, &msg);
-    let _ = app.emit("agent-chat://event", EventPayload { chat_id: id, msg });
+    let _ = app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
+        "agent-chat://event",
+        EventPayload { chat_id: id, msg },
+    );
 }
 
 fn codex_plan_item_id(item: &serde_json::Value) -> Option<String> {
@@ -2143,7 +2257,11 @@ fn flush_codex_pending_plan_items(
             plans.remove(&item_id);
         }
         remember_msg(meta, &msg);
-        let _ = app.emit("agent-chat://event", EventPayload { chat_id: id, msg });
+        let _ = app.emit_to(
+            crate::MAIN_WINDOW_LABEL,
+            "agent-chat://event",
+            EventPayload { chat_id: id, msg },
+        );
     }
 }
 
@@ -2718,7 +2836,8 @@ fn emit_codex_permission_request(
         description: Some("Codex is requesting permission to run a command.".to_string()),
         permission_suggestions,
     };
-    app.emit(
+    app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://permission",
         PermissionPayload {
             chat_id: id,
@@ -2837,7 +2956,8 @@ fn emit_codex_user_input_request(
     if let Ok(mut pending_user_inputs) = shared.pending_user_inputs.lock() {
         pending_user_inputs.insert(request_id, pending);
     }
-    app.emit(
+    app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://question",
         QuestionPayload {
             chat_id: id,
@@ -2954,7 +3074,11 @@ fn codex_app_server_reader(
             "item/started" => {
                 if let Some(msg) = params.get("item").and_then(codex_item_to_msg) {
                     remember_msg(&meta, &msg);
-                    let _ = app.emit("agent-chat://event", EventPayload { chat_id: id, msg });
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
+                        "agent-chat://event",
+                        EventPayload { chat_id: id, msg },
+                    );
                 }
             }
             "item/completed" => {
@@ -2975,7 +3099,8 @@ fn codex_app_server_reader(
                         .map(|mut seen| seen.remove(item_id))
                         .unwrap_or(false);
                     if was_streaming && !is_plan_item {
-                        let _ = app.emit(
+                        let _ = app.emit_to(
+                            crate::MAIN_WINDOW_LABEL,
                             "agent-chat://delta",
                             DeltaPayload {
                                 chat_id: id,
@@ -2997,7 +3122,11 @@ fn codex_app_server_reader(
                 }
                 if let Some(msg) = item.and_then(codex_item_to_msg) {
                     remember_msg(&meta, &msg);
-                    let _ = app.emit("agent-chat://event", EventPayload { chat_id: id, msg });
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
+                        "agent-chat://event",
+                        EventPayload { chat_id: id, msg },
+                    );
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -3025,7 +3154,8 @@ fn codex_app_server_reader(
                     .map(|s| s == "completed")
                     .unwrap_or(true);
                 let usage = shared.latest_usage.lock().ok().and_then(|g| *g);
-                let _ = app.emit(
+                let _ = app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
                     "agent-chat://result",
                     ResultPayload {
                         chat_id: id,
@@ -3036,6 +3166,17 @@ fn codex_app_server_reader(
                 mark_turn_finished(&meta);
                 if let Ok(mut g) = shared.current_turn_id.lock() {
                     *g = None;
+                }
+                // 这两张表是**本轮**的工作台账：streaming_agent_items 记哪些 item 还在
+                // 流式输出，plan_item_texts 暂存计划文本（上面 flush 过了）。本轮结束后
+                // 它们不会再被读到，却会一直留在进程里 —— 一个长对话跑几百轮就攒几百条。
+                // 去重用的 emitted_* 集合刻意不清：它们防的就是重复渲染，改用 RecentSet
+                // 只保留最近若干条来封顶。
+                if let Ok(mut streaming) = shared.streaming_agent_items.lock() {
+                    streaming.clear();
+                }
+                if let Ok(mut plans) = shared.plan_item_texts.lock() {
+                    plans.clear();
                 }
             }
             "error" => {
@@ -3051,7 +3192,8 @@ fn codex_app_server_reader(
 
                 if will_retry {
                     // 重试中：发送 stderr 以触发前端的重试状态识别
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://stderr",
                         StderrPayload {
                             chat_id: id,
@@ -3066,8 +3208,13 @@ fn codex_app_server_reader(
                         crate::util::text_block("system_event", message),
                     );
                     remember_msg(&meta, &msg);
-                    let _ = app.emit("agent-chat://event", EventPayload { chat_id: id, msg });
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
+                        "agent-chat://event",
+                        EventPayload { chat_id: id, msg },
+                    );
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://result",
                         ResultPayload {
                             chat_id: id,
@@ -3087,7 +3234,8 @@ fn codex_app_server_reader(
         let _ = child.wait();
     }
     if release_and_remove_chat(id) {
-        let _ = app.emit(
+        let _ = app.emit_to(
+            crate::MAIN_WINDOW_LABEL,
             "agent-chat://exit",
             ExitPayload {
                 chat_id: id,
@@ -3116,8 +3264,12 @@ fn reader_loop(
         let emit_ok = match source.parse_chat_line(&line) {
             ChatEvent::Message(msg) => {
                 remember_msg(&meta, &msg);
-                app.emit("agent-chat://event", EventPayload { chat_id: id, msg })
-                    .is_ok()
+                app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
+                    "agent-chat://event",
+                    EventPayload { chat_id: id, msg },
+                )
+                .is_ok()
             }
             ChatEvent::Init {
                 session_id,
@@ -3127,7 +3279,8 @@ fn reader_loop(
                     .as_ref()
                     .and_then(|session_id| bind_chat_session(id, &agent, session_id).err());
                 if let Some(error) = bind_error {
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://stderr",
                         StderrPayload {
                             chat_id: id,
@@ -3137,7 +3290,8 @@ fn reader_loop(
                     let _ = stop(id);
                     false
                 } else {
-                    app.emit(
+                    app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://init",
                         InitPayload {
                             chat_id: id,
@@ -3150,7 +3304,8 @@ fn reader_loop(
             }
             ChatEvent::Result { ok, usage } => {
                 mark_turn_finished(&meta);
-                app.emit(
+                app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
                     "agent-chat://result",
                     ResultPayload {
                         chat_id: id,
@@ -3227,14 +3382,19 @@ fn waiter_loop(app: AppHandle, id: u64) {
             Ok(Some(status)) => {
                 let code = status.code().unwrap_or(-1);
                 if release_and_remove_chat(id) {
-                    let _ = app.emit("agent-chat://exit", ExitPayload { chat_id: id, code });
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
+                        "agent-chat://exit",
+                        ExitPayload { chat_id: id, code },
+                    );
                 }
                 return;
             }
             Ok(None) => thread::sleep(Duration::from_millis(150)),
             Err(_) => {
                 if release_and_remove_chat(id) {
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://exit",
                         ExitPayload {
                             chat_id: id,
@@ -3617,7 +3777,8 @@ fn emit_one_shot_permission(
             }
         ])),
     };
-    app.emit(
+    app.emit_to(
+        crate::MAIN_WINDOW_LABEL,
         "agent-chat://permission",
         PermissionPayload {
             chat_id: id,
@@ -3717,7 +3878,8 @@ fn oneshot_turn_reader(
                     .as_ref()
                     .and_then(|session_id| bind_chat_session(id, &agent, session_id).err());
                 if let Some(error) = bind_error {
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://stderr",
                         StderrPayload {
                             chat_id: id,
@@ -3727,7 +3889,8 @@ fn oneshot_turn_reader(
                     let _ = stop(id);
                     false
                 } else {
-                    app.emit(
+                    app.emit_to(
+                        crate::MAIN_WINDOW_LABEL,
                         "agent-chat://init",
                         InitPayload {
                             chat_id: id,
@@ -3740,7 +3903,8 @@ fn oneshot_turn_reader(
             }
             ChatEvent::Result { ok, usage } => {
                 saw_result = true;
-                app.emit(
+                app.emit_to(
+                    crate::MAIN_WINDOW_LABEL,
                     "agent-chat://result",
                     ResultPayload {
                         chat_id: id,
@@ -3770,7 +3934,8 @@ fn oneshot_turn_reader(
         return;
     }
     if !saw_result && !waiting_for_permission {
-        let _ = app.emit(
+        let _ = app.emit_to(
+            crate::MAIN_WINDOW_LABEL,
             "agent-chat://result",
             ResultPayload {
                 chat_id: id,

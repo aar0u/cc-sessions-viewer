@@ -1,5 +1,6 @@
 import { createHighlighterCore, type HighlighterCore } from '@shikijs/core'
 import { createJavaScriptRegexEngine } from '@shikijs/engine-javascript'
+import { SHIKI_MAX_CHARS } from './renderLimits'
 
 let highlighterPromise: Promise<HighlighterCore> | null = null
 
@@ -127,11 +128,14 @@ async function tryLoadLang(hl: HighlighterCore, lang: string): Promise<boolean> 
   }
 }
 
+// Shiki 产出的 `<pre>` 的 `textContent` 逐字等于原始代码（每行一个 `<span class="line">`，
+// 行间是真实的换行文本节点）。所以主题切换重画和「复制代码」都直接读 `textContent`
+// 即可，不需要再把源码 `encodeURIComponent` 存一份到 `data-source` —— 那份编码后的
+// 副本比原文还大（转义字符 ×3），且随节点一直驻留在内存里。
 function replaceWithShiki(
   pre: HTMLPreElement,
   html: string,
   lang: string,
-  source: string,
   extraClass?: string,
 ): void {
   const wrapper = document.createElement('div')
@@ -141,7 +145,6 @@ function replaceWithShiki(
   shikiPre.className = (extraClass ? extraClass + ' ' : '') + 'shiki'
   shikiPre.dataset.shiki = 'done'
   shikiPre.dataset.lang = lang
-  shikiPre.dataset.source = encodeURIComponent(source)
   pre.replaceWith(shikiPre)
 }
 
@@ -272,26 +275,26 @@ export async function highlightAllCodeBlocks(root: HTMLElement | null): Promise<
     const lang = canonicalLang(pre.dataset.lang || '')
     if (!lang) { pre.dataset.shiki = 'skip'; continue }
     const code = pre.querySelector('code')?.textContent ?? ''
-    if (!code) { pre.dataset.shiki = 'skip'; continue }
+    if (!code || code.length > SHIKI_MAX_CHARS) { pre.dataset.shiki = 'skip'; continue }
     if (!(await tryLoadLang(hl, lang))) { pre.dataset.shiki = 'skip'; continue }
     const html = hl.codeToHtml(code, { lang, theme: themeName })
-    replaceWithShiki(pre, html, lang, code, 'code-block')
+    replaceWithShiki(pre, html, lang, 'code-block')
   }
 
   for (const pre of toolJson) {
     const code = pre.textContent ?? ''
-    if (!code.trim()) { pre.dataset.shiki = 'skip'; continue }
+    if (!code.trim() || code.length > SHIKI_MAX_CHARS) { pre.dataset.shiki = 'skip'; continue }
     if (!(await tryLoadLang(hl, 'json'))) { pre.dataset.shiki = 'skip'; continue }
     const html = hl.codeToHtml(code, { lang: 'json', theme: themeName })
-    replaceWithShiki(pre, html, 'json', code, 'lang-json')
+    replaceWithShiki(pre, html, 'json', 'lang-json')
   }
 
   for (const pre of toolDiff) {
     const code = pre.textContent ?? ''
-    if (!code.trim()) { pre.dataset.shiki = 'skip'; continue }
+    if (!code.trim() || code.length > SHIKI_MAX_CHARS) { pre.dataset.shiki = 'skip'; continue }
     if (!(await tryLoadLang(hl, 'diff'))) { pre.dataset.shiki = 'skip'; continue }
     const html = hl.codeToHtml(code, { lang: 'diff', theme: themeName })
-    replaceWithShiki(pre, html, 'diff', code, 'lang-diff')
+    replaceWithShiki(pre, html, 'diff', 'lang-diff')
   }
 
   if (diffBlocks.length) {
@@ -309,11 +312,11 @@ export async function rehighlightAllCodeBlocks(root: HTMLElement | null): Promis
 
   for (const pre of blocks) {
     const lang = pre.dataset.lang || ''
-    const code = decodeURIComponent(pre.dataset.source || '')
+    const code = pre.textContent ?? ''
     if (!lang || !code) continue
     const origClass = pre.className.replace(/\bshiki\b/, '').trim()
     const html = hl.codeToHtml(code, { lang, theme: themeName })
-    replaceWithShiki(pre, html, lang, code, origClass)
+    replaceWithShiki(pre, html, lang, origClass)
   }
 
   if (diffBlocks.length) {

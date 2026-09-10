@@ -319,6 +319,10 @@ impl SessionSource for ClaudeSource {
         image_src(block)
     }
 
+    fn metadata_fingerprint(&self, path: &str) -> Option<String> {
+        metadata_fingerprint(Path::new(path))
+    }
+
     fn usage_summary(&self, path: &str) -> Result<UsageSummary, String> {
         usage_summary(Path::new(path))
     }
@@ -338,19 +342,42 @@ impl SessionSource for ClaudeSource {
 
 // ----- 内部解析 --------------------------------------------------------------
 
-/// 从 JSONL 尾部反向读，找最后一条 `role: human` 的文本。
-fn last_user_text(fp: &Path) -> Option<String> {
-    let raw = fs::read(fp).ok()?;
-    // 反向逐行扫描
-    for line in raw.rsplit(|&b| b == b'\n') {
-        if line.is_empty() {
+/// 会话标题的廉价指纹：`/rename` 追加的 custom-title / agent-name 总在文件末尾，
+/// 只读尾部 256 KB 取最后一条即可。返回 None = 尾部没有重命名记录（标题来自首条
+/// 用户消息，那部分变化必然伴随 Msg 数变化，无需这条指纹兜底）。
+fn metadata_fingerprint(fp: &Path) -> Option<String> {
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let tail = crate::util::read_tail_text(fp, TAIL_BYTES)?;
+    let mut latest: Option<String> = None;
+    for line in tail.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
+        let bytes = trimmed.as_bytes();
+        let kind = json_str_field_prefix(bytes, "type").unwrap_or_default();
+        let field = match kind.as_str() {
+            "custom-title" => "customTitle",
+            "agent-name" => "agentName",
+            _ => continue,
+        };
+        if let Some(title) = json_str_field_prefix(bytes, field) {
+            latest = Some(title);
+        }
+    }
+    latest
+}
+
+/// 从 JSONL 尾部反向读，找最后一条 `role: human` 的文本。
+fn last_user_text(fp: &Path) -> Option<String> {
+    // 分块反向扫描：峰值内存 = 一个 1 MB 块，而不是整个文件。会话 JSONL 常有
+    // 上百 MB，`fs::read` 整读是列表页滚动时内存暴涨的直接来源。命中即停。
+    crate::util::scan_lines_backwards(fp, |line| {
         let Ok(v) = serde_json::from_slice::<Value>(line) else {
-            continue;
+            return None;
         };
         if v.get("type").and_then(Value::as_str) != Some("user") {
-            continue;
+            return None;
         }
         let content = v.get("message").and_then(|m| m.get("content"));
         let text = match content {
@@ -366,14 +393,9 @@ fn last_user_text(fp: &Path) -> Option<String> {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };
-        if let Some(t) = text.as_deref() {
-            let clean = crate::util::truncate_subtitle(t);
-            if !clean.is_empty() {
-                return Some(clean);
-            }
-        }
-    }
-    None
+        let clean = crate::util::truncate_subtitle(text.as_deref()?);
+        (!clean.is_empty()).then_some(clean)
+    })
 }
 
 /// 一次性把整份 JSONL 走一遍，累加每条 assistant 消息里的 `message.usage` 字段。
@@ -1289,25 +1311,82 @@ fn json_str_field_prefix(prefix: &[u8], field: &str) -> Option<String> {
 /// scan() 结果缓存：key = 绝对路径，value = (mtime, size, meta)。
 /// 会话文件不变（mtime+size 一致）就直接返回克隆,避免每次切项目都把 500MB 会话重扫一遍。
 /// 文件被追加/替换后 mtime 或 size 变 → key 不命中 → 重扫。是纯加速,不影响正确性。
-type ScanCache = HashMap<PathBuf, (u64, u64, SessionMeta)>;
+///
+/// 条目数等于**扫过的会话文件总数**，且从不释放：统计页跑一遍就把全部会话灌进来，
+/// 每条 value 还带着标题 / cwd 等字符串。按条数封顶，超限按插入序淘汰，被淘汰的
+/// 下次重扫一遍即可（本来也就是纯加速）。
+struct ScanEntry {
+    mtime: u64,
+    size: u64,
+    seq: u64,
+    meta: SessionMeta,
+}
+
+#[derive(Default)]
+struct ScanCache {
+    entries: HashMap<PathBuf, ScanEntry>,
+    next_seq: u64,
+}
+
+const SCAN_CACHE_MAX_ENTRIES: usize = 20_000;
+
 static SCAN_CACHE: OnceLock<Mutex<ScanCache>> = OnceLock::new();
+
+/// 诊断用：会话扫描缓存当前的条目数。
+pub fn scan_cache_entries() -> usize {
+    SCAN_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok().map(|guard| guard.entries.len()))
+        .unwrap_or(0)
+}
 fn scan_cache() -> &'static Mutex<ScanCache> {
-    SCAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    SCAN_CACHE.get_or_init(|| Mutex::new(ScanCache::default()))
+}
+
+fn evict_scan_cache(cache: &mut ScanCache) {
+    if cache.entries.len() <= SCAN_CACHE_MAX_ENTRIES {
+        return;
+    }
+    // 降到 75% 再停，避免在上限附近每插一条就淘汰一轮。
+    let target = SCAN_CACHE_MAX_ENTRIES / 4 * 3;
+    let mut by_seq: Vec<(u64, PathBuf)> = cache
+        .entries
+        .iter()
+        .map(|(path, entry)| (entry.seq, path.clone()))
+        .collect();
+    by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, path) in by_seq {
+        if cache.entries.len() <= target {
+            break;
+        }
+        cache.entries.remove(&path);
+    }
 }
 
 fn scan(fp: &Path) -> SessionMeta {
     let size = fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
     let modified = mtime_millis(fp);
     if let Ok(cache) = scan_cache().lock() {
-        if let Some((m, s, meta)) = cache.get(fp) {
-            if *m == modified && *s == size {
-                return meta.clone();
+        if let Some(entry) = cache.entries.get(fp) {
+            if entry.mtime == modified && entry.size == size {
+                return entry.meta.clone();
             }
         }
     }
     let meta = scan_uncached(fp, size, modified);
     if let Ok(mut cache) = scan_cache().lock() {
-        cache.insert(fp.to_path_buf(), (modified, size, meta.clone()));
+        let seq = cache.next_seq;
+        cache.next_seq += 1;
+        cache.entries.insert(
+            fp.to_path_buf(),
+            ScanEntry {
+                mtime: modified,
+                size,
+                seq,
+                meta: meta.clone(),
+            },
+        );
+        evict_scan_cache(&mut cache);
     }
     meta
 }
@@ -3656,6 +3735,100 @@ mod tests {
         std::fs::write(&p, lines.join("\n")).unwrap();
         let meta = scan(&p);
         assert_eq!(meta.title, "真正的第一句话");
+    }
+
+    // ---- scan 缓存的条数封顶 ----
+
+    fn seeded_scan_cache(count: u64) -> ScanCache {
+        // SessionMeta 字段很多且没有 Default；直接扫一个真实的小文件拿一份来复制。
+        let dir = std::env::temp_dir().join("csv-claude-scan-cache-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let sample = dir.join("sample.jsonl");
+        std::fs::write(
+            &sample,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        )
+        .unwrap();
+        let meta = scan(&sample);
+
+        let mut cache = ScanCache::default();
+        for seq in 0..count {
+            cache.entries.insert(
+                PathBuf::from(format!("/tmp/scan-{seq}.jsonl")),
+                ScanEntry {
+                    mtime: 1,
+                    size: 1,
+                    seq,
+                    meta: meta.clone(),
+                },
+            );
+        }
+        cache.next_seq = count;
+        cache
+    }
+
+    #[test]
+    fn evict_scan_cache_is_a_no_op_below_the_cap() {
+        let mut cache = seeded_scan_cache(5);
+        evict_scan_cache(&mut cache);
+        assert_eq!(cache.entries.len(), 5);
+    }
+
+    #[test]
+    fn evict_scan_cache_drops_the_oldest_down_to_three_quarters() {
+        let over = SCAN_CACHE_MAX_ENTRIES as u64 + 10;
+        let mut cache = seeded_scan_cache(over);
+        evict_scan_cache(&mut cache);
+
+        let target = SCAN_CACHE_MAX_ENTRIES / 4 * 3;
+        assert_eq!(cache.entries.len(), target);
+        // 最早扫到的那批先走。
+        assert!(!cache.entries.contains_key(&PathBuf::from("/tmp/scan-0.jsonl")));
+        let newest = PathBuf::from(format!("/tmp/scan-{}.jsonl", over - 1));
+        assert!(cache.entries.contains_key(&newest));
+    }
+
+    // ---- metadata_fingerprint: /rename 的廉价指纹 ----
+
+    fn fingerprint_file(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("csv-claude-fingerprint-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(name);
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        p
+    }
+
+    #[test]
+    fn metadata_fingerprint_returns_the_latest_rename_record() {
+        // 连续两次 /rename：指纹必须是最后一次的标题，否则改名不会触发列表刷新。
+        let p = fingerprint_file(
+            "renamed-twice.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"custom-title","customTitle":"first name"}"#,
+                r#"{"type":"agent-name","agentName":"first name"}"#,
+                r#"{"type":"custom-title","customTitle":"second name"}"#,
+                r#"{"type":"agent-name","agentName":"second name"}"#,
+            ],
+        );
+        assert_eq!(metadata_fingerprint(&p).as_deref(), Some("second name"));
+    }
+
+    #[test]
+    fn metadata_fingerprint_is_none_without_a_rename_record() {
+        // 标题来自首条用户消息时没有指纹 —— 那条路径的变化必然伴随 Msg 数变化。
+        let p = fingerprint_file(
+            "never-renamed.jsonl",
+            &[r#"{"type":"user","message":{"role":"user","content":"hi"}}"#],
+        );
+        assert!(metadata_fingerprint(&p).is_none());
+    }
+
+    #[test]
+    fn metadata_fingerprint_is_none_for_a_missing_file() {
+        let missing =
+            std::env::temp_dir().join("csv-claude-fingerprint-tests/does-not-exist.jsonl");
+        assert!(metadata_fingerprint(&missing).is_none());
     }
 
     #[test]

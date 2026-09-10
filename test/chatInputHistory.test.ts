@@ -3,6 +3,7 @@ import {
   buildChatHistory,
   chatHistoryEntryFromMsg,
   countChatHistoryEntriesBefore,
+  needsImageBytes,
 } from '../src/chatInputHistory'
 import type { Block, Msg } from '../src/types'
 
@@ -92,6 +93,28 @@ describe('buildChatHistory', () => {
     const h = buildChatHistory([user([{ kind: 'image', isError: false, imageSrc: 'https://x/y.png' }, txt('hi')])])
     expect(h[0].images).toEqual([])
     expect(h[0].text).toBe('hi')
+  })
+
+  // 本地路径图片：会话图片磁盘缓存、Codex 的 @文件、剪贴板截图都是这个形态。
+  // 本模块是纯函数，只占位；字节由 ChatComposer 回填时读盘补上。
+  it('keeps a local-path image as a pending attachment carrying its path', () => {
+    const path = '/Users/me/Library/Application Support/app/image-cache/abc.png'
+    const h = buildChatHistory([user([{ kind: 'image', isError: false, imageSrc: path }, txt('look')])])
+
+    expect(h[0].images).toHaveLength(1)
+    expect(h[0].images[0].sourcePath).toBe(path)
+    expect(h[0].images[0].data).toBe('')
+    expect(h[0].images[0].name).toBe('abc.png')
+    expect(needsImageBytes(h[0].images[0])).toBe(true)
+  })
+
+  it('marks a data-url image as needing no further reading', () => {
+    const h = buildChatHistory([
+      user([{ kind: 'image', isError: false, imageSrc: 'data:image/png;base64,QUJD' }]),
+    ])
+    expect(needsImageBytes(h[0].images[0])).toBe(false)
+    expect(h[0].images[0].data).toBe('QUJD')
+    expect(h[0].images[0].sourcePath).toBeUndefined()
   })
 
   it('restores file attachments with basename + isDir', () => {

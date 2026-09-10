@@ -19,7 +19,7 @@ import {
   type ChatSession,
   type QueuedMessage,
 } from '../chatSessions'
-import { buildChatHistory, type ChatHistoryEntry } from '../chatInputHistory'
+import { buildChatHistory, needsImageBytes, type ChatHistoryEntry } from '../chatInputHistory'
 import { setChatDraft, takeChatDraft } from '../chatDrafts'
 import { parseChatSlashAction } from '../chatSlashActions'
 import { systemSlashCommands } from '../chatSystemCommands'
@@ -237,6 +237,7 @@ watch(() => props.session, (session, previousSession) => {
   saveDraft(previousSession)
   // 图片读取属于旧会话；切换后不能阻塞新会话的发送按钮。
   pendingInlineImages.value = 0
+  cancelHistoryHydration()
   const draft = takeDraft(session)
   text.value = draft?.text ?? ''
   images.value = draft ? bindImagesToText(text.value, draft.images.map((image) => ({ ...image }))) : []
@@ -1097,9 +1098,19 @@ function exitHistory() {
 /** 把一条历史输入回填进输入框，光标移到末尾。 */
 function applyHistoryEntry(e: ChatHistoryEntry) {
   text.value = e.text
-  images.value = bindImagesToText(text.value, e.images.map((i) => ({ ...i })))
+  const restored = e.images.map((i) => ({ ...i }))
   resetInlineImageSequence(text.value)
   files.value = e.files.map((f) => ({ ...f }))
+  // 历史里的图片可能只是一条本地路径（会话图片磁盘缓存、Codex 的 @文件、剪贴板截图）。
+  // 先读盘补上字节再挂进附件栏 —— 不能先挂一个空壳，否则用户在读盘完成前按下回车就
+  // 发出一张空图。读不到的直接丢掉，跟以前对远程 URL 的处理一致。
+  const seq = ++historyHydrateSeq
+  if (restored.some(needsImageBytes)) {
+    images.value = []
+    void hydrateHistoryImages(seq, restored)
+  } else {
+    images.value = bindImagesToText(text.value, restored)
+  }
   nextTick(() => {
     autosize()
     const el = taEl.value
@@ -1108,6 +1119,41 @@ function applyHistoryEntry(e: ChatHistoryEntry) {
       el.setSelectionRange(end, end)
     }
   })
+}
+
+// 序号：读盘期间输入框可能已经翻去了别的历史、或者整个换了会话。每一次改写附件栏的
+// 操作都推进它，落后的那次回填到手也不许写。
+let historyHydrateSeq = 0
+
+/** 让所有在飞的历史回填作废（换会话时用：那些字节属于上一个会话的输入框）。 */
+function cancelHistoryHydration() {
+  historyHydrateSeq++
+}
+
+async function hydrateHistoryImages(seq: number, restored: ChatImageAttachment[]) {
+  const filled = await Promise.all(
+    restored.map(async (image) => {
+      if (!needsImageBytes(image)) return image
+      try {
+        const bytes = await api.readFileBase64(image.sourcePath!)
+        return {
+          ...image,
+          mediaType: bytes.mediaType,
+          data: bytes.data,
+          dataUrl: `data:${bytes.mediaType};base64,${bytes.data}`,
+        }
+      } catch {
+        return null
+      }
+    }),
+  )
+  if (seq !== historyHydrateSeq) return
+  // 读盘期间用户可能又贴了图 —— 附件栏在发起时被清空过，现在还在里面的都是这期间新加的，
+  // 接在回填结果后面，别整栏覆盖掉。
+  images.value = bindImagesToText(text.value, [
+    ...images.value,
+    ...filled.filter((image): image is ChatImageAttachment => image !== null),
+  ])
 }
 
 /** 保存当前输入到所属会话；空草稿直接清除，避免发送后重新进入又恢复旧内容。 */

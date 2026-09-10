@@ -5232,6 +5232,19 @@ body.is-tab-reordering * {
   color: var(--text-mute);
   font-variant-numeric: tabular-nums;
 }
+/* 超大块提示：标题右侧标注体积，说明这个块为什么默认折叠、为什么没有配色。 */
+.oversize-hint {
+  margin-left: auto;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 已经有增删统计把空白吃掉了，这里只需要一点间距，否则两个 auto 会把它们撑开。 */
+.diff-stat + .oversize-hint {
+  margin-left: 6px;
+}
 .diff {
   margin: -10px -12px;
   padding: 6px 0;
@@ -5537,6 +5550,222 @@ body.is-tab-reordering * {
 .set-data-actions {
   display: inline-flex;
   gap: 8px;
+}
+/* ---------------------------------------------------------------------------
+   存储面板。一条分段条 + 一份图例回答「谁把磁盘吃了」，配色沿用 /context 卡片：
+   蓝色族 = 清得掉，中性灰 = 用户自己的东西。悬停某一项时其余段淡出，图形与图例
+   的对应关系不用靠数颜色。
+   --------------------------------------------------------------------------- */
+.set-store-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.set-store-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.set-store-hero {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  padding: 14px 16px 16px;
+  margin: 12px 0 4px;
+}
+.set-store-hero-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.set-store-total {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.set-store-total-num {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.set-store-total-cap {
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.set-store-bar {
+  display: flex;
+  gap: 1px;
+  height: 10px;
+  margin-top: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--ctx-track);
+}
+.set-store-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: opacity 0.15s ease;
+}
+.set-store-seg.dim {
+  opacity: 0.28;
+}
+.set-store-list {
+  margin-top: 6px;
+}
+.set-store-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  margin: 0 -8px;
+  border-radius: var(--radius-md);
+  transition: background 0.12s ease, opacity 0.15s ease;
+}
+.set-store-item + .set-store-item {
+  box-shadow: inset 0 1px 0 var(--border);
+}
+.set-store-item:hover {
+  background: var(--surface-hover);
+  box-shadow: none;
+}
+.set-store-item:hover + .set-store-item {
+  box-shadow: none;
+}
+.set-store-item.dim {
+  opacity: 0.45;
+}
+.set-store-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: none;
+}
+.set-store-text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.set-store-name {
+  font-size: 13px;
+  color: var(--text);
+}
+.set-store-path {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.set-store-metrics {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.set-store-bytes {
+  font-size: 12.5px;
+  color: var(--text);
+  min-width: 68px;
+  text-align: right;
+}
+.set-store-pct {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  min-width: 34px;
+  text-align: right;
+}
+.set-store-nobtn {
+  width: 32px;
+  flex: none;
+}
+
+/* 诊断：两个进程的内存做成带刻度的卡片（4 GB = 后端记 warn 的线），
+   其余全是计数，做成等宽小方块，一眼扫完。 */
+.set-diag-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  margin: 12px 0 10px;
+}
+.set-diag-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  padding: 12px 14px 13px;
+}
+.set-diag-card-label {
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.set-diag-card-value {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.2;
+  margin-top: 3px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.set-diag-meter {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--ctx-track);
+  overflow: hidden;
+  margin: 10px 0 7px;
+}
+.set-diag-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ctx-blue-2);
+  transition: width 0.3s ease;
+}
+.set-diag-meter-fill.warn {
+  background: var(--status-blocked);
+}
+.set-diag-meter-fill.high {
+  background: var(--status-error);
+}
+.set-diag-card-cap {
+  font-size: 11px;
+  color: var(--text-mute);
+}
+.set-diag-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+  /* 标签在别的语言下会折成两行，让所有行等高，免得末行凭空矮一截 */
+  grid-auto-rows: 1fr;
+  gap: 8px;
+}
+.set-diag-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 9px 10px 10px;
+  min-width: 0;
+}
+.set-diag-tile-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+.set-diag-tile-label {
+  font-size: 11px;
+  color: var(--text-mute);
+  margin-top: 2px;
+  line-height: 1.35;
 }
 .set-icon-btn {
   width: 32px;
@@ -5845,6 +6074,13 @@ body.is-tab-reordering * {
   margin-top: 14px;
   padding-top: 13px;
   border-top: 1px solid var(--border);
+}
+/* 「重新安装」图标按钮 + 主按钮：贴在一起，别吃 .set-hooks-action 那 20px 的分栏间距 */
+.set-hooks-action-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 .set-hooks-action-text {
   min-width: 0;

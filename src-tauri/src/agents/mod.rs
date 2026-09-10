@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
 
@@ -31,24 +31,87 @@ static SEARCH_POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
 use crate::agent_command::AgentCommand;
 use crate::stats::types::Turn;
 use crate::types::{
-    AgentStats, DailyActivity, Msg, PiTreeNode, ProjectInfo, ProjectStats, SearchHit, SessionMeta, SessionPage,
-    UsageSummary,
+    AgentStats, DailyActivity, Msg, PiTreeNode, ProjectInfo, ProjectStats, SearchHit, SessionMeta,
+    SessionPage, UsageSummary,
 };
 use crate::util::yyyymmdd_local;
 
-/// 「会话 → 用户消息纯文本」缓存：搜索时跳过 JSONL 重新解析。
-/// key 是文件绝对路径；value 是 (mtime, Vec<(msg_index, msg_uuid, text)>)。
-/// mtime 用来失效检测：文件被改写后下一次搜索会自然重建。
-///
-/// 这一层只在「全文兜底」分支里读 / 写 —— 命中 title 不会触碰它。
-/// 用 Mutex 即可：rayon 把 lock 切片得很小，竞争忽略不计；
-/// 真正贵的事在 JSONL 解析 + 字节扫描，不在拿锁。
+// 「会话 → 用户消息纯文本」缓存：搜索时跳过 JSONL 重新解析。
+// key 是文件绝对路径；mtime 用来失效检测：文件被改写后下一次搜索会自然重建。
+//
+// 这一层只在「全文兜底」分支里读 / 写 —— 命中 title 不会触碰它。
+// 用 Mutex 即可：rayon 把 lock 切片得很小，竞争忽略不计；
+// 真正贵的事在 JSONL 解析 + 字节扫描，不在拿锁。
+
+/// (消息下标, 消息 uuid, 用户消息正文) —— 每条一行。
+type UserText = (usize, Option<String>, String);
+
 struct UserTextEntry {
     mtime: u64,
-    /// (消息下标, 消息 uuid, 用户消息正文) —— 每条一行。
-    msgs: Vec<(usize, Option<String>, String)>,
+    /// 插入序号；超出总量上限时按它从最早的开始淘汰。
+    seq: u64,
+    /// 本条目的近似字节数，用于总量封顶。
+    bytes: usize,
+    /// 用 `Arc` 而不是 `Vec`：命中时零拷贝返回。原实现每次命中都 `clone()` 整份
+    /// 正文，一轮全局搜索下来能白白复制几百 MB。
+    msgs: Arc<[UserText]>,
 }
-static USER_TEXT_CACHE: Mutex<Option<HashMap<String, UserTextEntry>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct UserTextCache {
+    entries: HashMap<String, UserTextEntry>,
+    bytes: usize,
+    next_seq: u64,
+}
+
+/// 搜索正文缓存的总量上限。
+///
+/// 一次全局搜索会把**扫过的每一个会话**的用户消息正文抽出来常驻。本机 codex 语料
+/// 就有 1.9 GB，不封顶等于把其中的用户消息全部搬进内存并永不释放 —— 这是「搜索一次
+/// 之后内存再也降不下来」的直接原因。超限时按插入序淘汰到 75%，命中率损失可忽略
+/// （淘汰掉的下次搜索重新解析即可）。
+const USER_TEXT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+static USER_TEXT_CACHE: Mutex<Option<UserTextCache>> = Mutex::new(None);
+
+/// 诊断用：搜索正文缓存当前占的字节数。
+pub fn user_text_cache_bytes() -> usize {
+    USER_TEXT_CACHE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|cache| cache.bytes))
+        .unwrap_or(0)
+}
+
+fn user_text_bytes(msgs: &[UserText]) -> usize {
+    msgs.iter()
+        .map(|(_, uuid, text)| {
+            text.len() + uuid.as_ref().map_or(0, String::len) + std::mem::size_of::<UserText>()
+        })
+        .sum()
+}
+
+fn evict_user_text(cache: &mut UserTextCache) {
+    if cache.bytes <= USER_TEXT_CACHE_MAX_BYTES {
+        return;
+    }
+    // 掉到 75% 再停，避免在上限附近来回抖动、每次插入都触发一轮淘汰。
+    let target = USER_TEXT_CACHE_MAX_BYTES / 4 * 3;
+    let mut by_seq: Vec<(u64, String)> = cache
+        .entries
+        .iter()
+        .map(|(path, entry)| (entry.seq, path.clone()))
+        .collect();
+    by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, path) in by_seq {
+        if cache.bytes <= target {
+            break;
+        }
+        if let Some(entry) = cache.entries.remove(&path) {
+            cache.bytes = cache.bytes.saturating_sub(entry.bytes);
+        }
+    }
+}
 
 fn mtime_of(path: &str) -> u64 {
     use std::time::UNIX_EPOCH;
@@ -61,22 +124,36 @@ fn mtime_of(path: &str) -> u64 {
 }
 
 /// 从缓存里拿用户消息正文；命中即返回，否则 None（调用方再去 read_session 重建）。
-fn cached_user_text(path: &str, mtime: u64) -> Option<Vec<(usize, Option<String>, String)>> {
+fn cached_user_text(path: &str, mtime: u64) -> Option<Arc<[UserText]>> {
     let guard = USER_TEXT_CACHE.lock().ok()?;
-    let map = guard.as_ref()?;
-    let entry = map.get(path)?;
-    if entry.mtime != mtime {
-        return None;
-    }
-    Some(entry.msgs.clone())
+    let cache = guard.as_ref()?;
+    let entry = cache.entries.get(path)?;
+    (entry.mtime == mtime).then(|| entry.msgs.clone())
 }
 
-/// 把刚解析好的用户消息正文写回缓存。
-fn store_user_text(path: String, mtime: u64, msgs: Vec<(usize, Option<String>, String)>) {
-    if let Ok(mut guard) = USER_TEXT_CACHE.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(path, UserTextEntry { mtime, msgs });
+/// 把刚解析好的用户消息正文写回缓存，并把缓存总量压回上限内。
+fn store_user_text(path: String, mtime: u64, msgs: Vec<UserText>) {
+    let Ok(mut guard) = USER_TEXT_CACHE.lock() else {
+        return;
+    };
+    let cache = guard.get_or_insert_with(UserTextCache::default);
+    let bytes = user_text_bytes(&msgs);
+    let seq = cache.next_seq;
+    cache.next_seq += 1;
+    let replaced = cache.entries.insert(
+        path,
+        UserTextEntry {
+            mtime,
+            seq,
+            bytes,
+            msgs: msgs.into(),
+        },
+    );
+    if let Some(previous) = replaced {
+        cache.bytes = cache.bytes.saturating_sub(previous.bytes);
     }
+    cache.bytes = cache.bytes.saturating_add(bytes);
+    evict_user_text(cache);
 }
 
 /// 搜索取消令牌：每次 `search_sessions` 调用都把自己的 `request_id` 写入
@@ -528,6 +605,20 @@ pub trait SessionSource: Send + Sync {
         self.watch_target(path).into_iter().collect()
     }
 
+    /// 会话的「不产生消息、但会改变展示」的元数据指纹 —— 目前只有标题。
+    ///
+    /// 实时 tail 每次整份重解析后会拿 Msg 数跟上次比。数量没变时，对绝大多数 agent
+    /// 都意味着这次写入只是内部记录（progress / token_count / file-history-snapshot
+    /// …），不该让前端整份重拉。但 Claude 的 `/rename`（成对的 custom-title +
+    /// agent-name）和 Pi 的 `/rename`（session_info）同样不产生 Msg 却改了标题 ——
+    /// 这两个 agent 实现本方法，只有返回值变化才触发 `session:reset`。
+    ///
+    /// 默认 `None` = 该 agent 没有这类元数据。实现必须**廉价**：rename 记录总是追加
+    /// 在末尾，只读文件尾部若干 KB，绝不做整文件扫描。
+    fn metadata_fingerprint(&self, _path: &str) -> Option<String> {
+        None
+    }
+
     /// rename 等写操作前的路径合法性检查（lib.rs 统一调用，不再自带 exists/.jsonl
     /// 硬编码）。文件型 agent 用默认实现；虚拟路径 agent（opencode）重写。
     fn validate_session_path(&self, path: &Path) -> Result<(), String> {
@@ -637,23 +728,75 @@ pub trait SessionSource: Send + Sync {
 // ============================ 用量缓存（按文件 mtime 失效） ============================
 // 跟 USER_TEXT_CACHE 同模式：把每个 JSONL 的解析结果用 (path, mtime) 锁住，
 // 后端命令 `session_usage` 命中直接返回，miss 才让 agent 走一次全文件扫描。
-// 单个 entry ~ 48 B，放心存。
-static USAGE_CACHE: Mutex<Option<HashMap<String, (u64, UsageSummary)>>> = Mutex::new(None);
+//
+// 单个 entry 的 value 很小，但 key 是一条绝对路径，而条目数等于**磁盘上的会话总数**：
+// 统计页跑一次就把所有 agent 的所有会话都灌进来，之后永不释放。本机语料上万条会话，
+// 光路径字符串就是几 MB。按条数封顶，超限按插入序淘汰 —— 被淘汰的下次重算一遍即可。
+struct UsageEntry {
+    mtime: u64,
+    seq: u64,
+    usage: UsageSummary,
+}
+
+#[derive(Default)]
+struct UsageCache {
+    entries: HashMap<String, UsageEntry>,
+    next_seq: u64,
+}
+
+const USAGE_CACHE_MAX_ENTRIES: usize = 20_000;
+
+static USAGE_CACHE: Mutex<Option<UsageCache>> = Mutex::new(None);
+
+/// 诊断用：用量缓存当前的条目数。
+pub fn usage_cache_entries() -> usize {
+    USAGE_CACHE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|cache| cache.entries.len()))
+        .unwrap_or(0)
+}
 
 fn cached_usage(path: &str, mtime: u64) -> Option<UsageSummary> {
     let g = USAGE_CACHE.lock().ok()?;
-    let m = g.as_ref()?;
-    let (saved, u) = m.get(path)?;
-    if *saved != mtime {
-        return None;
-    }
-    Some(*u)
+    let cache = g.as_ref()?;
+    let entry = cache.entries.get(path)?;
+    (entry.mtime == mtime).then_some(entry.usage)
 }
 
 fn store_usage(path: String, mtime: u64, u: UsageSummary) {
     if let Ok(mut g) = USAGE_CACHE.lock() {
-        let m = g.get_or_insert_with(HashMap::new);
-        m.insert(path, (mtime, u));
+        let cache = g.get_or_insert_with(UsageCache::default);
+        let seq = cache.next_seq;
+        cache.next_seq += 1;
+        cache.entries.insert(
+            path,
+            UsageEntry {
+                mtime,
+                seq,
+                usage: u,
+            },
+        );
+        evict_by_seq(&mut cache.entries, USAGE_CACHE_MAX_ENTRIES, |e| e.seq);
+    }
+}
+
+/// 按插入序把 map 裁到 `max` 条以内（超限时降到 75%，避免在上限附近每次插入都淘汰一轮）。
+fn evict_by_seq<V>(entries: &mut HashMap<String, V>, max: usize, seq_of: impl Fn(&V) -> u64) {
+    if entries.len() <= max {
+        return;
+    }
+    let target = max / 4 * 3;
+    let mut by_seq: Vec<(u64, String)> = entries
+        .iter()
+        .map(|(key, value)| (seq_of(value), key.clone()))
+        .collect();
+    by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, key) in by_seq {
+        if entries.len() <= target {
+            break;
+        }
+        entries.remove(&key);
     }
 }
 
@@ -902,30 +1045,30 @@ fn classify_hit(
             ("text", hit.hit.snippet)
         // 缓存热时直接内存扫描，跳过磁盘 I/O
         } else {
-        let mtime = src.source_mtime(&session.path);
-        let cached = cached_user_text(&session.path, mtime);
-        if let Some(ref texts) = cached {
-            {
-                let hit = scan_user_text(texts, q)?;
-                match_msg_index = Some(hit.msg_index);
-                match_msg_uuid = hit.msg_uuid;
-                ("text", hit.snippet)
+            let mtime = src.source_mtime(&session.path);
+            let cached = cached_user_text(&session.path, mtime);
+            if let Some(ref texts) = cached {
+                {
+                    let hit = scan_user_text(texts, q)?;
+                    match_msg_index = Some(hit.msg_index);
+                    match_msg_uuid = hit.msg_uuid;
+                    ("text", hit.snippet)
+                }
+            } else {
+                // 冷路径：粗筛（文件型 = 字节扫描；库型 = SQL）→ JSON 解析
+                if !src.contains_text(&session.path, q) {
+                    return None;
+                }
+                if cancel.cancelled() {
+                    return None;
+                }
+                {
+                    let hit = find_text_hit(|p| src.read_session(p), &session.path, mtime, q)?;
+                    match_msg_index = Some(hit.msg_index);
+                    match_msg_uuid = hit.msg_uuid;
+                    ("text", hit.snippet)
+                }
             }
-        } else {
-            // 冷路径：粗筛（文件型 = 字节扫描；库型 = SQL）→ JSON 解析
-            if !src.contains_text(&session.path, q) {
-                return None;
-            }
-            if cancel.cancelled() {
-                return None;
-            }
-            {
-                let hit = find_text_hit(|p| src.read_session(p), &session.path, mtime, q)?;
-                match_msg_index = Some(hit.msg_index);
-                match_msg_uuid = hit.msg_uuid;
-                ("text", hit.snippet)
-            }
-        }
         }
     };
     Some(SearchHit {
@@ -961,16 +1104,26 @@ fn find_pi_text_hit(
 ) -> Option<PiTextHit> {
     let tree = src.session_tree(path).ok()?;
     for node in tree.into_iter().filter(|node| node.terminal) {
-        if cancel.cancelled() { return None; }
-        let Ok(msgs) = src.read_session_at(path, Some(&node.id)) else { continue; };
+        if cancel.cancelled() {
+            return None;
+        }
+        let Ok(msgs) = src.read_session_at(path, Some(&node.id)) else {
+            continue;
+        };
         let mut texts = Vec::new();
         for (index, msg) in msgs.into_iter().enumerate() {
-            if msg.role != "user" { continue; }
+            if msg.role != "user" {
+                continue;
+            }
             let mut combined = String::new();
             for block in msg.blocks {
-                if block.kind != "text" { continue; }
+                if block.kind != "text" {
+                    continue;
+                }
                 if let Some(text) = block.text {
-                    if !combined.is_empty() { combined.push('\n'); }
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
                     combined.push_str(&text);
                 }
             }
@@ -979,7 +1132,10 @@ fn find_pi_text_hit(
             }
         }
         if let Some(hit) = scan_user_text(&texts, q) {
-            return Some(PiTextHit { hit, leaf_id: node.id });
+            return Some(PiTextHit {
+                hit,
+                leaf_id: node.id,
+            });
         }
     }
     None
@@ -1004,7 +1160,7 @@ where
     }
     // 冷路径：解析 + 抽取 + 缓存
     let msgs = read(path).ok()?;
-    let mut user_texts: Vec<(usize, Option<String>, String)> = Vec::new();
+    let mut user_texts: Vec<UserText> = Vec::new();
     for (i, msg) in msgs.into_iter().enumerate() {
         if msg.role != "user" {
             continue;
@@ -1130,6 +1286,98 @@ mod tests {
     use super::*;
     use crate::types::ChatImageInput;
     use serde_json::Value;
+
+    // ---- 搜索正文缓存的总量封顶 ----
+
+    fn seed_user_text_cache(entry_bytes: usize, count: u64) -> UserTextCache {
+        let mut cache = UserTextCache::default();
+        for seq in 0..count {
+            cache.entries.insert(
+                format!("/tmp/session-{seq}.jsonl"),
+                UserTextEntry {
+                    mtime: 1,
+                    seq,
+                    bytes: entry_bytes,
+                    msgs: Vec::new().into(),
+                },
+            );
+            cache.bytes += entry_bytes;
+        }
+        cache.next_seq = count;
+        cache
+    }
+
+    // ---- 用量缓存的条数封顶 ----
+
+    #[test]
+    fn evict_by_seq_is_a_no_op_below_the_cap() {
+        let mut entries: HashMap<String, u64> = (0..4).map(|i| (format!("k{i}"), i)).collect();
+        evict_by_seq(&mut entries, 10, |seq| *seq);
+        assert_eq!(entries.len(), 4);
+    }
+
+    #[test]
+    fn evict_by_seq_drops_the_oldest_down_to_three_quarters() {
+        let mut entries: HashMap<String, u64> = (0..13).map(|i| (format!("k{i}"), i)).collect();
+        evict_by_seq(&mut entries, 12, |seq| *seq);
+
+        // 上限 12 → 目标 9 条。
+        assert_eq!(entries.len(), 9);
+        for seq in 0..4 {
+            assert!(!entries.contains_key(&format!("k{seq}")), "k{seq} 应被淘汰");
+        }
+        for seq in 4..13 {
+            assert!(entries.contains_key(&format!("k{seq}")), "k{seq} 应保留");
+        }
+    }
+
+    #[test]
+    fn usage_cache_round_trips_and_invalidates_on_mtime() {
+        let path = format!("/tmp/usage-cache-{}.jsonl", std::process::id());
+        let usage = UsageSummary::default();
+        store_usage(path.clone(), 100, usage);
+        assert!(cached_usage(&path, 100).is_some());
+        // 文件被追加 → mtime 变 → 不命中，交给上层重算。
+        assert!(cached_usage(&path, 101).is_none());
+    }
+
+    #[test]
+    fn evict_user_text_is_a_no_op_below_the_cap() {
+        let mut cache = seed_user_text_cache(1024, 4);
+        evict_user_text(&mut cache);
+        assert_eq!(cache.entries.len(), 4);
+        assert_eq!(cache.bytes, 4 * 1024);
+    }
+
+    #[test]
+    fn evict_user_text_drops_the_oldest_entries_down_to_three_quarters() {
+        // 每条 1/8 上限 => 10 条超限；淘汰到 <= 75% 需要掉到 6 条。
+        let entry = USER_TEXT_CACHE_MAX_BYTES / 8;
+        let mut cache = seed_user_text_cache(entry, 10);
+        evict_user_text(&mut cache);
+
+        assert!(cache.bytes <= USER_TEXT_CACHE_MAX_BYTES / 4 * 3);
+        assert_eq!(cache.entries.len(), 6);
+        assert_eq!(cache.bytes, 6 * entry, "bytes 必须与留下的条目对得上");
+        // 淘汰按插入序，最早的 4 条先走。
+        for seq in 0..4 {
+            assert!(!cache
+                .entries
+                .contains_key(&format!("/tmp/session-{seq}.jsonl")));
+        }
+        for seq in 4..10 {
+            assert!(cache
+                .entries
+                .contains_key(&format!("/tmp/session-{seq}.jsonl")));
+        }
+    }
+
+    #[test]
+    fn user_text_bytes_grows_with_the_stored_text() {
+        let small = user_text_bytes(&[(0, None, "hi".to_string())]);
+        let large = user_text_bytes(&[(0, Some("uuid-1".to_string()), "x".repeat(1000))]);
+        assert!(large > small + 1000, "{large} vs {small}");
+    }
 
     #[test]
     fn snippet_returns_match_with_surrounding_context() {

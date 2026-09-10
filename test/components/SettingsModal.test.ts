@@ -1,20 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 
-const { appVersionMock, backgroundMediaDirectoryMock, checkAppUpdateMock, deleteBackgroundMediaMock, emitToMock, exportBackgroundMediaMock, importBackgroundMediaMock, installTurnHooksMock, listBackgroundMediaMock, openDialogMock, openPathExternalMock, reclaudeInfoMock, tauriInvokeMock, turnHookStatusMock } = vi.hoisted(() => ({
+const { appVersionMock, backgroundMediaDirectoryMock, checkAppUpdateMock, clearStorageMock, deleteBackgroundMediaMock, emitToMock, exportBackgroundMediaMock, importBackgroundMediaMock, installTurnHooksMock, listBackgroundMediaMock, openDialogMock, openPathExternalMock, reclaudeInfoMock, revealInFinderMock, runtimeDiagnosticsMock, setTrashRetentionMock, storageUsageMock, tauriInvokeMock, trashRetentionMock, turnHookStatusMock, uninstallTurnHooksMock } = vi.hoisted(() => ({
   appVersionMock: vi.fn(),
   backgroundMediaDirectoryMock: vi.fn(),
   checkAppUpdateMock: vi.fn(),
+  clearStorageMock: vi.fn(),
   deleteBackgroundMediaMock: vi.fn(),
   emitToMock: vi.fn(),
   exportBackgroundMediaMock: vi.fn(),
   importBackgroundMediaMock: vi.fn(),
   installTurnHooksMock: vi.fn(),
+  uninstallTurnHooksMock: vi.fn(),
   listBackgroundMediaMock: vi.fn(),
   openDialogMock: vi.fn(),
   openPathExternalMock: vi.fn(),
+  revealInFinderMock: vi.fn(),
   reclaudeInfoMock: vi.fn(),
+  runtimeDiagnosticsMock: vi.fn(),
+  setTrashRetentionMock: vi.fn(),
+  storageUsageMock: vi.fn(),
   tauriInvokeMock: vi.fn(),
+  trashRetentionMock: vi.fn(),
   turnHookStatusMock: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/core', () => ({
@@ -30,10 +37,17 @@ vi.mock('../../src/api', () => ({
   exportBackgroundMedia: exportBackgroundMediaMock,
   importBackgroundMedia: importBackgroundMediaMock,
   installTurnHooks: installTurnHooksMock,
+  uninstallTurnHooks: uninstallTurnHooksMock,
   listBackgroundMedia: listBackgroundMediaMock,
   openUrl: (url: string) => tauriInvokeMock('open_url', { url }),
   openPathExternal: openPathExternalMock,
   reclaudeInfo: reclaudeInfoMock,
+  revealInFinder: revealInFinderMock,
+  runtimeDiagnostics: runtimeDiagnosticsMock,
+  setTrashRetention: setTrashRetentionMock,
+  storageUsage: storageUsageMock,
+  trashRetention: trashRetentionMock,
+  clearStorage: clearStorageMock,
   turnHookStatus: turnHookStatusMock,
 }))
 vi.mock('../../src/updateCheck', async (importOriginal) => {
@@ -42,6 +56,7 @@ vi.mock('../../src/updateCheck', async (importOriginal) => {
 })
 
 import SettingsModal from '../../src/components/SettingsModal.vue'
+import ConfirmModal from '../../src/modals/ConfirmModal.vue'
 import { vTooltip } from '../../src/tooltip'
 import {
   lang,
@@ -206,6 +221,7 @@ beforeEach(() => {
   exportBackgroundMediaMock.mockReset().mockResolvedValue({ count: 0, directory: '/export/background-media' })
   checkAppUpdateMock.mockReset()
   installTurnHooksMock.mockReset().mockResolvedValue({})
+  uninstallTurnHooksMock.mockReset().mockResolvedValue({})
   openPathExternalMock.mockReset().mockResolvedValue(undefined)
   reclaudeInfoMock.mockReset().mockResolvedValue({
     installed: false,
@@ -239,6 +255,12 @@ beforeEach(() => {
   deleteBackgroundMediaMock.mockReset().mockResolvedValue(undefined)
   desktopPetCatalog.value = null
   desktopPetCatalogError.value = ''
+  storageUsageMock.mockReset().mockResolvedValue(storageEntries)
+  revealInFinderMock.mockReset().mockResolvedValue(undefined)
+  clearStorageMock.mockReset().mockResolvedValue(1024)
+  trashRetentionMock.mockReset().mockResolvedValue(30)
+  setTrashRetentionMock.mockReset().mockImplementation(async (days: number) => days)
+  runtimeDiagnosticsMock.mockReset().mockResolvedValue(diagnosticsSample)
 })
 afterEach(() => {
   setLang('en')
@@ -251,6 +273,27 @@ afterEach(() => {
   setBackgroundBorderOpacity(26)
   localStorage.removeItem('settingsActiveTab:v1')
 })
+
+const storageEntries = [
+  { key: 'trash', path: '/home/test/.claude/.session-viewer-trash', bytes: 2 * 1024 * 1024, clearable: true },
+  { key: 'imageCache', path: '/data/image-cache', bytes: 512 * 1024, clearable: true },
+  { key: 'backgroundMedia', path: '/data/background-media', bytes: 4 * 1024 * 1024, clearable: false },
+]
+
+const diagnosticsSample = {
+  mainRssBytes: 300 * 1024 * 1024,
+  webviewRssBytes: 1024 * 1024 * 1024,
+  threads: 37,
+  userTextCacheBytes: 12 * 1024 * 1024,
+  usageCacheEntries: 1200,
+  scanCacheEntries: 800,
+  watchMapEntries: 2,
+  activeChats: 1,
+  desktopTasks: 4,
+  imageCacheBytes: 512 * 1024,
+  attachmentsBytes: 0,
+  trashBytes: 2 * 1024 * 1024,
+}
 
 type Props = InstanceType<typeof SettingsModal>['$props']
 const factory = (props: Partial<Props> = {}) =>
@@ -689,5 +732,218 @@ describe('SettingsModal', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('Update check failed')
+  })
+})
+
+// hooks 装好之后主按钮会锁成「已启用」，唯一的退路是旁边那个重置按钮。
+describe('SettingsModal turn hooks', () => {
+  it('removes the installed hooks after confirming a reset', async () => {
+    // 组件读的是 turnHookStatus 这个共享 ref，不是 api 的返回值。
+    turnHookStatus.value = fullHookStatus as never
+    const wrapper = factory({ initialTab: 'hooks' })
+    await flushPromises()
+
+    const primary = wrapper.find('.set-hooks-enable')
+    expect(primary.text()).toContain('Enabled')
+    // 主按钮锁住了，取消启用走旁边那个图标按钮。
+    expect(primary.attributes('disabled')).toBeDefined()
+
+    const reset = wrapper.find('.set-hooks-action-btns .set-icon-btn')
+    expect(reset.exists()).toBe(true)
+    await reset.trigger('click')
+    await flushPromises()
+
+    // 改的是各家 agent 的共享配置，点一下不能直接动手。
+    expect(uninstallTurnHooksMock).not.toHaveBeenCalled()
+    const confirms = wrapper.findAllComponents(ConfirmModal)
+    const dialog = confirms.find((c) => c.props('show'))
+    expect(dialog).toBeTruthy()
+    dialog!.vm.$emit('confirm')
+    await flushPromises()
+
+    expect(uninstallTurnHooksMock).toHaveBeenCalledTimes(1)
+    expect(installTurnHooksMock).not.toHaveBeenCalled()
+    // 卸载后要重新读盘，不能拿旧状态糊弄。
+    expect(turnHookStatusMock).toHaveBeenCalled()
+  })
+
+  it('leaves the hooks alone when the reset is cancelled', async () => {
+    turnHookStatus.value = fullHookStatus as never
+    const wrapper = factory({ initialTab: 'hooks' })
+    await flushPromises()
+
+    await wrapper.find('.set-hooks-action-btns .set-icon-btn').trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.findAllComponents(ConfirmModal).find((c) => c.props('show'))
+    dialog!.vm.$emit('cancel')
+    await flushPromises()
+
+    expect(uninstallTurnHooksMock).not.toHaveBeenCalled()
+    expect(wrapper.findAllComponents(ConfirmModal).some((c) => c.props('show'))).toBe(false)
+  })
+
+  it('hides the reset button while hooks are not installed yet', async () => {
+    turnHookStatus.value = { ...fullHookStatus, enabled: false } as never
+    const wrapper = factory({ initialTab: 'hooks' })
+    await flushPromises()
+
+    // 还没装的时候没什么可重置的，主按钮本身就是「安装」。
+    expect(wrapper.find('.set-hooks-action-btns .set-icon-btn').exists()).toBe(false)
+    expect(wrapper.find('.set-hooks-enable').attributes('disabled')).toBeUndefined()
+  })
+})
+
+// 存储与诊断页：「app 越用越大」的排查入口。
+describe('SettingsModal storage', () => {
+  it('lists every location and offers no clear button for user assets', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    expect(storageUsageMock).toHaveBeenCalledTimes(1)
+    const rows = wrapper.findAll('.set-store-item')
+    expect(rows).toHaveLength(3)
+    // 按占用从大到小排：背景素材 4 MB > 回收站 2 MB > 图片缓存 512 KB。
+    expect(rows.map((row) => row.find('.set-store-bytes').text()))
+      .toEqual(['4.0 MB', '2.0 MB', '512.0 KB'])
+    // 路径中段省略：前缀家家一样，末两段才有信息量（完整路径在 tooltip 里）。
+    expect(rows[1].find('.set-store-path').text()).toBe('/home/…/.claude/.session-viewer-trash')
+    expect(rows[1].find('.set-store-path').attributes('aria-label'))
+      .toBe('/home/test/.claude/.session-viewer-trash')
+    // 合计 = 2 MB + 512 KB + 4 MB，其中可清理的是回收站 + 图片缓存。
+    expect(wrapper.find('.set-store-total-num').text()).toBe('6.5 MB')
+    expect(wrapper.find('.set-store-total-cap').text()).toContain('2.5 MB can be freed')
+    // 每一行都能在文件管理器里打开；背景素材是用户资产，没有清理按钮。
+    expect(rows[0].findAll('button')).toHaveLength(1)
+    expect(rows[0].find('.set-store-reveal').exists()).toBe(true)
+    expect(rows[1].findAll('button')).toHaveLength(2)
+  })
+
+  it('draws one bar segment per non-empty location and dims the rest on hover', async () => {
+    storageUsageMock.mockResolvedValue([...storageEntries, { key: 'logs', path: '/data/logs', bytes: 0, clearable: true }])
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    const segments = wrapper.findAll('.set-store-seg')
+    // 0 B 的那条不画段，否则条上会出现一截认不出归属的最小宽度。
+    expect(segments).toHaveLength(3)
+    expect(segments[0].attributes('style')).toContain('61.5384')
+
+    await wrapper.findAll('.set-store-item')[1].trigger('mouseenter')
+    expect(segments[0].classes()).toContain('dim')
+    expect(wrapper.findAll('.set-store-seg')[1].classes()).not.toContain('dim')
+  })
+
+  it('clears a rebuildable cache immediately, without asking', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    // 排序后：0 背景素材 / 1 回收站 / 2 图片缓存。图片缓存删了下次读会话会重新写出来。
+    await wrapper.findAll('.set-store-item')[2].findAll('button')[1].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findComponent(ConfirmModal).props('show')).toBe(false)
+    expect(clearStorageMock).toHaveBeenCalledWith('imageCache')
+    expect(storageUsageMock).toHaveBeenCalledTimes(2)
+    expect(wrapper.emitted('notify')?.[0]?.[0]).toContain('Freed')
+  })
+
+  // 清空回收站是不可逆的：会话删掉就还不回来了，必须先问一句。
+  it('asks before emptying the trash and only clears after confirming', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    await wrapper.findAll('.set-store-item')[1].findAll('button')[1].trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.findComponent(ConfirmModal)
+    expect(dialog.props('show')).toBe(true)
+    expect(dialog.props('danger')).toBe(true)
+    expect(dialog.props('title')).toBe('Clear Trash?')
+    expect(dialog.props('message')).toContain('can no longer be restored')
+    // 还没确认，一个字节都不能删。
+    expect(clearStorageMock).not.toHaveBeenCalled()
+
+    storageUsageMock.mockResolvedValue([{ ...storageEntries[0], bytes: 0 }])
+    dialog.vm.$emit('confirm')
+    await flushPromises()
+
+    expect(clearStorageMock).toHaveBeenCalledWith('trash')
+    expect(wrapper.findComponent(ConfirmModal).props('show')).toBe(false)
+  })
+
+  it('deletes nothing when the confirmation is dismissed', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    await wrapper.findAll('.set-store-item')[1].findAll('button')[1].trigger('click')
+    await flushPromises()
+    wrapper.findComponent(ConfirmModal).vm.$emit('cancel')
+    await flushPromises()
+
+    expect(clearStorageMock).not.toHaveBeenCalled()
+    expect(wrapper.findComponent(ConfirmModal).props('show')).toBe(false)
+  })
+
+  it('opens a location in the file manager', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    await wrapper.findAll('.set-store-item')[0].find('.set-store-reveal').trigger('click')
+    await flushPromises()
+
+    expect(revealInFinderMock).toHaveBeenCalledWith('/data/background-media')
+  })
+
+  it('persists the trash retention choice', async () => {
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    const dropdown = wrapper.find('.set-dropdown-btn')
+    expect(dropdown.text()).toContain('30 days')
+    await dropdown.trigger('click')
+    const options = wrapper.findAll('.set-dropdown-item')
+    expect(options).toHaveLength(4)
+    await options[0].trigger('click') // 永久保留
+    await flushPromises()
+
+    expect(setTrashRetentionMock).toHaveBeenCalledWith(0)
+    expect(wrapper.find('.set-dropdown-btn').text()).toContain('Forever')
+  })
+
+  it('keeps the old choice when saving the retention fails', async () => {
+    setTrashRetentionMock.mockRejectedValue(new Error('read-only config'))
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    await wrapper.find('.set-dropdown-btn').trigger('click')
+    await wrapper.findAll('.set-dropdown-item')[1].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.set-dropdown-btn').text()).toContain('30 days')
+    expect(wrapper.emitted('notify')?.at(-1)?.[1]).toBe(true)
+  })
+
+  it('renders the runtime diagnostics and copies them as text', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.assign(navigator, { clipboard: { writeText } })
+    const wrapper = factory({ initialTab: 'storage' })
+    await flushPromises()
+
+    const cards = wrapper.findAll('.set-diag-card')
+    expect(cards[0].find('.set-diag-card-value').text()).toBe('300.0 MB')
+    expect(cards[1].find('.set-diag-card-value').text()).toBe('1.0 GB')
+    // 4 GB 是后端记 warn 的线：渲染进程占了四分之一，条要跟着走。
+    expect(cards[1].find('.set-diag-meter-fill').attributes('style')).toContain('width: 25%')
+    expect(cards[1].find('.set-diag-card-cap').text()).toBe('25% of the 4 GB alert threshold')
+    expect(wrapper.findAll('.set-diag-tile')[0].find('.set-diag-tile-value').text()).toBe('37')
+
+    const buttons = wrapper.find('.set-store-actions').findAll('button')
+    await buttons[1].trigger('click')
+    await flushPromises()
+
+    expect(writeText).toHaveBeenCalledTimes(1)
+    expect(writeText.mock.calls[0][0]).toContain('main RSS: 300.0 MB')
+    expect(writeText.mock.calls[0][0]).toContain('threads: 37')
   })
 })

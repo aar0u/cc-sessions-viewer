@@ -18,13 +18,30 @@ function baseName(p: string): string {
   return p.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || p
 }
 
-/** 从 image 块的 src 还原成可再发送的图片附件；只有 `data:` 内联图能还原（远程 URL 拿不到 base64）。 */
+/**
+ * 从 image 块的 src 还原成可再发送的图片附件。
+ *
+ *   · `data:` 内联图 —— 直接拆出 base64，本函数自给自足。
+ *   · 本地文件路径 —— 只填 `sourcePath` 占位，字节留空。会话图片磁盘缓存、Codex 的
+ *     `@文件`、剪贴板截图都是这个形态；本模块是纯函数（好单测），读盘交给组件在回填
+ *     时补（见 ChatComposer 的 applyHistoryEntry）。
+ *   · 远程 URL —— 拿不到字节，放弃。
+ */
 function imageFromSrc(src: string | undefined): ChatImageAttachment | null {
-  if (!src || !src.startsWith('data:')) return null
+  if (!src) return null
+  if (src.startsWith('http:') || src.startsWith('https:')) return null
+  if (!src.startsWith('data:')) {
+    return { dataUrl: '', mediaType: '', data: '', name: baseName(src), sourcePath: src }
+  }
   const comma = src.indexOf(',')
   if (comma < 0) return null
   const mediaType = src.slice(5, comma).split(';')[0] || 'image/png'
   return { dataUrl: src, mediaType, data: src.slice(comma + 1), name: 'image' }
+}
+
+/** 这条附件还缺字节，回填前要先按 `sourcePath` 读盘。 */
+export function needsImageBytes(image: ChatImageAttachment): boolean {
+  return !image.data && !!image.sourcePath
 }
 
 function entryFromBlocks(blocks: Block[]): ChatHistoryEntry | null {

@@ -102,3 +102,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# 测试里需要把文件 mtime 拨到过去，验证目录容量治理的年龄判据；std 只能读不能写 mtime。
+filetime = "0.2"

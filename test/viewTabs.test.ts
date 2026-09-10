@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
+import { isReactive } from 'vue'
 import {
   createViewTab,
   markViewTabViewed,
@@ -8,9 +9,14 @@ import {
   migrateViewTabsProjectKey,
   syncSessionViewTitles,
   visibleViewTabs,
+  setTabMsgs,
+  sweepSessionTabs,
+  LOADED_SESSION_TAB_LIMIT,
+  SESSION_TAB_IDLE_MS,
 } from '../src/viewTabs'
+import { panes } from '../src/panes'
 import { chatSessions, findChatBySourceSession, type ChatSession } from '../src/chatSessions'
-import type { SessionMeta } from '../src/types'
+import type { Msg, SessionMeta } from '../src/types'
 
 function sessionMeta(over: Partial<SessionMeta> = {}): SessionMeta {
   return {
@@ -255,5 +261,130 @@ describe('GUI chat tab status', () => {
     expect(viewTabStatusKind(tab, false)).toBe('none')
     session.errorMessage = 'second failure'
     expect(viewTabStatusKind(tab, false)).toBe('error')
+  })
+})
+
+// ---- 只读 transcript 的装载 / 淘汰 ----
+
+function msg(text: string): Msg {
+  return { role: 'assistant', sidechain: false, blocks: [{ kind: 'text', text, isError: false }] }
+}
+
+/** 建一个已装载、且不属于任何 pane 的后台 session tab。 */
+function backgroundSessionTab(lastShownAt: number) {
+  const tab = createViewTab({
+    type: 'session',
+    agent: 'claude',
+    projectKey: 'proj',
+    session: sessionMeta(),
+  })
+  setTabMsgs(tab, [msg('hello')])
+  tab.lastShownAt = lastShownAt
+  // createViewTab 会把新 tab 设成所属 pane 的 active；这里要的是「后台 tab」。
+  for (const pane of panes.values()) {
+    if (pane.activeViewTabId === tab.uiId) pane.activeViewTabId = null
+  }
+  return tab
+}
+
+describe('session tab residency', () => {
+  beforeEach(() => {
+    viewTabs.value = []
+    chatSessions.value = []
+    for (const pane of panes.values()) pane.activeViewTabId = null
+  })
+
+  it('stores messages as a non-reactive snapshot', () => {
+    const tab = createViewTab({ type: 'session', agent: 'claude', projectKey: 'proj' })
+    expect(tab.msgsLoaded).toBe(false)
+
+    setTabMsgs(tab, [msg('one'), msg('two')])
+
+    expect(tab.msgsLoaded).toBe(true)
+    expect(tab.msgs).toHaveLength(2)
+    // markRaw 的整点：Vue 不再为数组、每个 Msg、每个 Block 各建一层 Proxy 和依赖表。
+    expect(isReactive(tab.msgs)).toBe(false)
+    expect(isReactive(tab.msgs[0])).toBe(false)
+    expect(isReactive(tab.msgs[0].blocks[0])).toBe(false)
+  })
+
+  it('marks a tab created with messages as already loaded', () => {
+    const tab = createViewTab({
+      type: 'session',
+      agent: 'claude',
+      projectKey: 'proj',
+      msgs: [msg('preloaded')],
+    })
+    expect(tab.msgsLoaded).toBe(true)
+    expect(isReactive(tab.msgs)).toBe(false)
+  })
+
+  it('keeps a freshly used background tab loaded', () => {
+    const now = 1_000_000
+    const tab = backgroundSessionTab(now - 1000)
+    expect(sweepSessionTabs(now)).toEqual([])
+    expect(tab.msgsLoaded).toBe(true)
+  })
+
+  it('releases a background tab that has been idle past the limit', () => {
+    const now = 1_000_000
+    const tab = backgroundSessionTab(now - SESSION_TAB_IDLE_MS - 1)
+
+    expect(sweepSessionTabs(now)).toEqual([tab.uiId])
+    expect(tab.msgsLoaded).toBe(false)
+    expect(tab.msgs).toEqual([])
+    // loadingMsgs 的含义是「此刻正有人在读盘」，释放不该动它 —— 那是
+    // ensureSessionTabLoaded 的重入闸门，置起来会让这个 tab 再也装载不回来。
+    expect(tab.loadingMsgs).toBe(false)
+  })
+
+  it('releases the least recently shown tabs once past the loaded limit', () => {
+    const now = 1_000_000
+    // 全部都在闲置时限内，所以只有条数上限会触发淘汰。
+    const tabs = Array.from({ length: LOADED_SESSION_TAB_LIMIT + 3 }, (_, i) =>
+      backgroundSessionTab(now - i * 1000),
+    )
+
+    const released = sweepSessionTabs(now)
+
+    expect(released).toHaveLength(3)
+    // 留下的是最近显示过的那批。
+    for (const tab of tabs.slice(0, LOADED_SESSION_TAB_LIMIT)) {
+      expect(tab.msgsLoaded).toBe(true)
+    }
+    for (const tab of tabs.slice(LOADED_SESSION_TAB_LIMIT)) {
+      expect(tab.msgsLoaded).toBe(false)
+    }
+  })
+
+  it('never releases a tab that a pane is currently showing', () => {
+    const now = 1_000_000
+    const visible = backgroundSessionTab(now - SESSION_TAB_IDLE_MS - 1)
+    const pane = panes.values().next().value!
+    pane.activeViewTabId = visible.uiId
+
+    expect(sweepSessionTabs(now)).toEqual([])
+    expect(visible.msgsLoaded).toBe(true)
+    // 正在显示 = 刚刚用过，LRU 时间戳同步刷新。
+    expect(visible.lastShownAt).toBe(now)
+  })
+
+  it('never releases a chat tab', () => {
+    const now = 1_000_000
+    const tab = createViewTab({
+      type: 'chat',
+      agent: 'codex',
+      projectKey: 'proj',
+      chatSession: chatSession(),
+    })
+    setTabMsgs(tab, [msg('live')])
+    tab.lastShownAt = now - SESSION_TAB_IDLE_MS - 1
+    for (const pane of panes.values()) {
+      if (pane.activeViewTabId === tab.uiId) pane.activeViewTabId = null
+    }
+
+    // chat 的 msgs 由进程实时推来，磁盘上没有等价来源，释放了就回不来。
+    expect(sweepSessionTabs(now)).toEqual([])
+    expect(tab.msgs).toHaveLength(1)
   })
 })

@@ -350,6 +350,18 @@ pub struct Msg {
     pub meta_kind: Option<String>,
 }
 
+/// 设置页「存储占用」的一行。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsageEntry {
+    /// 稳定标识，前端据此取本地化名称，也是 `clear_storage` 的入参。
+    pub key: String,
+    pub path: String,
+    pub bytes: u64,
+    /// 是否提供「清理」按钮。用户资产（背景素材、自定义宠物）一律为 false。
+    pub clearable: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrashItem {

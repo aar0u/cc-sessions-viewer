@@ -8,7 +8,8 @@
 //   · 包裹层在 shiki 用 pre.replaceWith(shikiPre) 换掉内层 <pre> 后依然存在（replaceWith 只
 //     替换节点本身、保留父节点），所以装饰与高亮互不干扰、调用先后无所谓。
 //   · 用「父节点是否已是 .code-wrap」做幂等判断，重复 sweep 不会二次包裹。
-//   · 复制内容惰性读取：shiki 之后内层 <pre> 带 data-source（原始码），否则回退 <code> 文本。
+//   · 复制内容惰性读取：直接取 <code>/<pre> 的 textContent。shiki 高亮后的 <pre> 逐字
+//     保留原始代码（行内是 span，行间是真实换行），textContent 就是原文。
 
 import { langLabel } from './shikiHighlight'
 
@@ -21,8 +22,6 @@ const CHECK_SVG =
 function codeOf(wrap: HTMLElement): string {
   const pre = wrap.querySelector('pre')
   if (!pre) return ''
-  const src = pre.dataset.source
-  if (src) return decodeURIComponent(src)
   return pre.querySelector('code')?.textContent ?? pre.textContent ?? ''
 }
 

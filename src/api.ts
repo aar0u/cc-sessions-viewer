@@ -17,6 +17,8 @@ import type {
   Msg,
   StatsRange,
   StatsScope,
+  RuntimeDiagnostics,
+  StorageUsageEntry,
   TrashItem,
   TrayStats,
   SearchHit,
@@ -81,6 +83,24 @@ export const dataDirectory = () => invoke<string>('data_directory')
 export const changeDataDirectory = (path: string) =>
   invoke<string>('change_data_directory', { newPath: path })
 export const resetDataDirectory = () => invoke<string>('reset_data_directory')
+
+/** 设置页「存储占用」：逐项大小 + 清理。 */
+export const storageUsage = () => invoke<StorageUsageEntry[]>('storage_usage')
+export const clearStorage = (key: string) => invoke<number>('clear_storage', { key })
+
+/** 回收站保留期（天）。0 = 永久保留。 */
+export const trashRetention = () => invoke<number>('trash_retention')
+/** 该不该弹「回收站现在会自动清理」这一次提示；返回会被删掉的条数，0 = 不弹。 */
+export const trashRetentionNotice = () => invoke<number>('trash_retention_notice')
+
+/** 用户看过提示了：放行自动清理，并立刻补清一次。 */
+export const ackTrashRetention = () => invoke<void>('ack_trash_retention')
+
+export const setTrashRetention = (days: number) =>
+  invoke<number>('set_trash_retention', { days })
+
+/** 运行时自检：内存 / 线程 / 各缓存占用。 */
+export const runtimeDiagnostics = () => invoke<RuntimeDiagnostics>('runtime_diagnostics')
 
 export const addBookmark = (agent: Agent, path: string) =>
   invoke<void>('add_bookmark', { agent, path })
@@ -276,9 +296,14 @@ export const writeBinaryFile = (path: string, base64: string) =>
   invoke<string>('write_binary_file', { path, base64 })
 
 /** Live tail：让后端开始监听一个 JSONL 文件，新增片段会通过 `session:append` 事件
- *  推送过来。同一时刻只有一个 watcher —— 再调一次会自动替换前一个。 */
-export const watchSession = (agent: Agent, path: string) =>
-  invoke<void>('watch_session', { agent, path })
+ *  推送过来。同一时刻只有一个 watcher —— 换成别的会话会替换前一个，重复订阅**同一个**
+ *  会话是幂等的空操作（不会重建 watcher、也不会再起一条轮询线程）。
+ *
+ *  `knownCount` 是调用方手上已有的消息条数，后端拿它当「append 从哪里开始切」的基准。
+ *  只在**刚刚 readSession 完同一个 path** 时传 —— 传错会导致整段消息被当成新增重复追加。
+ *  不传则由后端自己解析一遍文件建立基准（多花一次全量解析）。 */
+export const watchSession = (agent: Agent, path: string, knownCount?: number) =>
+  invoke<void>('watch_session', { agent, path, knownCount })
 
 /** 关闭 Live tail。可重入 —— 没有活跃 watcher 也不会抛错。 */
 export const unwatchSession = () => invoke<void>('unwatch_session')
@@ -333,6 +358,7 @@ export type TurnHookStatus = {
 }
 
 export const installTurnHooks = () => invoke<TurnHookInstallResult>('install_turn_hooks')
+export const uninstallTurnHooks = () => invoke<TurnHookInstallResult>('uninstall_turn_hooks')
 export const turnHookStatus = () => invoke<TurnHookStatus>('turn_hook_status')
 export const claudeRuntimeInfo = () => invoke<ClaudeRuntimeInfo>('claude_runtime_info')
 export const codexRuntimeInfo = () => invoke<CodexRuntimeInfo>('codex_runtime_info')

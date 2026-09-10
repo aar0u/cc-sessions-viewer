@@ -30,6 +30,7 @@ import {
 import { useReclaude } from './settings'
 import { bumpUsage } from './usage'
 import { markProjectsDirty } from './projectsRefresh'
+import { snapshotMsgs } from './msgSnapshot'
 import { humanizeRestoreError, humanizeSessionError, isRetryableSessionError } from './sessionError'
 import type { ChatHistoryEntry } from './chatInputHistory'
 import { codexPluginMentionTextElements, expandCodexPluginMentionsForPrompt } from './codexPluginMentions'
@@ -347,7 +348,7 @@ function onMsg(s: ChatSession, msg: Msg) {
   // stream-json 的每个 assistant / tool_result(user) 事件就是一条完整气泡。
   // **重建数组**（而非 push）：ChatView 的 mermaid / 代码高亮 watcher 按引用比较
   // `props.messages`，只有引用变化才会重跑 —— 与只读模式 reassign chatMsgs 一致。
-  s.msgs = [...s.msgs, msg]
+  s.msgs = snapshotMsgs([...s.msgs, msg])
 }
 
 /** 仅供单测驱动真实消息归并和紧凑工具状态的入口。 */
@@ -531,11 +532,11 @@ function mergeToolUpdate(s: ChatSession, msg: Msg): boolean {
       executionMs: msg.executionMs ?? existing.executionMs,
       blocks: [...retainedBlocks, ...msg.blocks],
     }
-    s.msgs = [
+    s.msgs = snapshotMsgs([
       ...s.msgs.slice(0, i),
       merged,
       ...s.msgs.slice(i + 1),
-    ]
+    ])
     return true
   }
   return false
@@ -834,7 +835,7 @@ function onQuestion(s: ChatSession, request: ChatQuestionRequest) {
 }
 
 function appendInterruptedMarker(s: ChatSession) {
-  s.msgs = [
+  s.msgs = snapshotMsgs([
     ...s.msgs,
     {
       role: 'user',
@@ -842,7 +843,7 @@ function appendInterruptedMarker(s: ChatSession) {
       timestamp: new Date().toISOString(),
       blocks: [{ kind: 'text', text: '[Request interrupted by user]', isError: false }],
     },
-  ]
+  ])
 }
 
 // ============================ 计时器 ============================
@@ -1171,7 +1172,7 @@ export async function startChat(opts: StartChatOptions): Promise<ChatSession> {
     sessionId: opts.sessionId ?? '',
     title: opts.title,
     createdAt: opts.created ?? new Date().toISOString(),
-    msgs: opts.preloadMsgs ? [...opts.preloadMsgs] : [],
+    msgs: snapshotMsgs(opts.preloadMsgs ? [...opts.preloadMsgs] : []),
     initialDraft: opts.initialDraft
       ? {
           text: opts.initialDraft.text,
@@ -1403,10 +1404,10 @@ function appendLocalUserMessage(
     blocks.push({ kind: 'text', text: trimmed, isError: false })
   }
   // 重建数组（理由同 onMsg）；带上「此刻」时间戳，否则 user 气泡时间显示成「—」。
-  session.msgs = [
+  session.msgs = snapshotMsgs([
     ...session.msgs,
     { role: 'user', sidechain: false, blocks, timestamp: new Date().toISOString() },
-  ]
+  ])
 }
 
 /** 运行中的进程/thread 实际生效的设置，与当前选择是否已不一致（需 restart 才能换）。 */
@@ -1557,7 +1558,7 @@ export async function clearChat(session: ChatSession): Promise<void> {
     if (!restored) return
   }
   // 立即视觉清屏 —— 无论后续 restart 成败，界面与上下文角标都应清零。
-  session.msgs = []
+  session.msgs = snapshotMsgs([])
   clearLivePreview(session)
   session.toolActivity = null
   session.toolActivities = []

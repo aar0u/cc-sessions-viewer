@@ -458,11 +458,12 @@ dependencies = [
 
 [[package]]
 name = "cc-sessions-viewer"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
+ "filetime",
  "libc",
  "notify",
  "objc2 0.6.4",

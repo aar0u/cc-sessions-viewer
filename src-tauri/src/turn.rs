@@ -152,6 +152,14 @@ struct SignalState {
 
 static SIGNAL_STATE: OnceLock<Mutex<Option<SignalState>>> = OnceLock::new();
 static DESKTOP_TASKS: OnceLock<Mutex<HashMap<String, DesktopTask>>> = OnceLock::new();
+
+/// 诊断用：还记着 turn 状态的会话数。
+pub fn desktop_task_count() -> usize {
+    DESKTOP_TASKS
+        .get()
+        .and_then(|tasks| tasks.lock().ok().map(|guard| guard.len()))
+        .unwrap_or(0)
+}
 static PENDING_PATH_SIGNALS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static GROK_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -219,11 +227,26 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 已结束的桌宠任务保留多久。
+///
+/// 任务表按「agent + 会话路径」记账，原本只增不删 —— 长期使用后会攒下每一个跑过
+/// turn 的会话，永不回收。已完成 / 失败的条目对 UI 只在短时间内有意义（用户瞄一眼
+/// 就消化了），过期即丢。运行中（started / blocked）的条目永远保留。
+const DESKTOP_TASK_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn prune_desktop_tasks(tasks: &mut HashMap<String, DesktopTask>, now: u64) {
+    tasks.retain(|_, task| {
+        !matches!(task.state.as_str(), "completed" | "failed")
+            || now.saturating_sub(task.updated_at) < DESKTOP_TASK_RETENTION_MS
+    });
+}
+
 fn upsert_desktop_task(
     tasks: &mut HashMap<String, DesktopTask>,
     payload: &TerminalTurnPayload,
     updated_at: u64,
 ) {
+    prune_desktop_tasks(tasks, updated_at);
     let path = payload.path.trim().to_string();
     tasks.insert(
         desktop_task_key(&payload.agent, &path),
@@ -419,6 +442,17 @@ pub fn emit_turn_signal(app: &AppHandle, mut payload: TerminalTurnPayload) -> Re
         .map_err(|e| e.to_string())
 }
 
+/// 启动时把信号文件清空的阈值。
+///
+/// `turn-signals.jsonl` 由各 agent 的 hook 脚本纯追加写入，应用只从 `offset` 往后读，
+/// 从不回收 —— 本机跑了几个月已经 1.6 MB，且只会继续涨。启动时 offset 本来就会被设成
+/// 文件当前长度（既有内容一律跳过，因为那些 turn 早就结束了），所以此刻清空与原行为
+/// 完全等价，只是顺手把磁盘还回去。
+///
+/// 只在启动时做：此时没有任何一方在读我们的 offset，也不存在「截断与 hook 并发追加」
+/// 的竞态。运行期不截断，宁可让它涨到下次启动。
+const SIGNAL_FILE_ROTATE_BYTES: u64 = 256 * 1024;
+
 pub fn start_signal_watcher(app: AppHandle) -> Result<(), String> {
     let signal_path = signal_file_path()?;
     if let Some(parent) = signal_path.parent() {
@@ -429,6 +463,11 @@ pub fn start_signal_watcher(app: AppHandle) -> Result<(), String> {
         .append(true)
         .open(&signal_path)
         .map_err(|e| format!("Failed to initialize state file: {e}"))?;
+
+    if fs::metadata(&signal_path).map(|m| m.len()).unwrap_or(0) > SIGNAL_FILE_ROTATE_BYTES {
+        // 失败不致命：拿不到写权限就照旧从末尾接着读。
+        let _ = fs::write(&signal_path, b"");
+    }
 
     let offset = fs::metadata(&signal_path).map(|m| m.len()).unwrap_or(0);
     let app_for_cb = app.clone();
@@ -609,6 +648,214 @@ pub fn install_turn_hooks() -> Result<TurnHookInstallResult, String> {
         pi_extension_path: pi_extension_path.to_string_lossy().to_string(),
         pi_settings_path: pi_settings_path.to_string_lossy().to_string(),
     })
+}
+
+/// 卸载：把安装时写进各家配置的 hook 逐一摘掉，恢复到没装过的样子。
+///
+/// 三条原则：
+/// 1. **只删自己的。** 每一处都复用安装时那套「这条是不是我们的」判据，用户手写的
+///    hook 一律原样保留 —— 这些是共享配置文件，误删就是删掉别人的东西。
+/// 2. **不存在的配置不碰。** 安装会为所有 agent 建目录建文件；卸载反过来，没装过
+///    这个 agent 就跳过，不能凭空写出一个空配置。
+/// 3. **配置全清干净了才删脚本。** 反过来会留下一堆指向不存在文件的 hook，
+///    每次触发都报错。
+pub fn uninstall_turn_hooks() -> Result<TurnHookInstallResult, String> {
+    let script_path = hook_script_path()?;
+    let legacy_script_path = legacy_hook_script_path()?;
+    let (settings_path, codex_hooks_path, agy_hooks_path) = turn_hook_config_paths()?;
+
+    // Claude / Codex：同一套 JSON hooks 结构。
+    for (path, events, label) in [
+        (
+            &settings_path,
+            CLAUDE_TURN_HOOKS
+                .iter()
+                .map(|(event, _, _)| *event)
+                .collect::<Vec<_>>(),
+            "Claude settings.json",
+        ),
+        (
+            &codex_hooks_path,
+            CODEX_TURN_HOOKS
+                .iter()
+                .map(|(event, _)| *event)
+                .collect::<Vec<_>>(),
+            "Codex hooks.json",
+        ),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let mut config = read_json_object(path, label)?;
+        for event in events {
+            strip_turn_hook(&mut config, event, &script_path, &legacy_script_path);
+        }
+        prune_empty_hooks(&mut config);
+        let formatted = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        fs::write(path, format!("{formatted}\n"))
+            .map_err(|e| format!("Failed to write {label}: {e}"))?;
+    }
+
+    // AGY：整块挂在一个我们自己的顶层键下，删键即可。
+    if agy_hooks_path.exists() {
+        let mut agy = read_json_object(&agy_hooks_path, "Antigravity hooks.json")?;
+        if let Some(root) = agy.as_object_mut() {
+            root.remove(AGY_HOOK_NAME);
+        }
+        let formatted = serde_json::to_string_pretty(&agy).map_err(|e| e.to_string())?;
+        fs::write(&agy_hooks_path, format!("{formatted}\n"))
+            .map_err(|e| format!("Failed to write Antigravity hooks: {e}"))?;
+    }
+
+    let grok_config_path = crate::agents::grok::config_path();
+    uninstall_grok_turn_hooks(&grok_config_path, &script_path, &legacy_script_path)?;
+    let kimi_config_path = crate::agents::kimi::config_path();
+    uninstall_kimi_turn_hooks(&kimi_config_path, &script_path, &legacy_script_path)?;
+    let (pi_extension_path, pi_settings_path) = uninstall_pi_turn_extension()?;
+
+    // 配置都清干净了，最后才动脚本。
+    let _ = fs::remove_file(&script_path);
+    let _ = fs::remove_file(&legacy_script_path);
+
+    Ok(TurnHookInstallResult {
+        claude_settings_path: settings_path.to_string_lossy().to_string(),
+        codex_hooks_path: codex_hooks_path.to_string_lossy().to_string(),
+        agy_hooks_path: agy_hooks_path.to_string_lossy().to_string(),
+        grok_config_path: grok_config_path.to_string_lossy().to_string(),
+        kimi_config_path: kimi_config_path.to_string_lossy().to_string(),
+        pi_extension_path: pi_extension_path.to_string_lossy().to_string(),
+        pi_settings_path: pi_settings_path.to_string_lossy().to_string(),
+    })
+}
+
+fn uninstall_grok_turn_hooks(
+    path: &Path,
+    script_path: &Path,
+    legacy_script_path: &Path,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _guard = grok_config_lock()
+        .lock()
+        .map_err(|error| format!("Failed to lock Grok config: {error}"))?;
+    let mut doc = read_toml_document(path, "Grok config.toml")?;
+    strip_grok_turn_hooks(&mut doc, script_path, legacy_script_path);
+    atomic_write_toml(path, &doc)
+}
+
+fn strip_grok_turn_hooks(doc: &mut Document, script_path: &Path, legacy_script_path: &Path) {
+    let Some(hooks) = doc
+        .as_table_mut()
+        .get_mut("hooks")
+        .and_then(Item::as_table_mut)
+    else {
+        return;
+    };
+    let mut emptied = Vec::new();
+    for (event, _, _) in GROK_TURN_HOOKS {
+        let Some(groups) = hooks.get_mut(event).and_then(Item::as_array_of_tables_mut) else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Item::as_array_mut) {
+                let mut kept = Array::new();
+                for value in handlers.iter() {
+                    if !is_grok_hook_handler(value, script_path, legacy_script_path) {
+                        kept.push(value.clone());
+                    }
+                }
+                *handlers = kept;
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Item::as_array)
+                .is_some_and(|handlers| !handlers.is_empty())
+        });
+        if groups.is_empty() {
+            emptied.push(event);
+        }
+    }
+    for event in emptied {
+        hooks.remove(event);
+    }
+    if hooks.is_empty() {
+        doc.as_table_mut().remove("hooks");
+    }
+}
+
+fn uninstall_kimi_turn_hooks(
+    path: &Path,
+    script_path: &Path,
+    legacy_script_path: &Path,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _guard = kimi_config_lock()
+        .lock()
+        .map_err(|error| format!("Failed to lock Kimi config: {error}"))?;
+    let mut doc = read_toml_document(path, "Kimi config.toml")?;
+    strip_kimi_turn_hooks(&mut doc, script_path, legacy_script_path);
+    atomic_write_toml(path, &doc)
+}
+
+fn strip_kimi_turn_hooks(doc: &mut Document, script_path: &Path, legacy_script_path: &Path) {
+    let Some(existing) = doc
+        .as_table_mut()
+        .get_mut("hooks")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    let mut kept = ArrayOfTables::new();
+    for hook in existing.iter() {
+        if !is_kimi_hook_handler(hook, script_path, legacy_script_path) {
+            kept.push(hook.clone());
+        }
+    }
+    let empty = kept.is_empty();
+    *existing = kept;
+    if empty {
+        doc.as_table_mut().remove("hooks");
+    }
+}
+
+/// Pi 是「settings 里登记一条 + 一个独立的扩展文件」，两边都要撤。
+fn uninstall_pi_turn_extension() -> Result<(PathBuf, PathBuf), String> {
+    let _guard = pi_config_lock().lock().map_err(|error| error.to_string())?;
+    let extension_path = crate::agents::pi::pi_status_extension_path();
+    let settings_path = crate::agents::pi::pi_settings_path();
+    if settings_path.exists() {
+        let settings_before = pi_file_revision(&settings_path)?;
+        let mut settings = read_json_object(&settings_path, "Pi settings.json")?;
+        let expected = extension_path.to_string_lossy().to_string();
+        if let Some(list) = settings
+            .get_mut("extensions")
+            .and_then(Value::as_array_mut)
+        {
+            list.retain(|value| value.as_str() != Some(expected.as_str()));
+            if list.is_empty() {
+                if let Some(root) = settings.as_object_mut() {
+                    root.remove("extensions");
+                }
+            }
+        }
+        let bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?
+        );
+        atomic_write_pi_file(
+            &settings_path,
+            bytes.as_bytes(),
+            &settings_before,
+            "Pi settings.json",
+        )?;
+    }
+    let _ = fs::remove_file(&extension_path);
+    Ok((extension_path, settings_path))
 }
 
 pub fn turn_hook_status() -> Result<TurnHookStatus, String> {
@@ -1114,6 +1361,54 @@ fn read_json_object(path: &Path, label: &str) -> Result<Value, String> {
     }
 }
 
+/// 把本 app 装进某个事件下的 hook 摘掉，用户自己配的原样留下。
+///
+/// 安装和卸载共用这一段 —— 「哪条算我们的」只能有一个定义，否则卸载迟早会漏掉一种
+/// 安装写法，留下一条永远触发失败的僵尸 hook。摘完变空的分组要清掉，免得留下空壳。
+fn strip_turn_hook(
+    settings: &mut Value,
+    event: &str,
+    script_path: &Path,
+    legacy_script_path: &Path,
+) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+        return;
+    };
+    for group in groups.iter_mut() {
+        let Some(items) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        items.retain(|item| !is_our_hook(item, script_path, legacy_script_path));
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    });
+    if groups.is_empty() {
+        hooks.remove(event);
+    }
+}
+
+/// 卸载后收尾：`hooks` 整个空了就把这个键也删掉。
+/// 「没装过」应该长得跟「装了又卸了」一模一样，不留空壳。
+fn prune_empty_hooks(settings: &mut Value) {
+    let Some(root) = settings.as_object_mut() else {
+        return;
+    };
+    if root
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        root.remove("hooks");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn merge_turn_hook(
     settings: &mut Value,
@@ -1125,6 +1420,8 @@ fn merge_turn_hook(
     legacy_script_path: &Path,
     signal_path: &Path,
 ) {
+    strip_turn_hook(settings, event, script_path, legacy_script_path);
+
     if !settings.get("hooks").is_some_and(Value::is_object) {
         settings["hooks"] = json!({});
     }
@@ -1138,20 +1435,6 @@ fn merge_turn_hook(
     let Some(groups) = entry.as_array_mut() else {
         return;
     };
-
-    for group in groups.iter_mut() {
-        let Some(items) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        items.retain(|item| !is_our_hook(item, script_path, legacy_script_path));
-    }
-    groups.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    });
-
     let mut group = json!({
         "hooks": [turn_hook_command(agent, state, script_path, signal_path)]
     });
@@ -1769,6 +2052,71 @@ mod tests {
     }
 
     #[test]
+    fn prune_desktop_tasks_drops_only_stale_terminal_entries() {
+        // DESKTOP_TASKS 过去只增不减 —— 常驻进程跑几天就是一张永不回收的表。
+        let mut tasks: HashMap<String, DesktopTask> = HashMap::new();
+        let now = 10 * DESKTOP_TASK_RETENTION_MS;
+        let mut add = |key: &str, state: &str, updated_at: u64| {
+            tasks.insert(
+                key.to_string(),
+                DesktopTask {
+                    agent: "codex".into(),
+                    path: format!("/tmp/{key}.jsonl"),
+                    state: state.into(),
+                    title: key.into(),
+                    updated_at,
+                },
+            );
+        };
+        add(
+            "stale-done",
+            "completed",
+            now - DESKTOP_TASK_RETENTION_MS - 1,
+        );
+        add(
+            "stale-failed",
+            "failed",
+            now - DESKTOP_TASK_RETENTION_MS - 1,
+        );
+        add("fresh-done", "completed", now - 1);
+        // 长跑任务超过保留期也必须留着：它还在跑，桌宠要显示。
+        add(
+            "old-running",
+            "started",
+            now - 5 * DESKTOP_TASK_RETENTION_MS,
+        );
+        add(
+            "old-blocked",
+            "blocked",
+            now - 5 * DESKTOP_TASK_RETENTION_MS,
+        );
+
+        prune_desktop_tasks(&mut tasks, now);
+
+        let mut kept: Vec<&str> = tasks.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["fresh-done", "old-blocked", "old-running"]);
+    }
+
+    #[test]
+    fn prune_desktop_tasks_survives_a_clock_that_went_backwards() {
+        // updated_at 比 now 大（系统时钟回拨）时 saturating_sub 得 0，条目必须保留。
+        let mut tasks: HashMap<String, DesktopTask> = HashMap::new();
+        tasks.insert(
+            "future".into(),
+            DesktopTask {
+                agent: "claude".into(),
+                path: "/tmp/future.jsonl".into(),
+                state: "completed".into(),
+                title: "future".into(),
+                updated_at: 5_000,
+            },
+        );
+        prune_desktop_tasks(&mut tasks, 1_000);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
     fn desktop_tasks_keep_only_the_latest_state_per_session() {
         let mut tasks = HashMap::new();
         upsert_desktop_task(
@@ -1900,6 +2248,65 @@ mod tests {
         let command = groups[1]["hooks"][0]["command"].as_str().unwrap();
         assert!(command.contains("turn-signal-hook.cjs"));
         assert!(command.contains("\"codex\" \"completed\""));
+    }
+
+    #[test]
+    fn hook_strip_removes_only_our_handlers_and_leaves_no_empty_shells() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let mut config = json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [
+                        {"type":"command","command":"node /app/turn-signal-hook.cjs \"claude\" \"completed\""},
+                        {"type":"command","command":"echo keep-me"}
+                    ]},
+                    {"hooks": [
+                        {"type":"command","command":"node /app/claude-turn-signal-hook.cjs completed /tmp/old"}
+                    ]}
+                ],
+                "SessionStart": [
+                    {"hooks": [
+                        {"type":"command","command":"node /app/turn-signal-hook.cjs \"claude\" \"running\""}
+                    ]}
+                ]
+            },
+            "model": "opus"
+        });
+
+        strip_turn_hook(&mut config, "Stop", script, legacy);
+        strip_turn_hook(&mut config, "SessionStart", script, legacy);
+        prune_empty_hooks(&mut config);
+
+        // 用户自己那条留着，我们的两条（新旧脚本名）都走了。
+        let stop = config["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(stop[0]["hooks"][0]["command"], "echo keep-me");
+        // 清空的事件键不留空壳，配置里的其它字段一个不碰。
+        assert!(config["hooks"].get("SessionStart").is_none());
+        assert_eq!(config["model"], "opus");
+    }
+
+    #[test]
+    fn hook_strip_drops_the_hooks_key_when_nothing_of_the_user_is_left() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let mut config = json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [
+                        {"type":"command","command":"node /app/turn-signal-hook.cjs \"claude\" \"completed\""}
+                    ]}
+                ]
+            }
+        });
+
+        strip_turn_hook(&mut config, "Stop", script, legacy);
+        prune_empty_hooks(&mut config);
+
+        // 「装了又卸」要和「没装过」长得一模一样。
+        assert_eq!(config, json!({}));
     }
 
     #[test]
@@ -2116,6 +2523,98 @@ hooks = [{ type = "command", command = "echo keep-this-handler" }]
                 signal,
             ));
         }
+    }
+
+    #[test]
+    fn grok_hook_uninstall_restores_the_config_it_started_from() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let signal = Path::new("/app/turn-signals.jsonl");
+        let source = r#"# Keep this comment and unrelated settings.
+[model]
+name = "grok-4"
+provider = "custom"
+
+[[hooks.Stop]]
+hooks = [{ type = "command", command = "echo keep-this-handler" }]
+"#;
+        let mut config = source.parse::<Document>().unwrap();
+        for (event, state, matcher) in GROK_TURN_HOOKS {
+            merge_grok_hook(&mut config, event, state, matcher, script, legacy, signal);
+        }
+        strip_grok_turn_hooks(&mut config, script, legacy);
+
+        // 装了又卸，用户那条 hook、注释、无关配置都还在，我们的一条不剩。
+        assert!(config.to_string().contains("echo keep-this-handler"));
+        assert!(config.to_string().contains("Keep this comment"));
+        assert!(!config.to_string().contains("turn-signal-hook.cjs"));
+        for (event, state, matcher) in GROK_TURN_HOOKS {
+            assert!(!has_grok_turn_hook(
+                &config, event, state, matcher, script, signal,
+            ));
+        }
+    }
+
+    #[test]
+    fn grok_hook_uninstall_leaves_no_empty_hooks_table_behind() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let signal = Path::new("/app/turn-signals.jsonl");
+        let source = "[model]\nname = \"grok-4\"\n";
+        let mut config = source.parse::<Document>().unwrap();
+        for (event, state, matcher) in GROK_TURN_HOOKS {
+            merge_grok_hook(&mut config, event, state, matcher, script, legacy, signal);
+        }
+        strip_grok_turn_hooks(&mut config, script, legacy);
+
+        // 「装了又卸」要和「没装过」长得一模一样，不留 `[hooks]` 空壳。
+        assert_eq!(config.to_string(), source);
+    }
+
+    #[test]
+    fn kimi_hook_uninstall_keeps_user_hooks_and_drops_only_ours() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let signal = Path::new("/app/turn-signals.jsonl");
+        let source = r#"# Keep this comment and user hook.
+[[hooks]]
+event = "Stop"
+command = "echo keep-this-handler"
+timeout = 2
+"#;
+        let mut config = source.parse::<Document>().unwrap();
+        merge_kimi_turn_hooks(&mut config, script, legacy, signal).unwrap();
+        strip_kimi_turn_hooks(&mut config, script, legacy);
+
+        // collect_kimi_hooks 只列我们托管的那几条，卸干净就是 0。
+        assert!(collect_kimi_hooks(&config, script, legacy).is_empty());
+        // 用户那条还在，且是 `[[hooks]]` 里唯一剩下的。
+        assert!(config.to_string().contains("echo keep-this-handler"));
+        assert!(config.to_string().contains("Keep this comment"));
+        assert_eq!(
+            config
+                .as_table()
+                .get("hooks")
+                .and_then(Item::as_array_of_tables)
+                .map(ArrayOfTables::len),
+            Some(1)
+        );
+        for (event, state) in KIMI_TURN_HOOKS {
+            assert!(!has_kimi_turn_hook(&config, event, state, script, signal));
+        }
+    }
+
+    #[test]
+    fn kimi_hook_uninstall_removes_the_hooks_key_when_it_was_all_ours() {
+        let script = Path::new("/app/turn-signal-hook.cjs");
+        let legacy = Path::new("/app/claude-turn-signal-hook.cjs");
+        let signal = Path::new("/app/turn-signals.jsonl");
+        let source = "model = \"kimi-k2\"\n";
+        let mut config = source.parse::<Document>().unwrap();
+        merge_kimi_turn_hooks(&mut config, script, legacy, signal).unwrap();
+        strip_kimi_turn_hooks(&mut config, script, legacy);
+
+        assert_eq!(config.to_string(), source);
     }
 
     #[test]

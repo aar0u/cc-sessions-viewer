@@ -3,8 +3,10 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { t } from '../i18n'
+import { elidePath, formatSize } from '../format'
+import ConfirmModal from '../modals/ConfirmModal.vue'
 import { agentLabel } from '../agentMeta'
-import type { Agent } from '../types'
+import type { Agent, RuntimeDiagnostics, StorageUsageEntry } from '../types'
 import {
   codexShowArchivedSessions,
   codexShowInternalSessions,
@@ -78,6 +80,8 @@ import {
   IconStar,
   IconFileImage,
   IconFolder,
+  IconDatabase,
+  IconCopy,
   IconPalette,
   agentIcons,
   terminalIcons,
@@ -125,7 +129,7 @@ import {
 import DesktopPetFallback from './DesktopPetFallback.vue'
 import PetAtlasPlayer from './PetAtlasPlayer.vue'
 
-type SettingsTab = 'general' | 'theme' | 'advanced' | 'hooks' | 'pet' | 'cli' | 'shortcuts' | 'updates'
+type SettingsTab = 'general' | 'theme' | 'advanced' | 'storage' | 'hooks' | 'pet' | 'cli' | 'shortcuts' | 'updates'
 const SETTINGS_ACTIVE_TAB_KEY = 'settingsActiveTab:v1'
 
 // 左侧导航：图标 + 文案，激活项高亮（参考 Claude 客户端设置面板）。
@@ -133,6 +137,7 @@ const navItems = [
   { id: 'general', icon: IconSettings, key: 'settings.tab.general' },
   { id: 'theme', icon: IconPalette, key: 'settings.tab.theme' },
   { id: 'advanced', icon: IconSliders, key: 'settings.tab.advanced' },
+  { id: 'storage', icon: IconDatabase, key: 'settings.tab.storage' },
   { id: 'hooks', icon: IconWebhook, key: 'settings.tab.hooks' },
   { id: 'pet', icon: IconStar, key: 'settings.tab.desktopPet' },
   { id: 'cli', icon: IconTerminal, key: 'settings.tab.cli' },
@@ -278,9 +283,235 @@ async function openDataDirectory() {
   try { await api.openPathExternal(dataDirectory.value) }
   catch (error) { emit('notify', String(error), true) }
 }
+
+// ============================ 存储与诊断 ============================
+// 「app 越用越大」的排查入口：逐项列出本 app 会写到磁盘的位置，能清的给一个清理按钮；
+// 下面的运行诊断把两个进程的内存与各常驻缓存摊开，用户一屏截图就能定位到哪一层。
+
+const storageEntries = ref<StorageUsageEntry[]>([])
+const storageLoading = ref(false)
+const storageError = ref('')
+const clearingStorageKey = ref('')
+const storageTotal = computed(() =>
+  storageEntries.value.reduce((sum, entry) => sum + entry.bytes, 0))
+const reclaimableBytes = computed(() =>
+  storageEntries.value.reduce((sum, entry) => sum + (entry.clearable ? entry.bytes : 0), 0))
+
+// 配色沿用 /context 卡片那套：能回收的走蓝色族（按占比由大到小），用户自己的素材和日志走
+// 中性灰 —— 颜色本身就在说「哪些清得掉、哪些是你的东西」，不用再加一列说明。
+const RECLAIMABLE_COLORS = [
+  'var(--ctx-blue-1)',
+  'var(--ctx-blue-2)',
+  'var(--ctx-blue-3)',
+  'var(--ctx-blue-4)',
+  'var(--ctx-blue-5)',
+  'var(--ctx-blue-6)',
+]
+const KEEP_COLORS = ['var(--ctx-gray-buffer)', 'var(--ctx-gray-deferred)', 'var(--line-strong)']
+
+interface StorageSlice extends StorageUsageEntry {
+  color: string
+  percent: number
+}
+
+/** 按占用从大到小排 —— 排查「谁把磁盘吃了」时，第一行就该是答案。 */
+const storageSlices = computed<StorageSlice[]>(() => {
+  const total = storageTotal.value
+  let reclaimable = 0
+  let keep = 0
+  return [...storageEntries.value]
+    .sort((a, b) => b.bytes - a.bytes)
+    .map((entry) => ({
+      ...entry,
+      percent: total ? (entry.bytes / total) * 100 : 0,
+      color: entry.clearable
+        ? RECLAIMABLE_COLORS[Math.min(reclaimable++, RECLAIMABLE_COLORS.length - 1)]
+        : KEEP_COLORS[Math.min(keep++, KEEP_COLORS.length - 1)],
+    }))
+})
+const storageSegments = computed(() => storageSlices.value.filter((slice) => slice.percent > 0))
+// 鼠标停在某一项上时，条形图里其它段淡下去 —— 图例与图形的对应关系不用靠数颜色。
+const hoveredStorageKey = ref('')
+
+async function loadStorageUsage() {
+  storageLoading.value = true
+  try {
+    storageEntries.value = await api.storageUsage()
+    storageError.value = ''
+  } catch (error) {
+    storageError.value = String(error)
+  } finally {
+    storageLoading.value = false
+  }
+}
+
+// 删了还能长回来的（内容寻址的图片缓存、能重装的宠物图集、只是被截断的日志）直接清；
+// 这两项删掉就真没了 —— 回收站清空后会话再也还不回来，附件是用户自己粘进对话的图。
+// 确认摩擦按后果给，而不是一刀切：给缓存也套弹窗只会让人养成闭眼点确认的习惯。
+const DESTRUCTIVE_STORAGE_KEYS = new Set(['trash', 'attachments'])
+
+const storageConfirm = ref<{ show: boolean; entry: StorageUsageEntry | null }>({
+  show: false,
+  entry: null,
+})
+const storageConfirmTitle = computed(() => storageConfirm.value.entry
+  ? t('settings.storage.confirm.title', {
+      name: t(`settings.storage.item.${storageConfirm.value.entry.key}`),
+    })
+  : '')
+const storageConfirmMessage = computed(() => storageConfirm.value.entry
+  ? t(`settings.storage.confirm.${storageConfirm.value.entry.key}`, {
+      size: formatSize(storageConfirm.value.entry.bytes),
+    })
+  : '')
+
+function clearStorageEntry(entry: StorageUsageEntry) {
+  if (clearingStorageKey.value) return
+  if (DESTRUCTIVE_STORAGE_KEYS.has(entry.key)) {
+    storageConfirm.value = { show: true, entry }
+    return
+  }
+  void runClearStorage(entry)
+}
+
+function confirmClearStorage() {
+  const entry = storageConfirm.value.entry
+  storageConfirm.value = { show: false, entry: null }
+  if (entry) void runClearStorage(entry)
+}
+
+async function runClearStorage(entry: StorageUsageEntry) {
+  clearingStorageKey.value = entry.key
+  try {
+    const freed = await api.clearStorage(entry.key)
+    emit('notify', t('settings.storage.cleared', { size: formatSize(freed) }))
+    await loadStorageUsage()
+  } catch (error) {
+    emit('notify', String(error), true)
+  } finally {
+    clearingStorageKey.value = ''
+  }
+}
+
+/** 在系统文件管理器里打开这一项。目录还没被创建过时，后端会退到最近存在的祖先。 */
+async function revealStorageEntry(entry: StorageUsageEntry) {
+  try {
+    await api.revealInFinder(entry.path)
+  } catch (error) {
+    emit('notify', String(error), true)
+  }
+}
+
+// 保留期：0 = 永久保留。默认 30 天，与后端 `DEFAULT_TRASH_RETENTION_DAYS` 一致 ——
+// 这里的初值只在后端应答回来之前显示，取一样的值免得先闪一下「永久」。
+const RETENTION_OPTIONS = [0, 7, 30, 90] as const
+const trashRetention = ref(30)
+const retentionMenuOpen = ref(false)
+const retentionWrapEl = ref<HTMLElement>()
+const retentionLabel = computed(() =>
+  trashRetention.value === 0
+    ? t('settings.storage.retention.forever')
+    : t('settings.storage.retention.days', { n: trashRetention.value }))
+
+async function pickRetention(days: number) {
+  retentionMenuOpen.value = false
+  const previous = trashRetention.value
+  trashRetention.value = days
+  try {
+    trashRetention.value = await api.setTrashRetention(days)
+  } catch (error) {
+    trashRetention.value = previous
+    emit('notify', String(error), true)
+  }
+}
+
+const diagnostics = ref<RuntimeDiagnostics | null>(null)
+const diagnosticsLoading = ref(false)
+
+async function loadDiagnostics() {
+  diagnosticsLoading.value = true
+  try { diagnostics.value = await api.runtimeDiagnostics() }
+  catch { diagnostics.value = null }
+  finally { diagnosticsLoading.value = false }
+}
+
+/** 复制诊断信息：用户反馈问题时直接贴给我们，省掉来回问。 */
+async function copyDiagnostics() {
+  const data = diagnostics.value
+  if (!data) return
+  const lines = [
+    `app v${version.value}`,
+    `main RSS: ${formatSize(data.mainRssBytes)}`,
+    `webview RSS: ${formatSize(data.webviewRssBytes)}`,
+    `threads: ${data.threads}`,
+    `user text cache: ${formatSize(data.userTextCacheBytes)}`,
+    `usage cache: ${data.usageCacheEntries}`,
+    `scan cache: ${data.scanCacheEntries}`,
+    `watch map: ${data.watchMapEntries}`,
+    `chats: ${data.activeChats}`,
+    `turn tasks: ${data.desktopTasks}`,
+    `image cache: ${formatSize(data.imageCacheBytes)}`,
+    `attachments: ${formatSize(data.attachmentsBytes)}`,
+    `trash: ${formatSize(data.trashBytes)}`,
+  ]
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'))
+    emit('notify', t('settings.diagnostics.copied'))
+  } catch (error) {
+    emit('notify', String(error), true)
+  }
+}
+
+// 后端在主进程 / 渲染进程 RSS 超过 4 GB 时往 diagnostics.log 记 warn，这里就拿这条线当满格：
+// 单看「79.5 MB」说明不了任何事，「离告警线还有 2%」才是用户要的那个判断。
+const RSS_WARN_BYTES = 4 * 1024 * 1024 * 1024
+const RSS_WARN_LABEL = '4 GB'
+
+function memoryCard(key: string, bytes: number) {
+  const percent = Math.min(100, (bytes / RSS_WARN_BYTES) * 100)
+  return {
+    key,
+    known: bytes > 0,
+    value: bytes ? formatSize(bytes) : '—',
+    // 再小也留一截可见的填充，否则空条看着像是没读到数
+    width: bytes ? Math.max(percent, 1.5) : 0,
+    percentLabel: percent < 1 ? '<1' : String(Math.round(percent)),
+    level: percent >= 75 ? 'high' : percent >= 40 ? 'warn' : 'ok',
+  }
+}
+
+const memoryCards = computed(() => {
+  const data = diagnostics.value
+  if (!data) return []
+  return [memoryCard('mainRss', data.mainRssBytes), memoryCard('webviewRss', data.webviewRssBytes)]
+})
+
+/** 剩下的都是「条数 / 个数」，做成小方块比堆成九行表格好读。 */
+const statTiles = computed(() => {
+  const data = diagnostics.value
+  if (!data) return []
+  return [
+    { key: 'threads', value: String(data.threads) },
+    { key: 'userTextCache', value: formatSize(data.userTextCacheBytes) },
+    { key: 'usageCache', value: String(data.usageCacheEntries) },
+    { key: 'scanCache', value: String(data.scanCacheEntries) },
+    { key: 'watchMap', value: String(data.watchMapEntries) },
+    { key: 'activeChats', value: String(data.activeChats) },
+    { key: 'desktopTasks', value: String(data.desktopTasks) },
+  ]
+})
+
+// 只在真正打开这一页时才去读盘 / 数进程 —— 这些查询要遍历目录、要 fork `ps`。
+watch(activeTab, (tab) => {
+  if (tab !== 'storage') return
+  void loadStorageUsage()
+  void loadDiagnostics()
+  api.trashRetention().then((days) => { trashRetention.value = days }).catch(() => {})
+}, { immediate: true })
 const updateMsg = ref('')
 const checking = ref(false)
 const installingTurnHooks = ref(false)
+const hookResetConfirm = ref(false)
 const turnHooksMsg = ref('')
 const hookOpenError = ref('')
 const turnHooksEnabled = computed(() => turnHookStatus.value?.enabled ?? false)
@@ -492,6 +723,8 @@ function onDocClick(e: MouseEvent) {
     themeMenuOpen.value = false
   if (terminalMenuOpen.value && terminalWrapEl.value && !terminalWrapEl.value.contains(e.target as Node))
     terminalMenuOpen.value = false
+  if (retentionMenuOpen.value && retentionWrapEl.value && !retentionWrapEl.value.contains(e.target as Node))
+    retentionMenuOpen.value = false
 }
 onMounted(() => document.addEventListener('click', onDocClick, true))
 onUnmounted(() => {
@@ -719,8 +952,7 @@ async function installUpdate() {
   }
 }
 
-async function installTurnHooks() {
-  if (installingTurnHooks.value || turnHookStatusLoading.value || turnHooksEnabled.value) return
+async function runTurnHookInstall() {
   installingTurnHooks.value = true
   turnHooksMsg.value = t('settings.turnStatus.installing')
   try {
@@ -736,6 +968,40 @@ async function installTurnHooks() {
   }
 }
 
+function installTurnHooks() {
+  if (installingTurnHooks.value || turnHookStatusLoading.value || turnHooksEnabled.value) return
+  void runTurnHookInstall()
+}
+
+/**
+ * 重置 = 把装进去的 hook 全部摘掉，回到没启用过的样子。
+ *
+ * 改的是各家 agent 的共享配置文件（Claude / Codex / AGY / Grok / Kimi / Pi），
+ * 用户自己手写的 hook 后端会原样留下，但这仍然是一次改别人配置的写操作，
+ * 所以走二次确认，和存储面板里的清理按钮同一档。
+ */
+function resetTurnHooks() {
+  if (installingTurnHooks.value || turnHookStatusLoading.value) return
+  hookResetConfirm.value = true
+}
+
+async function confirmResetTurnHooks() {
+  hookResetConfirm.value = false
+  installingTurnHooks.value = true
+  turnHooksMsg.value = t('settings.turnStatus.resetting')
+  try {
+    await api.uninstallTurnHooks()
+    await refreshTurnHookStatus()
+    turnHooksMsg.value = turnHookStatusError.value
+      ? t('settings.turnStatus.resetFail', { e: turnHookStatusError.value })
+      : t('settings.turnStatus.resetDone')
+  } catch (e) {
+    turnHooksMsg.value = t('settings.turnStatus.resetFail', { e: String(e) })
+  } finally {
+    installingTurnHooks.value = false
+  }
+}
+
 async function refreshTurnHooks() {
   if (installingTurnHooks.value || turnHookStatusLoading.value) return
   turnHooksMsg.value = ''
@@ -745,6 +1011,25 @@ async function refreshTurnHooks() {
 
 <template>
   <div class="app-overlay">
+    <!-- 清理前的二次确认。z-index 比设置弹窗高，叠在它上面（见 style.css 的 .app-overlay-confirm） -->
+    <ConfirmModal
+      :show="storageConfirm.show"
+      :title="storageConfirmTitle"
+      :message="storageConfirmMessage"
+      :ok-text="t('settings.storage.clear')"
+      :danger="true"
+      @confirm="confirmClearStorage"
+      @cancel="storageConfirm = { show: false, entry: null }"
+    />
+    <ConfirmModal
+      :show="hookResetConfirm"
+      :title="t('settings.turnStatus.reset')"
+      :message="t('settings.turnStatus.resetConfirm')"
+      :ok-text="t('settings.turnStatus.reset')"
+      :danger="true"
+      @confirm="confirmResetTurnHooks"
+      @cancel="hookResetConfirm = false"
+    />
     <div class="modal settings-modal">
       <!-- 左侧导航：分组标题 + 图标项，激活项高亮（参考 Claude 客户端设置面板） -->
       <nav class="set-nav">
@@ -1341,6 +1626,179 @@ async function refreshTurnHooks() {
 
         </template>
 
+        <template v-else-if="activeTab === 'storage'">
+          <!-- 存储占用：一条分段条先回答「谁占的」，下面每一项既是图例也是清理入口。 -->
+          <div class="set-group">
+            <div class="set-group-head">
+              <div class="set-group-title">{{ t('settings.storage.title') }}</div>
+              <p class="set-group-desc">{{ t('settings.storage.desc') }}</p>
+            </div>
+
+            <p v-if="storageError" class="set-row-desc error">{{ storageError }}</p>
+
+            <div class="set-store-hero">
+              <div class="set-store-hero-top">
+                <div class="set-store-total">
+                  <span class="set-store-total-num">{{ formatSize(storageTotal) }}</span>
+                  <span class="set-store-total-cap">
+                    {{ t('settings.storage.onDisk') }}
+                    <template v-if="reclaimableBytes">
+                      · {{ t('settings.storage.reclaimable', { size: formatSize(reclaimableBytes) }) }}
+                    </template>
+                  </span>
+                </div>
+                <button
+                  class="btn set-icon-btn"
+                  :disabled="storageLoading"
+                  v-tooltip="t('common.refresh')"
+                  :aria-label="t('common.refresh')"
+                  @click="loadStorageUsage"
+                >
+                  <IconRefresh />
+                </button>
+              </div>
+              <div class="set-store-bar">
+                <span
+                  v-for="slice in storageSegments"
+                  :key="slice.key"
+                  class="set-store-seg"
+                  :class="{ dim: hoveredStorageKey && hoveredStorageKey !== slice.key }"
+                  :style="{ width: slice.percent + '%', background: slice.color }"
+                  v-tooltip="`${t('settings.storage.item.' + slice.key)} · ${formatSize(slice.bytes)}`"
+                  @mouseenter="hoveredStorageKey = slice.key"
+                  @mouseleave="hoveredStorageKey = ''"
+                />
+              </div>
+            </div>
+
+            <div class="set-store-list">
+              <div
+                v-for="slice in storageSlices"
+                :key="slice.key"
+                class="set-store-item"
+                :class="{ dim: hoveredStorageKey && hoveredStorageKey !== slice.key }"
+                @mouseenter="hoveredStorageKey = slice.key"
+                @mouseleave="hoveredStorageKey = ''"
+              >
+                <span class="set-store-dot" :style="{ background: slice.color }" />
+                <div class="set-store-text">
+                  <div class="set-store-name">{{ t(`settings.storage.item.${slice.key}`) }}</div>
+                  <div class="set-store-path" v-tooltip="slice.path">{{ elidePath(slice.path) }}</div>
+                </div>
+                <div class="set-store-metrics">
+                  <span class="set-store-bytes">{{ formatSize(slice.bytes) }}</span>
+                  <span class="set-store-pct">{{ slice.percent >= 0.5 ? Math.round(slice.percent) + '%' : '—' }}</span>
+                </div>
+                <button
+                  class="btn set-icon-btn set-store-reveal"
+                  v-tooltip="t('settings.storage.reveal')"
+                  :aria-label="t('settings.storage.reveal')"
+                  @click="revealStorageEntry(slice)"
+                >
+                  <IconFolder />
+                </button>
+                <button
+                  v-if="slice.clearable"
+                  class="btn set-icon-btn"
+                  :disabled="!slice.bytes || clearingStorageKey === slice.key"
+                  v-tooltip="t('settings.storage.clear')"
+                  :aria-label="t('settings.storage.clear')"
+                  @click="clearStorageEntry(slice)"
+                >
+                  <IconTrash />
+                </button>
+                <!-- 用户资产只报大小，占位保持右缘对齐 -->
+                <span v-else class="set-store-nobtn" />
+              </div>
+            </div>
+          </div>
+
+          <!-- 回收站保留期。默认「永久保留」，与本次改动之前的行为一致。 -->
+          <div class="set-group">
+            <div class="set-row">
+              <div class="set-row-text">
+                <div class="set-row-title">{{ t('settings.storage.retention.title') }}</div>
+                <p class="set-row-desc">{{ t('settings.storage.retention.desc') }}</p>
+              </div>
+              <div ref="retentionWrapEl" class="set-dropdown-wrap set-row-control">
+                <button
+                  class="set-dropdown-btn"
+                  :class="{ active: retentionMenuOpen }"
+                  @click.stop="retentionMenuOpen = !retentionMenuOpen"
+                >
+                  <span>{{ retentionLabel }}</span>
+                  <IconChevronDown class="set-dropdown-chev" />
+                </button>
+                <div v-if="retentionMenuOpen" class="set-dropdown-menu" role="menu">
+                  <button
+                    v-for="days in RETENTION_OPTIONS"
+                    :key="days"
+                    class="set-dropdown-item"
+                    :class="{ active: trashRetention === days }"
+                    role="menuitem"
+                    @click.stop="pickRetention(days)"
+                  >
+                    <span class="set-dropdown-check"><IconCheck v-if="trashRetention === days" /></span>
+                    <span>{{ days === 0 ? t('settings.storage.retention.forever') : t('settings.storage.retention.days', { n: days }) }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 运行诊断：两个进程的内存做成带刻度的卡片，其余计数做成小方块。 -->
+          <div class="set-group">
+            <div class="set-group-head set-store-head">
+              <div>
+                <div class="set-group-title">{{ t('settings.diagnostics.title') }}</div>
+                <p class="set-group-desc">{{ t('settings.diagnostics.desc') }}</p>
+              </div>
+              <div class="set-store-actions">
+                <button
+                  class="btn set-icon-btn"
+                  :disabled="diagnosticsLoading"
+                  v-tooltip="t('common.refresh')"
+                  :aria-label="t('common.refresh')"
+                  @click="loadDiagnostics"
+                >
+                  <IconRefresh />
+                </button>
+                <button
+                  class="btn set-icon-btn"
+                  :disabled="!diagnostics"
+                  v-tooltip="t('settings.diagnostics.copy')"
+                  :aria-label="t('settings.diagnostics.copy')"
+                  @click="copyDiagnostics"
+                >
+                  <IconCopy />
+                </button>
+              </div>
+            </div>
+
+            <div class="set-diag-cards">
+              <div v-for="card in memoryCards" :key="card.key" class="set-diag-card">
+                <div class="set-diag-card-label">{{ t(`settings.diagnostics.${card.key}`) }}</div>
+                <div class="set-diag-card-value">{{ card.value }}</div>
+                <div class="set-diag-meter">
+                  <span class="set-diag-meter-fill" :class="card.level" :style="{ width: card.width + '%' }" />
+                </div>
+                <div class="set-diag-card-cap">
+                  {{ card.known
+                    ? t('settings.diagnostics.ofWarn', { pct: card.percentLabel, limit: RSS_WARN_LABEL })
+                    : t('settings.diagnostics.unattributed') }}
+                </div>
+              </div>
+            </div>
+
+            <div class="set-diag-tiles">
+              <div v-for="tile in statTiles" :key="tile.key" class="set-diag-tile">
+                <div class="set-diag-tile-value">{{ tile.value }}</div>
+                <div class="set-diag-tile-label">{{ t(`settings.diagnostics.${tile.key}`) }}</div>
+              </div>
+            </div>
+          </div>
+        </template>
+
         <template v-else-if="activeTab === 'hooks'">
           <div class="set-hooks-head">
             <h2 class="set-hooks-title">{{ t('settings.hooks.title') }}</h2>
@@ -1397,6 +1855,17 @@ async function refreshTurnHooks() {
                   {{ turnHooksMsg }}
                 </p>
               </div>
+              <div class="set-hooks-action-btns">
+              <button
+                v-if="turnHooksEnabled"
+                class="btn set-icon-btn"
+                :disabled="installingTurnHooks || turnHookStatusLoading"
+                v-tooltip="t('settings.turnStatus.reset')"
+                :aria-label="t('settings.turnStatus.reset')"
+                @click="resetTurnHooks"
+              >
+                <IconTrash />
+              </button>
               <button
                 class="btn primary set-hooks-enable"
                 :class="{ enabled: turnHooksEnabled }"
@@ -1412,6 +1881,7 @@ async function refreshTurnHooks() {
                       ? t('settings.turnStatus.enabled')
                       : t('settings.turnStatus.install') }}
               </button>
+              </div>
             </div>
           </section>
 

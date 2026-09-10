@@ -474,25 +474,49 @@ fn tree_nodes(parsed: &ParsedPi) -> Vec<PiTreeNode> {
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     for entry in &parsed.entries {
         if let Some(parent) = entry.parent_id.as_ref() {
-            children.entry(parent.clone()).or_default().push(entry.id.clone());
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(entry.id.clone());
         }
     }
-    parsed.entries.iter().enumerate().map(|(ordinal, entry)| {
-        let kind = entry.value.get("type").and_then(Value::as_str).unwrap_or("entry").to_string();
-        let kind = if kind == "message" {
-            entry.value.pointer("/message/role").and_then(Value::as_str).unwrap_or("message").to_string()
-        } else { kind };
-        let node_children = children.remove(&entry.id).unwrap_or_default();
-        PiTreeNode {
-            id: entry.id.clone(),
-            parent_id: entry.parent_id.clone(),
-            terminal: node_children.is_empty(),
-            children: node_children,
-            kind,
-            timestamp: entry.value.get("timestamp").and_then(Value::as_str).map(str::to_string),
-            ordinal,
-        }
-    }).collect()
+    parsed
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            let kind = entry
+                .value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("entry")
+                .to_string();
+            let kind = if kind == "message" {
+                entry
+                    .value
+                    .pointer("/message/role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    .to_string()
+            } else {
+                kind
+            };
+            let node_children = children.remove(&entry.id).unwrap_or_default();
+            PiTreeNode {
+                id: entry.id.clone(),
+                parent_id: entry.parent_id.clone(),
+                terminal: node_children.is_empty(),
+                children: node_children,
+                kind,
+                timestamp: entry
+                    .value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ordinal,
+            }
+        })
+        .collect()
 }
 
 fn tree_is_unsafe(parsed: &ParsedPi) -> bool {
@@ -826,10 +850,7 @@ fn entry_to_msgs(entry: &PiEntry) -> Vec<Msg> {
                 // Pi records an interrupted turn as an assistant entry with no
                 // content and `stopReason: "aborted"`. Preserve that user action
                 // as a lightweight cancellation note instead of dropping it.
-                let aborted = message
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    == Some("aborted");
+                let aborted = message.get("stopReason").and_then(Value::as_str) == Some("aborted");
                 let error_message = message
                     .get("errorMessage")
                     .and_then(Value::as_str)
@@ -1390,6 +1411,32 @@ fn tree_summary(bytes: &[u8]) -> TreeSummary {
     }
 }
 
+/// 标题指纹：Pi 的 `/rename` 追加一条 `session_info`（带 `name`），它不产生任何
+/// 可见消息，因此实时 tail 只能靠这条指纹发现改名。记录总在末尾，读尾部 256 KB
+/// 取最后一条即可 —— 绝不整文件扫描。返回 `Some("")` 表示「显式清空标题」，与
+/// 「从未改名」(`None`) 是两种不同状态，都必须能被指纹比较区分出来。
+fn metadata_fingerprint(fp: &Path) -> Option<String> {
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let tail = crate::util::read_tail_text(fp, TAIL_BYTES)?;
+    let mut latest: Option<String> = None;
+    for line in tail.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("session_info") {
+            continue;
+        }
+        if let Some(name) = entry.get("name").and_then(Value::as_str) {
+            latest = Some(name.to_string());
+        }
+    }
+    latest
+}
+
 fn session_meta(record: &PiSessionRecord) -> SessionMeta {
     let summary = stable_bytes(&record.path)
         .map(|bytes| tree_summary(&bytes))
@@ -1532,7 +1579,9 @@ impl SessionSource for PiSource {
         let parsed = parse_entries(&bytes)?;
         let selected_leaf = leaf_id
             .map(|id| {
-                parsed.by_id.contains_key(id)
+                parsed
+                    .by_id
+                    .contains_key(id)
                     .then_some(id.to_string())
                     .ok_or_else(|| format!("Pi entry not found: {id}"))
             })
@@ -1542,8 +1591,12 @@ impl SessionSource for PiSource {
         let mut header = Value::Null;
         for raw in bytes.split(|byte| *byte == b'\n') {
             let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-            if raw.is_empty() { continue; }
-            let Ok(value) = serde_json::from_slice::<Value>(raw) else { continue; };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+                continue;
+            };
             if value.get("type").and_then(Value::as_str) == Some("session") {
                 header = value;
             } else if value.get("id").and_then(Value::as_str).is_some() {
@@ -1558,7 +1611,8 @@ impl SessionSource for PiSource {
             "selectedLeafId": selected_leaf,
             "header": header,
             "entries": entries,
-        })).map_err(|e| format!("Pi export serialization failed: {e}"))
+        }))
+        .map_err(|e| format!("Pi export serialization failed: {e}"))
     }
     fn rename_session(&self, path: &Path, name: &str) -> Result<(), String> {
         let name = validate_rename_name(name)?;
@@ -1603,6 +1657,9 @@ impl SessionSource for PiSource {
     }
     fn image_src(&self, _: &Value) -> Option<String> {
         None
+    }
+    fn metadata_fingerprint(&self, path: &str) -> Option<String> {
+        metadata_fingerprint(Path::new(path))
     }
     fn usage_summary(&self, path: &str) -> Result<UsageSummary, String> {
         usage_summary_from_bytes(&stable_bytes(Path::new(path))?)
@@ -1730,6 +1787,49 @@ mod tests {
 
     fn header(version: u64, id: &str, cwd: &str) -> Value {
         serde_json::json!({"type":"session","version":version,"id":id,"timestamp":"2026-08-22T00:00:00.000Z","cwd":cwd})
+    }
+
+    #[test]
+    fn metadata_fingerprint_returns_the_latest_session_name() {
+        // Pi 的 /rename 追加一条新的 session_info；指纹取最后一条，改名才会刷新列表。
+        let root = temp_root("fingerprint-latest");
+        let path = write_session(
+            &root,
+            "session.jsonl",
+            &[
+                header(3, "session", "/tmp/project"),
+                serde_json::json!({"type":"session_info","name":"first"}),
+                serde_json::json!({"type":"session_info","name":"second"}),
+            ],
+        );
+        assert_eq!(metadata_fingerprint(&path).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn metadata_fingerprint_reports_an_explicit_title_clear() {
+        // 清空标题写的是空串 —— 必须区别于"没有指纹"的 None，否则清空不会刷新。
+        let root = temp_root("fingerprint-cleared");
+        let path = write_session(
+            &root,
+            "session.jsonl",
+            &[
+                header(3, "session", "/tmp/project"),
+                serde_json::json!({"type":"session_info","name":"named"}),
+                serde_json::json!({"type":"session_info","name":""}),
+            ],
+        );
+        assert_eq!(metadata_fingerprint(&path).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn metadata_fingerprint_is_none_without_session_info() {
+        let root = temp_root("fingerprint-none");
+        let path = write_session(
+            &root,
+            "session.jsonl",
+            &[header(3, "session", "/tmp/project")],
+        );
+        assert!(metadata_fingerprint(&path).is_none());
     }
 
     #[test]
@@ -2289,7 +2389,10 @@ Use tmux-bridge for pane control.
         };
         let messages = entry_to_msgs(&entry);
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].blocks.iter().all(|block| block.kind != "thinking"));
+        assert!(messages[0]
+            .blocks
+            .iter()
+            .all(|block| block.kind != "thinking"));
         assert_eq!(messages[0].blocks[0].text.as_deref(), Some("done"));
     }
 
@@ -2307,7 +2410,10 @@ Use tmux-bridge for pane control.
         let messages = entry_to_msgs(&entry);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].meta_kind.as_deref(), Some("cancelled"));
-        assert_eq!(messages[0].blocks[0].text.as_deref(), Some("Operation aborted"));
+        assert_eq!(
+            messages[0].blocks[0].text.as_deref(),
+            Some("Operation aborted")
+        );
     }
 
     #[test]

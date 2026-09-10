@@ -157,6 +157,9 @@ import {
   setActiveViewTab,
   syncSessionViewTitles,
   visibleViewTabs,
+  visibleViewTabIds,
+  setTabMsgs,
+  sweepSessionTabs,
   persistViewTabs,
   loadSavedViewTabs,
   clearSavedViewTabs,
@@ -164,6 +167,7 @@ import {
   migrateViewTabsProjectKey,
   type SavedViewTab,
 } from './viewTabs'
+import { snapshotMsgs } from './msgSnapshot'
 import {
   currentAgent as panesAgent,
   currentProjectKey as panesProject,
@@ -209,7 +213,7 @@ const showStats = ref(false)
 const showExportHistory = ref(false)
 const showPricing = ref(false)
 const showSettings = ref(false)
-const settingsTab = ref<'general' | 'theme' | 'advanced' | 'hooks' | 'pet' | 'cli' | 'shortcuts' | 'updates'>()
+const settingsTab = ref<'general' | 'theme' | 'advanced' | 'storage' | 'hooks' | 'pet' | 'cli' | 'shortcuts' | 'updates'>()
 const sidebarOpen = ref(true)
 const refreshing = ref(false)
 const isWindows = /Win/i.test(navigator.platform)
@@ -219,6 +223,7 @@ const windowClosePrompt = ref({ show: false, remember: false })
 const windowCloseRunning = ref(false)
 let windowCloseUnlisten: UnlistenFn | null = null
 let beforeQuitUnlisten: UnlistenFn | null = null
+let trashPurgedUnlisten: UnlistenFn | null = null
 function toggleSidebar() {
   sidebarOpen.value = !sidebarOpen.value
 }
@@ -526,8 +531,13 @@ watch(openSession, (val, old) => {
     api.unwatchSession().catch(() => {})
     if (val?.path) {
       const tab = activeViewTab.value
-      if (tab?.type === 'session') {
-        api.watchSession(tab.agent, val.path).catch(() => {})
+      // 还在读盘的 tab 这里先不挂 —— 此刻 tab.msgs 还是空的，传 0 当基准会让后端把
+      // 整段消息当成「新增」推回来，前端 concat 后就重复了。loadSessionTab 读完会
+      // 自己挂上，并带上真实条数。
+      // 壳 tab（尚未装载 / 已被释放）同理：它手上是空的，等 ensureSessionTabLoaded
+      // 读完会自己挂上。
+      if (tab?.type === 'session' && tab.msgsLoaded && !tab.loadingMsgs) {
+        api.watchSession(tab.agent, val.path, tab.msgs.length).catch(() => {})
       }
     }
   }
@@ -1094,6 +1104,12 @@ interface ConfirmState {
   onOk: () => void
   altText?: string
   onAlt?: () => void
+  /** 取消按钮文案。告知类弹窗用「知道了」，比「取消」贴切。 */
+  cancelText?: string
+  /** 走取消时也要做的事。告知类弹窗两个按钮都算「已阅」。 */
+  onCancel?: () => void
+  /** 点遮罩是否能关掉。一次性的数据丢失警告传 false，必须点按钮。 */
+  dismissable?: boolean
 }
 const confirm = ref<ConfirmState>({
   show: false,
@@ -1113,7 +1129,16 @@ function ask(opts: Partial<ConfirmState> & { onOk: () => void }) {
     onOk: opts.onOk,
     altText: opts.altText,
     onAlt: opts.onAlt,
+    cancelText: opts.cancelText,
+    onCancel: opts.onCancel,
+    dismissable: opts.dismissable,
   }
+}
+
+function runCancel() {
+  const fn = confirm.value.onCancel
+  confirm.value.show = false
+  fn?.()
 }
 function runConfirm() {
   const fn = confirm.value.onOk
@@ -1342,6 +1367,11 @@ function chooseWindowCloseAction(action: WindowCloseAction) {
 // Rust 侧退出拦截（ExitRequested → app://before-quit）给前端的最后保存机会：
 // 托盘 Quit / ⌘Q 这类不经过 runWindowCloseAction 的退出路径全靠这里兜底。
 async function installBeforeQuitSave() {
+  // 后台维护线程清掉过期回收站条目后刷新列表，否则回收站视图会一直显示已经不存在的项。
+  trashPurgedUnlisten = await listen<number>('trash:purged', async (e) => {
+    try { trash.value = await api.listTrash() } catch { return }
+    if (e.payload > 0) notify(t('toast.trashPurged', { n: e.payload }))
+  })
   beforeQuitUnlisten = await listen('app://before-quit', () => saveTabState())
 }
 
@@ -1825,6 +1855,39 @@ function openStats() {
   sessionTotal.value = 0
 }
 
+/**
+ * 「回收站现在会自动清理」——升级后只弹这一次。
+ *
+ * 后端在用户确认之前**不会删任何东西**（`storage_gc` 里跳过回收站），所以这条提示
+ * 一定出现在删除之前，而不是事后通知。回收站里没有到期条目时后端返回 0，不打扰。
+ * 两个按钮都算「已阅」：点「去设置」顺带把设置页开到存储那一栏。
+ */
+async function showTrashRetentionNotice() {
+  let expired = 0
+  try { expired = await api.trashRetentionNotice() } catch { return }
+  if (!expired) return
+  const acknowledge = async () => {
+    try {
+      await api.ackTrashRetention()
+      trash.value = await api.listTrash()
+    } catch (e) { notify(String(e), true) }
+  }
+  ask({
+    title: t('dialog.trashRetention.title'),
+    message: t('dialog.trashRetention.body', { n: expired }),
+    okText: t('dialog.trashRetention.openSettings'),
+    cancelText: t('dialog.trashRetention.ack'),
+    // 唯一一次提醒，必须点按钮 —— 误点遮罩不算看过。
+    dismissable: false,
+    onOk: async () => {
+      await acknowledge()
+      settingsTab.value = 'storage'
+      showSettings.value = true
+    },
+    onCancel: acknowledge,
+  })
+}
+
 async function loadTrash() {
   setActiveTui(null)
   showTrash.value = true
@@ -1883,7 +1946,9 @@ async function openChat(s: SessionMeta, requestedPiLeaf?: string) {
   try {
     await loadSessionTab(tab, openAgent, s.path, requestedPiLeaf)
     try {
-      await api.watchSession(openAgent, s.path)
+      // loadSessionTab 已经挂过 watcher 了；这里是幂等重入，只为兜住「加载期间用户
+      // 又切走再切回」的时序。带上条数，后端不会再解析一遍。
+      await api.watchSession(openAgent, s.path, tab.msgs.length)
       const ageMs = Date.now() - (s.modified ?? 0)
       if (ageMs >= 0 && ageMs < LIVE_FRESH_MS) {
         tab.liveTailing = true
@@ -1918,16 +1983,55 @@ async function loadSessionTab(
       tab.piTree = tree
       const leaf = requestedLeaf || tree[tree.length - 1]?.id || null
       tab.piLeafId = leaf
-      tab.msgs = await api.readSession(sourceAgent, path, leaf ?? undefined)
+      setTabMsgs(tab, await api.readSession(sourceAgent, path, leaf ?? undefined))
     } catch {
       tab.piTree = null
       tab.piLeafId = null
-      tab.msgs = await api.readSession(sourceAgent, path)
+      setTabMsgs(tab, await api.readSession(sourceAgent, path))
     }
   } else {
-    tab.msgs = await api.readSession(sourceAgent, path)
+    setTabMsgs(tab, await api.readSession(sourceAgent, path))
   }
   tab.loadingMsgs = false
+  // 刚读完盘，这里是唯一能确定「前端手上有多少条」的地方 —— 顺手把 live tail 挂上并
+  // 把条数交给后端当基准，省掉后端为了建基准再整份解析一遍同一个文件（打开一个
+  // 160 MB 的会话原本要解析两遍）。只给当前正在看的 tab 挂：后端同一时刻只追一个会话。
+  if (tab.uiId === activeViewTabId.value) {
+    api.watchSession(sourceAgent, path, tab.msgs.length).catch(() => {})
+  }
+}
+
+/** 正在读盘的 tab —— 防止同一个 tab 被并发装载两次。 */
+const loadingTabIds = new Set<number>()
+
+/** 按需装载一个「壳」session tab。启动恢复和后台淘汰都会把 tab 留成壳，等它真正
+ *  被某个 pane 显示时才走这里读盘。重入安全：正在读的 tab 不会被重复触发。 */
+function ensureSessionTabLoaded(tab: ViewTab) {
+  if (tab.type !== 'session' || tab.msgsLoaded || !tab.session) return
+  // loadingMsgs 是「此刻正有人在读盘」。openSession / openTrashSession 这些显式入口
+  // 会先把它置起来再 await，所以这里必须让路 —— 否则同一个 160 MB 的文件会被读两遍。
+  if (tab.loadingMsgs || loadingTabIds.has(tab.uiId)) return
+  loadingTabIds.add(tab.uiId)
+  tab.loadingMsgs = true
+  const path = tab.session.path
+  const sourceAgent = tab.trashAgent ?? tab.importedAgent ?? tab.agent
+  loadSessionTab(tab, sourceAgent, path, tab.piLeafId)
+    .catch(() => {
+      // 文件已被删除 / 移走：这个 tab 已经没有内容可看，收掉。
+      removeViewTab(tab.uiId)
+    })
+    .finally(() => {
+      loadingTabIds.delete(tab.uiId)
+    })
+}
+
+/** 装载所有当前可见的 session tab，再把该释放的后台 tab 释放掉。 */
+function syncSessionTabResidency() {
+  for (const uiId of visibleViewTabIds()) {
+    const tab = viewTabs.value.find(t => t.uiId === uiId)
+    if (tab) ensureSessionTabLoaded(tab)
+  }
+  sweepSessionTabs()
 }
 
 async function switchPiLeaf(leafId: string) {
@@ -1936,7 +2040,7 @@ async function switchPiLeaf(leafId: string) {
   if (tab.piLeafId === leafId) return
   tab.loadingMsgs = true
   try {
-    tab.msgs = await api.readSession('pi', tab.session.path, leafId)
+    setTabMsgs(tab, await api.readSession('pi', tab.session.path, leafId))
     tab.piLeafId = leafId
     persistViewTabs()
   } catch (e) {
@@ -2051,7 +2155,7 @@ async function openHistorySession(rec: ExportRecord) {
   })
   setActiveViewTab(tab.uiId)
   try {
-    tab.msgs = await api.readSession(rec.agent, rec.path)
+    setTabMsgs(tab, await api.readSession(rec.agent, rec.path))
   } catch (e) {
     notify(t('toast.readFail', { e: String(e) }), true)
     removeViewTab(tab.uiId)
@@ -2132,7 +2236,7 @@ async function openTrashSession(item: TrashItem) {
     loadingMsgs: true,
   })
   try {
-    tab.msgs = await api.readSession(item.agent, item.trashPath)
+    setTabMsgs(tab, await api.readSession(item.agent, item.trashPath))
   } catch (e) {
     notify(t('toast.readFail', { e: String(e) }), true)
     removeViewTab(tab.uiId)
@@ -2847,7 +2951,7 @@ async function switchLiveChatToRead() {
   tab.sourceSession = null
   tab.loadingMsgs = true
   api.readSession(tab.agent, source.path).then(msgs => {
-    tab.msgs = msgs
+    setTabMsgs(tab, msgs)
     tab.loadingMsgs = false
   }).catch(() => { tab.loadingMsgs = false })
 }
@@ -3622,19 +3726,16 @@ async function onFocus() {
   if (activeTuiTab) markTabViewed(activeTuiTab.uiId)
   clearPendingLiveNotification()
   const activeTab = viewTabs.value.find(t => t.uiId === activeViewTabId.value)
-  if (activeTab && activeTab.type === 'session' && activeTab.session?.path) {
+  if (activeTab?.type === 'session' && activeTab.session?.path && activeTab.msgsLoaded && !activeTab.loadingMsgs) {
+    // 这里原本是「整份重读 + 重新挂 watcher」。窗口每切一次焦点就把一个可能上百 MB 的
+    // 会话整份解析一遍、并且**再叠一条**后端轮询线程 —— 这是内存增长最陡的那条曲线。
+    //
+    // 现在改成：幂等地确认 watcher 还在（已在追同一个会话就只校准一下基准，不重建、
+    // 不重解析），然后主动催后端查一次。真有新增会照常走 session:append 推回来，
+    // liveTailing 的点亮也由那条链路负责，行为不变。
     try {
-      const oldLen = activeTab.msgs.length
-      const newMsgs = await api.readSession(activeTab.agent, activeTab.session.path)
-      activeTab.msgs = newMsgs
-      await api.watchSession(activeTab.agent, activeTab.session.path)
-      if (newMsgs.length > oldLen) {
-        activeTab.liveTailing = true
-        window.clearTimeout(activeTab.liveFadeTimer)
-        activeTab.liveFadeTimer = window.setTimeout(() => {
-          activeTab.liveTailing = false
-        }, LIVE_STALE_MS)
-      }
+      await api.watchSession(activeTab.agent, activeTab.session.path, activeTab.msgs.length)
+      await api.checkWatchedSession()
     } catch {}
   }
 }
@@ -3767,16 +3868,14 @@ onMounted(() => {
           title: sv.title,
           createdAt: sv.createdAt,
           session: sv.session,
-          loadingMsgs: true,
           trashAgent: sv.trashAgent,
           importedAgent: sv.importedAgent,
           piLeafId: sv.piLeafId ?? null,
         })
         if (sv.isActive) activeTabs.push(tab)
         if (i === savedVT.activeIdx) restoredActiveIdx = tab.uiId
-        loadSessionTab(tab, sv.agent, sv.session.path, sv.piLeafId).catch(() => {
-          removeViewTab(tab.uiId)
-        })
+        // 只建壳，不读盘。真正被 pane 显示的那几个由 syncSessionTabResidency 装载 ——
+        // 攒了十几个 tab 的用户过去启动就要把每一份 transcript 整读一遍。
       }
     })
     for (const tab of activeTabs) {
@@ -3792,7 +3891,7 @@ onMounted(() => {
       if (saved?.session?.path) {
         try {
           const diskMsgs = await api.readSession(session.agent, saved.session.path)
-          if (diskMsgs.length > session.msgs.length) session.msgs = diskMsgs
+          if (diskMsgs.length > session.msgs.length) session.msgs = snapshotMsgs(diskMsgs)
           if (!session.lastModel) session.lastModel = lastAssistantModel(session.msgs)
         } catch {}
       }
@@ -3877,6 +3976,7 @@ onMounted(() => {
   })
   // 启动时拉一次回收站，让顶栏红点从一开始就准确（不必先打开回收站视图）
   api.listTrash().then((items) => { trash.value = items }).catch(() => {})
+  void showTrashRetentionNotice()
   // 检测可用终端，首次启动时自动选默认（有 cmux 就默认 cmux）
   api.detectTerminals().then(applyTerminalDefault).catch(() => {})
 
@@ -4051,16 +4151,24 @@ type TerminalTurnEvent = {
 
 type DesktopPetSessionTarget = Pick<DesktopTask, 'agent' | 'path'>
 
+/** 按路径找 session tab。同一个会话可能同时开了不止一个 tab（分屏 / 不同项目视图），
+ *  优先返回**手上真有 msgs** 的那个 —— 只有它能接住增量追加；壳 tab 下次显示时会
+ *  整份重读，接了反而会得到一份只有尾段的残缺列表。 */
+function findSessionTabByPath(path: string): ViewTab | undefined {
+  const matches = viewTabs.value.filter(t => t.type === 'session' && t.session?.path === path)
+  return matches.find(t => t.msgsLoaded) ?? matches[0]
+}
+
 async function installLiveTailListeners() {
   const appendUnlisten = await listen<{ path: string; messages: Msg[] }>(
     'session:append',
     (e) => {
-      const tab = viewTabs.value.find(t => t.type === 'session' && t.session?.path === e.payload.path)
+      const tab = findSessionTabByPath(e.payload.path)
       if (!tab) return
       const added = e.payload.messages
       if (!added.length) return
       markTabSessionActivity(tab.agent, e.payload.path)
-      tab.msgs = tab.msgs.concat(added)
+      if (tab.msgsLoaded) setTabMsgs(tab, tab.msgs.concat(added))
       tab.liveTailing = true
       window.clearTimeout(tab.liveFadeTimer)
       tab.liveFadeTimer = window.setTimeout(() => { tab.liveTailing = false }, LIVE_STALE_MS)
@@ -4077,7 +4185,7 @@ async function installLiveTailListeners() {
     },
   )
   const resetUnlisten = await listen<{ path: string }>('session:reset', async (e) => {
-    const tab = viewTabs.value.find(t => t.type === 'session' && t.session?.path === e.payload.path)
+    const tab = findSessionTabByPath(e.payload.path)
     const listed = sessions.value.some(session => session.path === e.payload.path)
     if (activeDir.value && (tab || listed)) {
       // Pi's /rename appends session_info without adding a visible message.
@@ -4086,13 +4194,15 @@ async function installLiveTailListeners() {
       await refreshSessions()
     }
     if (!tab) return
+    markTabSessionActivity(tab.agent, e.payload.path)
+    // 壳 tab 不重读：它下次被显示时本来就要整份读一遍。
+    if (!tab.msgsLoaded) return
     try {
-      markTabSessionActivity(tab.agent, e.payload.path)
       await loadSessionTab(tab, tab.agent, e.payload.path, tab.piLeafId)
     } catch {}
   })
   const goneUnlisten = await listen<{ path: string }>('session:gone', (e) => {
-    const tab = viewTabs.value.find(t => t.type === 'session' && t.session?.path === e.payload.path)
+    const tab = findSessionTabByPath(e.payload.path)
     if (!tab) return
     notify(t('toast.sessionGone'))
     removeViewTab(tab.uiId)
@@ -4201,8 +4311,8 @@ async function openDesktopPetSession(target: DesktopPetSessionTarget) {
     existingView.loadingMsgs = true
     setActiveViewTab(existingView.uiId)
     try {
-      existingView.msgs = await api.readSession(target.agent, target.path)
-      await api.watchSession(target.agent, target.path).catch(() => {})
+      setTabMsgs(existingView, await api.readSession(target.agent, target.path))
+      await api.watchSession(target.agent, target.path, existingView.msgs.length).catch(() => {})
       opened = true
     } catch (error) {
       notify(t('toast.readFail', { e: String(error) }), true)
@@ -4220,8 +4330,8 @@ async function openDesktopPetSession(target: DesktopPetSessionTarget) {
     })
     await nextTick()
     try {
-      tab.msgs = await api.readSession(target.agent, target.path)
-      await api.watchSession(target.agent, target.path).catch(() => {})
+      setTabMsgs(tab, await api.readSession(target.agent, target.path))
+      await api.watchSession(target.agent, target.path, tab.msgs.length).catch(() => {})
       opened = true
       recordView({
         agent: target.agent,
@@ -4244,11 +4354,25 @@ async function openDesktopPetSession(target: DesktopPetSessionTarget) {
   }
 }
 
+// 可见 tab 集合的指纹。分屏下每个 pane 各有一个 active view tab，切换任何一个都要
+// 重新算「谁该有 msgs」。用字符串投影是为了让 watch 做值比较而不是引用比较。
+const visibleViewTabFingerprint = computed(() =>
+  Array.from(panes.values(), pane => pane.activeViewTabId ?? 0).join(','),
+)
+watch(visibleViewTabFingerprint, () => syncSessionTabResidency())
+
+// 闲置释放靠定时器兜底：只切一次 tab 之后就再没有事件了，光靠上面的 watch
+// 那些后台 tab 会一直占着内存不放。
+const SESSION_TAB_SWEEP_MS = 60 * 1000
+let sessionTabSweepTimer = 0
+
 onMounted(() => {
   installWindowClosePrompt()
   installBeforeQuitSave()
   installLiveTailListeners()
   installTerminalTurnListeners()
+  syncSessionTabResidency()
+  sessionTabSweepTimer = window.setInterval(() => sweepSessionTabs(), SESSION_TAB_SWEEP_MS)
   void refreshTurnHookStatus()
   void restoreDesktopPetWindow().catch((error) => {
     console.warn('[desktop-pet] failed to restore window:', error)
@@ -4256,10 +4380,14 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.clearInterval(sessionTabSweepTimer)
+  sessionTabSweepTimer = 0
   windowCloseUnlisten?.()
   windowCloseUnlisten = null
   beforeQuitUnlisten?.()
   beforeQuitUnlisten = null
+  trashPurgedUnlisten?.()
+  trashPurgedUnlisten = null
   menuUnlisten?.()
   menuUnlisten = null
   window.clearInterval(tuiTitleSyncTimer)
@@ -4542,8 +4670,10 @@ provide<PaneActions>(PaneActionsKey, {
       :ok-text="confirm.okText"
       :danger="confirm.danger"
       :alt-text="confirm.altText"
+      :cancel-text="confirm.cancelText"
+      :dismissable="confirm.dismissable"
       @confirm="runConfirm"
-      @cancel="confirm.show = false"
+      @cancel="runCancel"
       @alt="runAlt"
     />
 

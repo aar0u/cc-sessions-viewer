@@ -13,13 +13,42 @@
 // 切换主题时需要重渲染所有 .md-mermaid（mermaid 不支持运行时改主题，要拿 source 重画）。
 
 import { theme } from './settings'
+import { MERMAID_CACHE_MAX_CHARS, MERMAID_CACHE_MAX_ENTRIES } from './renderLimits'
 
 let mermaidPromise: Promise<typeof import('mermaid').default> | null = null
 let currentTheme: 'light' | 'dark' | null = null
 let renderSeq = 0
 // Mermaid 的布局是同步且昂贵的。缓存按“主题 + 源码”保存渲染任务，因此虚拟列表重新挂载
 // 同一消息时只把已有 SVG 写回 DOM，不会在滚动线程上重复布局。
-const renderedSvgCache = new Map<string, Promise<string>>()
+//
+// 这个缓存过去只增不减（只在切主题时整体清空）。一份 mermaid SVG 动辄几百 KB，
+// 长会话滚一遍就能攒出几百 MB 并永久驻留。现在按「条数 + 总字符」双上限做 LRU：
+// 命中挪到末尾，超限从最旧的开始淘汰，被淘汰的图下次滚回来重画即可。
+interface MermaidEntry {
+  task: Promise<string>
+  /** 渲染完成后回填的 SVG 字符数；未完成时按 0 计。 */
+  chars: number
+}
+const renderedSvgCache = new Map<string, MermaidEntry>()
+let renderedSvgChars = 0
+
+function evictMermaidCache(): void {
+  while (
+    renderedSvgCache.size > MERMAID_CACHE_MAX_ENTRIES ||
+    renderedSvgChars > MERMAID_CACHE_MAX_CHARS
+  ) {
+    const oldest = renderedSvgCache.keys().next().value
+    if (oldest === undefined) break
+    const dropped = renderedSvgCache.get(oldest)
+    renderedSvgCache.delete(oldest)
+    renderedSvgChars -= dropped?.chars ?? 0
+  }
+}
+
+/** 测试用：当前缓存的条数与总字符数。 */
+export function mermaidCacheSize(): { entries: number; chars: number } {
+  return { entries: renderedSvgCache.size, chars: renderedSvgChars }
+}
 // Mermaid 使用全局配置；把“设主题 + render”串行化，避免主题切换与并发图表渲染相互覆盖。
 let renderQueue = Promise.resolve()
 
@@ -55,18 +84,36 @@ function mermaidCacheKey(themeNow: 'light' | 'dark', src: string): string {
 
 function renderMermaidSvg(themeNow: 'light' | 'dark', src: string): Promise<string> {
   const cacheKey = mermaidCacheKey(themeNow, src)
-  let task = renderedSvgCache.get(cacheKey)
-  if (task) return task
+  const hit = renderedSvgCache.get(cacheKey)
+  if (hit) {
+    // LRU：命中挪到末尾（最近使用）。
+    renderedSvgCache.delete(cacheKey)
+    renderedSvgCache.set(cacheKey, hit)
+    return hit.task
+  }
 
-  task = renderQueue.then(async () => {
+  const task = renderQueue.then(async () => {
     const mermaid = await loadMermaid(themeNow)
     renderSeq += 1
     const { svg } = await mermaid.render(`md-mermaid-${renderSeq}`, src)
     return svg
   })
-  renderedSvgCache.set(cacheKey, task)
+  const entry: MermaidEntry = { task, chars: 0 }
+  renderedSvgCache.set(cacheKey, entry)
   renderQueue = task.then(() => undefined, () => undefined)
-  void task.catch(() => renderedSvgCache.delete(cacheKey))
+  void task.then(
+    (svg) => {
+      // 渲染期间可能已被淘汰或被主题切换清空；只给「还在表里的这一条」记账。
+      if (renderedSvgCache.get(cacheKey) !== entry) return
+      entry.chars = svg.length
+      renderedSvgChars += svg.length
+      evictMermaidCache()
+    },
+    () => {
+      if (renderedSvgCache.get(cacheKey) !== entry) return
+      renderedSvgCache.delete(cacheKey)
+    },
+  )
   return task
 }
 
@@ -120,6 +167,7 @@ export async function renderAllMermaid(root: HTMLElement | null): Promise<void> 
 export function resetMermaidForTheme(root: HTMLElement | null): void {
   currentTheme = null
   renderedSvgCache.clear()
+  renderedSvgChars = 0
   if (!root) return
   root.querySelectorAll<HTMLElement>('.md-mermaid[data-rendered]').forEach((el) => {
     el.removeAttribute('data-rendered')
