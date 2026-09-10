@@ -11,9 +11,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -37,6 +38,9 @@ pub struct CodexSource;
 const CODEX_APP_FIRST_PAGE_SIZE: usize = 50;
 const CODEX_APP_LIST_PAGE_SIZE: usize = 100;
 const CODEX_APP_LIST_MAX_THREADS: usize = 1_000;
+/// 排名快照的保鲜期。超过这个时长后下一次取用会顺手在后台刷新，
+/// 但取用方拿到的仍是旧快照——只有进程内第一次是阻塞的。
+const CODEX_APP_LIST_TTL: Duration = Duration::from_secs(30);
 
 fn sessions_dir() -> PathBuf {
     home().join(".codex").join("sessions")
@@ -69,6 +73,7 @@ fn find_state_db() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+#[derive(Clone)]
 struct Meta {
     id: String,
     cwd: String,
@@ -294,6 +299,52 @@ fn app_server_response(
         }
         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
+}
+
+#[derive(Default)]
+struct AppListCache {
+    snapshot: Option<Arc<CodexAppListSnapshot>>,
+    fetched_at: Option<Instant>,
+    refreshing: bool,
+}
+
+static APP_LIST_CACHE: OnceLock<Mutex<AppListCache>> = OnceLock::new();
+
+fn app_list_cache() -> &'static Mutex<AppListCache> {
+    APP_LIST_CACHE.get_or_init(Mutex::default)
+}
+
+/// 取 Codex app-server 的 thread 排名快照，带 stale-while-revalidate 缓存。
+///
+/// 拉一次快照要 spawn `codex app-server` 子进程 + JSON-RPC 握手 + 一次
+/// thread/list，实测 170–800ms，且跟项目大小、会话数完全无关——它就是列表
+/// 加载时长里那块雷打不动的地板。而这份排名是**全局**的（不分项目），只用来
+/// 渲染卡片上「首屏 x/50 · rank n」这行标签，所以完全没必要每次列表都重新拉：
+/// 有快照就立刻返回旧的，过期了在后台线程刷新。整个进程只有第一次是阻塞的。
+fn cached_codex_app_thread_list() -> Arc<CodexAppListSnapshot> {
+    let mut guard = app_list_cache().lock().unwrap();
+    if let Some(snapshot) = guard.snapshot.clone() {
+        let stale = guard
+            .fetched_at
+            .is_none_or(|at| at.elapsed() > CODEX_APP_LIST_TTL);
+        if stale && !guard.refreshing {
+            guard.refreshing = true;
+            thread::spawn(|| {
+                let fresh = Arc::new(query_codex_app_thread_list());
+                let mut guard = app_list_cache().lock().unwrap();
+                guard.snapshot = Some(fresh);
+                guard.fetched_at = Some(Instant::now());
+                guard.refreshing = false;
+            });
+        }
+        return snapshot;
+    }
+    // 进程内第一次：没有任何可用快照，只能阻塞拉一次。
+    // 故意持锁拉取，这样并发调用会排队复用同一次结果，而不是各 spawn 一个子进程。
+    let fresh = Arc::new(query_codex_app_thread_list());
+    guard.snapshot = Some(fresh.clone());
+    guard.fetched_at = Some(Instant::now());
+    fresh
 }
 
 fn query_codex_app_thread_list() -> CodexAppListSnapshot {
@@ -1290,19 +1341,119 @@ fn format_iso8601ish(ms: i64) -> String {
     format_iso8601_utc(ms.div_euclid(1000), ms.rem_euclid(1000) as u32)
 }
 
-fn scan(
-    fp: &Path,
-    m: &Meta,
-    title_index: &HashMap<String, TitleIndexEntry>,
-    flags: CodexThreadFlags,
-) -> SessionMeta {
-    let file_name = fp
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let size = fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
-    let modified = mtime_millis(fp);
+/// 按 `(mtime, size)` 指纹缓存「从文件里算出来的东西」：文件没变就直接用上次的结果。
+///
+/// `claude.rs` 早就有同款（`SCAN_CACHE`），Codex 一直没有 —— 于是每次列表都要把磁盘上
+/// **所有** rollout 重新打开读首行，命中当前页的还要整份读完。实测列一个只有 1 个会话的
+/// 项目也要 257ms，全是这些重复读堆出来的。
+///
+/// 是纯加速，不影响正确性：文件被追加/替换后 mtime 或 size 变 → 不命中 → 重算。
+struct FpEntry<V> {
+    mtime: u64,
+    size: u64,
+    seq: u64,
+    value: V,
+}
 
+struct FpCache<V> {
+    entries: HashMap<PathBuf, FpEntry<V>>,
+    next_seq: u64,
+}
+
+// 手写而非 derive：`#[derive(Default)]` 会给泛型参数强加 `V: Default`，
+// 而这里的值类型（Meta / ScanBody）没有、也不需要 Default。
+impl<V> Default for FpCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_seq: 0,
+        }
+    }
+}
+
+impl<V: Clone> FpCache<V> {
+    fn get(&self, fp: &Path, mtime: u64, size: u64) -> Option<V> {
+        self.entries
+            .get(fp)
+            .filter(|entry| entry.mtime == mtime && entry.size == size)
+            .map(|entry| entry.value.clone())
+    }
+
+    /// 插入并按条数封顶。缓存是纯加速，被淘汰的下次重算即可 —— 但不封顶它就会变成
+    /// 又一个只增不减的常驻内存点（统计页跑一遍就能把全部会话灌进来）。
+    /// 降到 75% 再停，避免在上限附近每插一条就淘汰一轮。
+    fn put(&mut self, fp: &Path, mtime: u64, size: u64, value: V, max: usize) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(
+            fp.to_path_buf(),
+            FpEntry { mtime, size, seq, value },
+        );
+        if self.entries.len() <= max {
+            return;
+        }
+        let target = max / 4 * 3;
+        let mut by_seq: Vec<(u64, PathBuf)> = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (entry.seq, path.clone()))
+            .collect();
+        by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+        for (_, path) in by_seq {
+            if self.entries.len() <= target {
+                break;
+            }
+            self.entries.remove(&path);
+        }
+    }
+}
+
+const CACHE_MAX_ENTRIES: usize = 20_000;
+
+static META_CACHE: OnceLock<Mutex<FpCache<Meta>>> = OnceLock::new();
+static SCAN_BODY_CACHE: OnceLock<Mutex<FpCache<ScanBody>>> = OnceLock::new();
+
+fn meta_cache() -> &'static Mutex<FpCache<Meta>> {
+    META_CACHE.get_or_init(|| Mutex::new(FpCache::default()))
+}
+
+fn scan_body_cache() -> &'static Mutex<FpCache<ScanBody>> {
+    SCAN_BODY_CACHE.get_or_init(|| Mutex::new(FpCache::default()))
+}
+
+/// 诊断用：两个扫描缓存当前的条目数。
+pub fn scan_cache_entries() -> usize {
+    let meta = meta_cache().lock().map(|c| c.entries.len()).unwrap_or(0);
+    let body = scan_body_cache().lock().map(|c| c.entries.len()).unwrap_or(0);
+    meta + body
+}
+
+/// 带缓存的首行 `session_meta`。列表要靠它判断「这个文件属于哪个项目」，
+/// 而这是唯一需要遍历全盘文件的地方 —— 缓存住它，那 257ms 的固定地板就没了。
+fn meta_cached(fp: &Path, mtime: u64, size: u64) -> Option<Meta> {
+    if let Some(hit) = meta_cache().lock().ok().and_then(|c| c.get(fp, mtime, size)) {
+        return Some(hit);
+    }
+    let m = meta(fp)?;
+    if let Ok(mut cache) = meta_cache().lock() {
+        cache.put(fp, mtime, size, m.clone(), CACHE_MAX_ENTRIES);
+    }
+    Some(m)
+}
+
+/// `scan()` 里必须整文件读一遍才能算出来的那部分。
+///
+/// 单独拎出来是为了能按指纹缓存：`title_index`（`~/.codex/session_index.jsonl`）和
+/// `flags`（state DB 的 threads 表）都可能在 rollout 文件本身没变的情况下变化，
+/// 所以它们**不能**进缓存，留在 `scan()` 里每次重新套上去。
+#[derive(Clone)]
+struct ScanBody {
+    message_count: usize,
+    thread_name: Option<String>,
+    first_user_title: String,
+}
+
+fn scan_body_uncached(fp: &Path) -> ScanBody {
     // Codex rename 会追加 `event_msg.payload.type == "thread_name_updated"`，
     // 最后一条 `thread_name` 生效。优先用它，没有则回落首条 user_message。
     let mut first_user_title = String::new();
@@ -1419,6 +1570,43 @@ fn scan(
     if first_user_title.is_empty() {
         first_user_title = fallback_title;
     }
+    ScanBody {
+        message_count,
+        thread_name,
+        first_user_title,
+    }
+}
+
+fn scan_body(fp: &Path, mtime: u64, size: u64) -> ScanBody {
+    if let Some(hit) = scan_body_cache().lock().ok().and_then(|c| c.get(fp, mtime, size)) {
+        return hit;
+    }
+    let body = scan_body_uncached(fp);
+    if let Ok(mut cache) = scan_body_cache().lock() {
+        cache.put(fp, mtime, size, body.clone(), CACHE_MAX_ENTRIES);
+    }
+    body
+}
+
+fn scan(
+    fp: &Path,
+    m: &Meta,
+    title_index: &HashMap<String, TitleIndexEntry>,
+    flags: CodexThreadFlags,
+) -> SessionMeta {
+    let file_name = fp
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let size = fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
+    let modified = mtime_millis(fp);
+
+    // 文件派生的部分走指纹缓存；解构成同名变量，下面的组装逻辑保持原样。
+    let ScanBody {
+        message_count,
+        thread_name,
+        first_user_title,
+    } = scan_body(fp, modified, size);
     let id = if m.id.is_empty() {
         file_name.trim_end_matches(".jsonl").to_string()
     } else {
@@ -2206,20 +2394,36 @@ impl SessionSource for CodexSource {
         include_codex_internal: bool,
         include_codex_archived: bool,
     ) -> Result<SessionPage, String> {
-        // 廉价阶段：只读每个文件首行 session_meta，筛出本项目的文件并取修改时间。
+        // 廉价阶段：拿每个文件的首行 session_meta，筛出本项目的文件并取修改时间。
+        //
+        // 这一段是**唯一**要遍历全盘文件的地方：为了知道「这个文件属于哪个项目」，
+        // 列任何项目都得把所有 rollout 过一遍。原来是逐个开文件读首行，于是列一个
+        // 只有 1 个会话的项目也要 257ms。现在一次 metadata 拿到指纹的两半，命中缓存
+        // 就完全不碰文件内容 —— 顺带还省掉了原先单独再 stat 一次取 mtime。
         let mut matched: Vec<(PathBuf, Meta, u64, CodexThreadFlags)> = Vec::new();
         let flags_index = load_thread_flags_index();
         for fp in all_files(include_codex_archived) {
-            if let Some(m) = meta(&fp) {
-                if m.cwd == project_key {
-                    let flags = flags_for(&fp, &m, &flags_index);
-                    if !include_by_flags(flags, include_codex_internal, include_codex_archived) {
-                        continue;
-                    }
-                    let mt = mtime_millis(&fp);
-                    matched.push((fp, m, mt, flags));
-                }
+            let Ok(md) = fs::metadata(&fp) else {
+                continue;
+            };
+            let size = md.len();
+            let mt = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let Some(m) = meta_cached(&fp, mt, size) else {
+                continue;
+            };
+            if m.cwd != project_key {
+                continue;
             }
+            let flags = flags_for(&fp, &m, &flags_index);
+            if !include_by_flags(flags, include_codex_internal, include_codex_archived) {
+                continue;
+            }
+            matched.push((fp, m, mt, flags));
         }
         matched.sort_by_key(|m| std::cmp::Reverse(m.2));
         let total = matched.len();
@@ -2233,7 +2437,7 @@ impl SessionSource for CodexSource {
             .map(|(p, m, _, flags)| scan(p, m, &title_index, *flags))
             .collect();
         if limit != usize::MAX {
-            let snapshot = query_codex_app_thread_list();
+            let snapshot = cached_codex_app_thread_list();
             apply_codex_app_list_snapshot(&mut sessions, &snapshot);
         }
         Ok(SessionPage { total, sessions })
@@ -3966,3 +4170,4 @@ fn gui_chat_uses_codex_app_server_process_model() {
     );
     assert_eq!(ChatProcessModel::CodexAppServer.as_str(), "codexAppServer");
 }
+

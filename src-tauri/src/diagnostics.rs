@@ -249,7 +249,8 @@ pub fn runtime_diagnostics(app: AppHandle) -> RuntimeDiagnostics {
         threads: thread_count(pid),
         user_text_cache_bytes: crate::agents::user_text_cache_bytes() as u64,
         usage_cache_entries: crate::agents::usage_cache_entries(),
-        scan_cache_entries: crate::agents::claude::scan_cache_entries(),
+        scan_cache_entries: crate::agents::claude::scan_cache_entries()
+            + crate::agents::codex::scan_cache_entries(),
         watch_map_entries: crate::watch::tracked_path_count(),
         active_chats: crate::agent_chat::active_chat_count(),
         desktop_tasks: crate::turn::desktop_task_count(),

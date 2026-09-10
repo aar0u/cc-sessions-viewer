@@ -323,10 +323,12 @@ async function refreshAll() {
     const keepScroll = listScrollEl.value?.scrollTop ?? savedListScroll
     // 保留当前已加载数量，避免分页回退
     const n = Math.max(sessions.value.length, PAGE_SIZE)
+    const scope = sessionScope()
     tasks.push(
       api
         .listSessions(agent.value, activeDir.value, 0, n, sessionListOptions())
         .then((page) => {
+          if (sessionScope() !== scope) return
           sessions.value = page.sessions
           sessionTotal.value = page.total
           nextTick(() => {
@@ -361,6 +363,24 @@ const sessionTotal = ref(0)
 const loadingMore = ref(false)
 const trash = shallowRef<TrashItem[]>([])
 const loadingList = ref(false)
+
+/** 一次列表请求发起时所处的作用域 = agent + 项目。
+ *
+ * 列表加载全是异步的，而 `activeDir` 是同步切的：慢项目（实测 ips-admin 约 800ms）
+ * 还没回来时切到快项目（约 250ms），快的先渲染完、慢的后到就把别人的会话盖了上去
+ * —— 侧栏显示 A、列表却是 B 的内容。loadMore 更糟，它是追加，会把两个项目的会话混在一起。
+ *
+ * 请求前记下作用域，响应回来对不上就丢弃。
+ *
+ * 不用自增序号：那样 4 秒一次的 TUI 标题同步会顺手把用户刚触发的 loadMore 一并作废，
+ * 下一页就静默丢了 —— 为修一个竞态造出另一个。按 agent+项目 判定只在用户真的切走时
+ * 才丢弃，同一项目内的并发刷新照旧后写者胜，与改动前一致。
+ *
+ * 只守 `sessions` / `sessionTotal` 这类数据写入，不守 finally 里的 loading 标志位
+ * —— 标志位必须无条件清掉，否则一次被作废的请求会让它永远停在 true。 */
+function sessionScope(dir: string | null = activeDir.value) {
+  return `${agent.value}\u0000${dir ?? ''}`
+}
 
 const PAGE_SIZE = 40
 
@@ -1698,11 +1718,14 @@ async function selectProject(dir: string, opts: { activateTerminal?: boolean } =
   savedListScroll = 0
   resetSessionsToolbar()
   loadingList.value = true
+  const scope = sessionScope(dir)
   try {
     const page = await api.listSessions(agent.value, dir, 0, PAGE_SIZE, sessionListOptions())
+    if (sessionScope() !== scope) return
     sessions.value = page.sessions
     sessionTotal.value = page.total
   } catch (e) {
+    if (sessionScope() !== scope) return
     notify(t('toast.loadSessionsFail', { e: String(e) }), true)
     sessions.value = []
   } finally {
@@ -1717,6 +1740,7 @@ async function loadMore() {
   if (loadingMore.value || loadingList.value || !activeDir.value) return
   if (sessions.value.length >= sessionTotal.value) return
   loadingMore.value = true
+  const scope = sessionScope()
   try {
     const page = await api.listSessions(
       agent.value,
@@ -1725,9 +1749,11 @@ async function loadMore() {
       PAGE_SIZE,
       sessionListOptions(),
     )
+    if (sessionScope() !== scope) return
     sessions.value = [...sessions.value, ...page.sessions]
     sessionTotal.value = page.total
   } catch (e) {
+    if (sessionScope() !== scope) return
     notify(t('toast.loadMoreFail', { e: String(e) }), true)
   } finally {
     loadingMore.value = false
@@ -1744,6 +1770,7 @@ async function loadAllSessions() {
   if (!activeDir.value || loadingList.value || loadingMore.value) return
   if (sessions.value.length >= sessionTotal.value) return
   loadingMore.value = true
+  const scope = sessionScope()
   try {
     const page = await api.listSessions(
       agent.value,
@@ -1752,10 +1779,12 @@ async function loadAllSessions() {
       sessionTotal.value,
       sessionListOptions(),
     )
+    if (sessionScope() !== scope) return
     sessions.value = page.sessions
     sessionTotal.value = page.total
     syncTuiTabsFromCurrentSessions()
   } catch (e) {
+    if (sessionScope() !== scope) return
     notify(t('toast.loadMoreFail', { e: String(e) }), true)
   } finally {
     loadingMore.value = false
@@ -1791,6 +1820,7 @@ function hasCurrentProjectTuiTabs(): boolean {
 async function syncTuiTitlesNow() {
   if (!activeDir.value || syncingTuiTitles || !hasCurrentProjectTuiTabs()) return
   syncingTuiTitles = true
+  const scope = sessionScope()
   try {
     const page = await api.listSessions(
       agent.value,
@@ -1799,6 +1829,7 @@ async function syncTuiTitlesNow() {
       Math.max(PAGE_SIZE, sessions.value.length),
       sessionListOptions(),
     )
+    if (sessionScope() !== scope) return
     sessions.value = page.sessions
     sessionTotal.value = page.total
     syncTuiTabsFromCurrentSessions()
@@ -1816,6 +1847,7 @@ async function syncTuiTitlesNow() {
 async function refreshSessions() {
   if (!activeDir.value || loadingList.value) return
   loadingList.value = true
+  const scope = sessionScope()
   try {
     const page = await api.listSessions(
       agent.value,
@@ -1824,10 +1856,12 @@ async function refreshSessions() {
       Math.max(PAGE_SIZE, sessions.value.length),
       sessionListOptions(),
     )
+    if (sessionScope() !== scope) return
     sessions.value = page.sessions
     sessionTotal.value = page.total
     syncTuiTabsFromCurrentSessions()
   } catch (e) {
+    if (sessionScope() !== scope) return
     notify(t('toast.loadSessionsFail', { e: String(e) }), true)
   } finally {
     loadingList.value = false
