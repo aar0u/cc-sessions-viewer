@@ -8,6 +8,8 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::{collections::HashSet, ffi::c_void, sync::OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -72,38 +74,92 @@ fn rss_bytes(_pid: u32) -> u64 {
 /// 这个数才是「内存越用越高」真正该看的那一个 —— transcript、DOM、解码后的图片全在
 /// 渲染进程里，主进程通常只有几十 MB。
 ///
-/// 认领方式是先列出机器上所有 `com.apple.WebKit.WebContent`，再用一次 `lsof` 看谁打开着
-/// 本 app 的文件（WebKit 网络缓存目录 / 数据目录里的图片缓存）。听着绕，但没有更直接的
-/// 办法：WebContent 是 WebKit 通过 XPC 起的，父进程是 launchd（ppid=1），命令行里也不带
-/// 任何应用信息，从进程树上根本认不出来。
+/// 认领哪个 `com.apple.WebKit.WebContent` 是我们的 —— 两个信号取并集，缺一不可。
 ///
-/// 两个已知的边界：认领不到时返回 0（UI 显示「—」）；dev 实例和已安装版本共用同一个
-/// WebKit 缓存目录，两个一起开着的时候会算到一起。都不影响它作为趋势指标的用途。
+/// WebContent 是 WebKit 通过 XPC 起的：父进程是 launchd（ppid=1），命令行、`comm`、
+/// `proc_name` 全都是 `com.apple.WebKit.WebContent`，从进程树上认不出来。能用的只有两条：
+///
+/// 1. **responsible pid**（Activity Monitor 用的就是它）：打包版由 LaunchServices 拉起，
+///    responsible 就是 app 自己，认得准。dev 实例从终端起，responsible 会算到终端 app
+///    头上，而终端自己往往也有 webview，分不开。
+/// 2. **lsof 看 WebKit 网络缓存**：dev 加载 `http://localhost:1420` 走真实网络栈，
+///    WebContent 会持有缓存目录里的 fd。打包版加载 `tauri://localhost` 这个自定义
+///    scheme，资源由主进程直接喂，压根不碰网络缓存，一个应用 fd 都不开。
+///
+/// 两条正好互补，(1) 优先：它一旦认到就是确凿的，此时 (2) 只会添乱 —— dev 实例和已安装
+/// 版本共用同一个 WebKit 缓存目录，并集会让打包版把 dev 的渲染进程一起算进来。只有 (1)
+/// 一个都没认到（即跑在 dev 里）才退到 (2)。
+///
+/// 边界：两条都认不到时返回 0（UI 显示「—」）；dev 下同时开着两个 dev 实例仍会算到一起。
+/// 不影响它作为趋势指标的用途。
 #[cfg(target_os = "macos")]
 fn webview_rss_bytes(data_dir: Option<&Path>) -> u64 {
+    let candidates = webcontent_candidates();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let self_pid = std::process::id() as i32;
+    let mut ours: HashSet<i32> = candidates
+        .iter()
+        .filter(|(pid, _)| responsible_pid(*pid) == Some(self_pid))
+        .map(|(pid, _)| *pid)
+        .collect();
+    if ours.is_empty() {
+        let all: Vec<i32> = candidates.iter().map(|(pid, _)| *pid).collect();
+        ours = webcontent_pids_holding_our_files(&all, data_dir);
+    }
+
+    candidates
+        .iter()
+        .filter(|(pid, _)| ours.contains(pid))
+        .map(|(_, bytes)| bytes)
+        .sum()
+}
+
+/// 机器上所有 WebContent 进程及其 RSS。
+///
+/// 只认 argv[0] 而不是「命令行里出现过 WebKit.WebContent」：本进程会 spawn 一堆 PTY
+/// 子进程，它们的 responsible 也是我们，宽松匹配会把它们的内存一起算进来。
+#[cfg(target_os = "macos")]
+fn webcontent_candidates() -> Vec<(i32, u64)> {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-axo", "pid=,rss=,command="])
         .output()
     else {
-        return 0;
+        return Vec::new();
     };
     let Ok(text) = String::from_utf8(output.stdout) else {
-        return 0;
+        return Vec::new();
     };
-    let mut candidates: Vec<(String, u64)> = Vec::new();
-    for line in text.lines().filter(|line| line.contains("WebKit.WebContent")) {
+    parse_webcontent_candidates(&text)
+}
+
+/// `ps -axo pid=,rss=,command=` 的输出里挑出 WebContent 行。
+#[cfg(target_os = "macos")]
+fn parse_webcontent_candidates(text: &str) -> Vec<(i32, u64)> {
+    let mut candidates = Vec::new();
+    for line in text.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(pid), Some(rss)) = (fields.next(), fields.next()) else {
+        let (Some(pid), Some(rss), Some(argv0)) = (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
-        if let Ok(kilobytes) = rss.parse::<u64>() {
-            candidates.push((pid.to_string(), kilobytes * 1024));
+        if !argv0.ends_with("/com.apple.WebKit.WebContent") {
+            continue;
+        }
+        if let (Ok(pid), Ok(kilobytes)) = (pid.parse::<i32>(), rss.parse::<u64>()) {
+            candidates.push((pid, kilobytes * 1024));
         }
     }
-    if candidates.is_empty() {
-        return 0;
-    }
+    candidates
+}
 
+/// 这些 WebContent 里，哪些打开着本 app 的文件（WebKit 网络缓存目录 / 数据目录）。
+#[cfg(target_os = "macos")]
+fn webcontent_pids_holding_our_files(pids: &[i32], data_dir: Option<&Path>) -> HashSet<i32> {
+    if pids.is_empty() {
+        return HashSet::new();
+    }
     let mut markers: Vec<String> = Vec::new();
     if let (Some(cache), Some(name)) = (dirs::cache_dir(), executable_name()) {
         markers.push(cache.join(name).to_string_lossy().into_owned());
@@ -112,41 +168,63 @@ fn webview_rss_bytes(data_dir: Option<&Path>) -> u64 {
         markers.push(dir.to_string_lossy().into_owned());
     }
     if markers.is_empty() {
-        return 0;
+        return HashSet::new();
     }
-
-    let pids = candidates
+    let joined = pids
         .iter()
-        .map(|(pid, _)| pid.as_str())
+        .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let Ok(output) = std::process::Command::new("lsof")
-        .args(["-p", &pids, "-Fpn"])
+        .args(["-p", &joined, "-Fpn"])
         .output()
     else {
-        return 0;
+        return HashSet::new();
     };
     let Ok(listing) = String::from_utf8(output.stdout) else {
-        return 0;
+        return HashSet::new();
     };
-    // `-F` 是逐字段一行：`p<pid>` 起一个进程块，后面的 `n<path>` 都属于它。
-    let mut ours: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut current = "";
+    parse_lsof_owners(&listing, &markers)
+}
+
+/// `lsof -Fpn` 是逐字段一行：`p<pid>` 起一个进程块，后面的 `n<path>` 都属于它。
+#[cfg(target_os = "macos")]
+fn parse_lsof_owners(listing: &str, markers: &[String]) -> HashSet<i32> {
+    let mut ours = HashSet::new();
+    let mut current: Option<i32> = None;
     for line in listing.lines() {
         if let Some(pid) = line.strip_prefix('p') {
-            current = pid;
+            current = pid.parse().ok();
         } else if let Some(name) = line.strip_prefix('n') {
-            if markers.iter().any(|marker| name.starts_with(marker.as_str())) {
-                ours.insert(current);
+            if let (Some(pid), true) = (
+                current,
+                markers.iter().any(|marker| name.starts_with(marker.as_str())),
+            ) {
+                ours.insert(pid);
             }
         }
     }
+    ours
+}
 
-    candidates
-        .iter()
-        .filter(|(pid, _)| ours.contains(pid.as_str()))
-        .map(|(_, bytes)| bytes)
-        .sum()
+/// macOS 的「responsible process」：Activity Monitor 就是靠它把 WebContent 归到宿主 app
+/// 名下。符号在 libSystem 里但没有公开头文件 —— 直接 extern 链接的话，哪天系统抽掉它
+/// 就是启动即崩，比少显示一个数字严重得多。所以 dlsym 运行时查，查不到当没有。
+#[cfg(target_os = "macos")]
+fn responsible_pid(pid: i32) -> Option<i32> {
+    type ResponsibleFor = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+    static SYMBOL: OnceLock<Option<ResponsibleFor>> = OnceLock::new();
+
+    let resolved = (*SYMBOL.get_or_init(|| {
+        // macOS 的 RTLD_DEFAULT（`(void *)-2`）—— libc crate 没导出这个常量。
+        const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+        const NAME: &[u8] = b"responsibility_get_pid_responsible_for_pid\0";
+        let symbol = unsafe { libc::dlsym(RTLD_DEFAULT, NAME.as_ptr().cast()) };
+        (!symbol.is_null())
+            .then(|| unsafe { std::mem::transmute::<*mut c_void, ResponsibleFor>(symbol) })
+    }))?;
+    let found = unsafe { resolved(pid) };
+    (found > 0).then_some(found)
 }
 
 #[cfg(target_os = "macos")]
@@ -310,5 +388,42 @@ mod tests {
             line,
             "2026-09-09 19:00:00 warn rss main=5120MB webview=512MB threads=42 chats=2 watch=3\n"
         );
+    }
+
+    /// 真实 `ps -axo pid=,rss=,command=` 的片段：WebContent 行认 argv[0]，别的都不算。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn webcontent_candidates_match_on_argv0_only() {
+        let text = concat!(
+            " 4930  4096 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices",
+            "/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n",
+            "59496 74448 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices",
+            "/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n",
+            // 本进程 spawn 的 PTY 子进程：responsible 也是我们，命令行里带着这个字符串，
+            // 但它不是渲染进程 —— 宽松匹配会把它的内存算进来。
+            "25787  3392 /bin/zsh -c grep WebKit.WebContent /tmp/notes\n",
+            "  501   128 /usr/sbin/cupsd -l\n",
+        );
+        assert_eq!(
+            super::parse_webcontent_candidates(text),
+            vec![(4930, 4096 * 1024), (59496, 74448 * 1024)]
+        );
+    }
+
+    /// `lsof -Fpn` 的块结构：`p<pid>` 之后的 `n<path>` 都归那个 pid。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lsof_owners_attribute_paths_to_the_enclosing_pid_block() {
+        let listing = concat!(
+            "p33471\n",
+            "n/System/Library/Fonts/Times.ttc\n",
+            "n/Users/me/Library/Caches/cc-sessions-viewer/WebKit/NetworkCache/Version 17/Blobs/AB\n",
+            "p34305\n",
+            "n/System/Library/Fonts/SFNSMono.ttf\n",
+            "n/Users/me/Library/Caches/some-other-app/WebKit/NetworkCache/Blobs/CD\n",
+        );
+        let markers = vec!["/Users/me/Library/Caches/cc-sessions-viewer".to_string()];
+        let owners = super::parse_lsof_owners(listing, &markers);
+        assert_eq!(owners.into_iter().collect::<Vec<_>>(), vec![33471]);
     }
 }

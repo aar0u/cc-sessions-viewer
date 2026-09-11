@@ -2593,13 +2593,13 @@ function onDocClick(e: MouseEvent) {
               type="button"
               class="msg-image-thumb"
               :class="{ 'is-image-unavailable': imageUnavailable(b) }"
-              :aria-label="imageUnavailable(b) ? 'Image unavailable' : 'Open image'"
+              :aria-label="imageUnavailable(b) ? t('chat.image.unavailable') : t('chat.image.open')"
               @click="openImagePreview(m, b)"
             >
               <template v-if="imageUnavailable(b)">
                 <div class="msg-image-missing">
                   <IconImageOff class="msg-image-missing-icon" />
-                  <span>图片不可用</span>
+                  <span>{{ t('chat.image.unavailable') }}</span>
                   <small>{{ fileName(b.imageSrc!) }}</small>
                 </div>
               </template>

@@ -83,9 +83,13 @@ import {
   IconDatabase,
   IconCopy,
   IconPalette,
+  IconGithub,
+  IconWallet,
   agentIcons,
   terminalIcons,
 } from './icons'
+import alipayQr from '../assets/alipay.jpg'
+import wechatQr from '../assets/wechat.jpg'
 import CliEnvironmentCheck from './CliEnvironmentCheck.vue'
 import * as api from '../api'
 import {
@@ -950,6 +954,21 @@ async function installUpdate() {
     updateInstallError.value = String(e)
     updateMsg.value = ''
   }
+}
+
+// 更新页底部的两块「支持一下」：给 star 和赞赏各留一个出口，都走系统浏览器。
+const REPO_URL = 'https://github.com/jerrywu001/cc-sessions-viewer'
+const SPONSORS_URL = 'https://github.com/sponsors/jerrywu001'
+
+const donateCodes = [
+  { key: 'wechat', src: wechatQr },
+  { key: 'alipay', src: alipayQr },
+] as const
+
+function openSupportUrl(url: string) {
+  void api.openUrl(url).catch(() => {
+    /* ignore */
+  })
 }
 
 async function runTurnHookInstall() {
@@ -2130,49 +2149,64 @@ async function refreshTurnHooks() {
 
         <template v-else-if="activeTab === 'updates'">
           <div class="set-group">
-            <!-- 版本/更新状态卡片：标题 + 副标题 + 单个主操作按钮，不再堆一排按钮 -->
-            <div class="set-update-card" :class="{ available: updateAvailable }">
-              <span class="set-update-icon">
-                <component :is="updateAvailable ? IconDownload : IconCheck" />
-              </span>
-              <div class="set-update-info">
-                <div class="set-update-title">
-                  {{ updateAvailable
-                    ? t('settings.update.newVersion', { v: latestVersion ?? '' })
-                    : t('settings.update.upToDateShort') }}
+            <!-- 关于卡：版本/更新状态 + Star 引导两行合在一张卡里 -->
+            <div class="set-about-card" :class="{ available: updateAvailable }">
+              <div class="set-about-row" :class="{ available: updateAvailable }">
+                <span class="set-update-icon">
+                  <component :is="updateAvailable ? IconDownload : IconCheck" />
+                </span>
+                <div class="set-update-info">
+                  <div class="set-update-title">
+                    {{ updateAvailable
+                      ? t('settings.update.newVersion', { v: latestVersion ?? '' })
+                      : t('settings.update.upToDateShort') }}
+                  </div>
+                  <div class="set-update-sub">
+                    {{ updateAvailable
+                      ? t('settings.update.fromTo', { cur: version, next: latestVersion ?? '' })
+                      : t('settings.update.current', { v: version }) }}
+                  </div>
                 </div>
-                <div class="set-update-sub">
-                  {{ updateAvailable
-                    ? t('settings.update.fromTo', { cur: version, next: latestVersion ?? '' })
-                    : t('settings.update.current', { v: version }) }}
+                <div class="set-update-cta">
+                  <button
+                    v-if="updateDownloaded"
+                    class="btn primary"
+                    @click="relaunchApp()"
+                  >
+                    <IconCheck />
+                    {{ t('settings.relaunch') }}
+                  </button>
+                  <button
+                    v-else-if="updaterUpdate"
+                    class="btn primary"
+                    :disabled="updateDownloading"
+                    @click="installUpdate"
+                  >
+                    <IconRefresh v-if="updateDownloading" />
+                    {{ updateDownloading ? t('settings.updateDownloading') : t('settings.installUpdate') }}
+                  </button>
+                  <button
+                    v-else
+                    class="btn"
+                    :disabled="checking"
+                    @click="doCheck"
+                  >
+                    <IconRefresh v-if="!checking" />
+                    {{ checking ? t('settings.checking') : t('settings.checkUpdate') }}
+                  </button>
                 </div>
               </div>
-              <div class="set-update-cta">
-                <button
-                  v-if="updateDownloaded"
-                  class="btn primary"
-                  @click="relaunchApp()"
-                >
-                  <IconCheck />
-                  {{ t('settings.relaunch') }}
-                </button>
-                <button
-                  v-else-if="updaterUpdate"
-                  class="btn primary"
-                  :disabled="updateDownloading"
-                  @click="installUpdate"
-                >
-                  <IconRefresh v-if="updateDownloading" />
-                  {{ updateDownloading ? t('settings.updateDownloading') : t('settings.installUpdate') }}
-                </button>
-                <button
-                  v-else
-                  class="btn"
-                  :disabled="checking"
-                  @click="doCheck"
-                >
-                  <IconRefresh v-if="!checking" />
-                  {{ checking ? t('settings.checking') : t('settings.checkUpdate') }}
+
+              <!-- Star 引导：同一张卡的第二行 -->
+              <div class="set-about-row">
+                <span class="set-support-icon"><IconGithub /></span>
+                <div class="set-support-info">
+                  <div class="set-support-title">{{ t('settings.support.starTitle') }}</div>
+                  <div class="set-support-sub">jerrywu001/cc-sessions-viewer</div>
+                </div>
+                <button class="btn primary" @click="openSupportUrl(REPO_URL)">
+                  <IconStar />
+                  {{ t('settings.support.starAction') }}
                 </button>
               </div>
             </div>
@@ -2199,6 +2233,22 @@ async function refreshTurnHooks() {
             <button v-if="updateAvailable" class="set-update-notes" @click="openReleasePage()">
               <IconExternalLink />
               {{ t('settings.viewRelease', { v: latestVersion ?? '' }) }}
+            </button>
+          </div>
+
+          <!-- 赞赏：标题 + 两张收款码 + Sponsors 出口，收在一张卡里 -->
+          <div class="set-donate-card">
+            <div class="set-support-title">{{ t('settings.support.donateTitle') }}</div>
+            <p class="set-donate-desc">{{ t('settings.support.donateDesc') }}</p>
+            <div class="set-donate-codes">
+              <figure v-for="code in donateCodes" :key="code.key" class="set-donate-code">
+                <img :src="code.src" :alt="t(`settings.support.${code.key}`)" />
+                <figcaption>{{ t(`settings.support.${code.key}`) }}</figcaption>
+              </figure>
+            </div>
+            <button class="set-update-notes" @click="openSupportUrl(SPONSORS_URL)">
+              <IconWallet />
+              {{ t('settings.support.sponsors') }}
             </button>
           </div>
         </template>

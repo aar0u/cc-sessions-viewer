@@ -6438,18 +6438,35 @@ body.is-tab-reordering * {
   font-size: 11px;
 }
 
-/* ---- Updates tab：单卡片状态 + 一个主操作，取代一排按钮 ---- */
-.set-update-card {
+/* ---- Updates tab：版本状态 + Star 引导合成一张「关于」卡 ---- */
+.set-about-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.set-about-card.available {
+  border-color: color-mix(in srgb, var(--brand, #e8643c) 45%, var(--border));
+}
+.set-about-row {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-2);
 }
-.set-update-card.available {
-  border-color: color-mix(in srgb, var(--brand, #e8643c) 45%, var(--border));
+/* 行间分隔线左右缩进，不顶到卡片边框 */
+.set-about-row + .set-about-row {
+  position: relative;
+}
+.set-about-row + .set-about-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 14px;
+  right: 14px;
+  border-top: 1px solid var(--border);
+}
+.set-about-row.available {
   background: color-mix(in srgb, var(--brand, #e8643c) 7%, var(--surface-2));
 }
 .set-update-icon {
@@ -6463,7 +6480,7 @@ body.is-tab-reordering * {
   background: var(--surface-hover);
   color: var(--text-mute);
 }
-.set-update-card.available .set-update-icon {
+.set-about-row.available .set-update-icon {
   background: color-mix(in srgb, var(--brand, #e8643c) 16%, transparent);
   color: var(--brand, #e8643c);
 }
@@ -6543,6 +6560,84 @@ body.is-tab-reordering * {
 .set-update-notes svg {
   width: 13px;
   height: 13px;
+}
+
+/* ---- Updates tab：Star 引导那一行 + 赞赏收款码 ---- */
+.set-support-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.set-support-icon svg {
+  width: 18px;
+  height: 18px;
+}
+.set-support-info {
+  flex: 1;
+  min-width: 0;
+}
+.set-support-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.set-support-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-mute);
+}
+.set-about-row .btn svg {
+  width: 13px;
+  height: 13px;
+}
+.set-donate-card {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.set-donate-desc {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  color: var(--text-mute);
+  line-height: 1.5;
+}
+.set-donate-codes {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+}
+.set-donate-code {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  text-align: center;
+}
+.set-donate-code img {
+  display: block;
+  width: 100%;
+  max-width: 150px;
+  margin: 0 auto;
+  border-radius: 6px;
+}
+.set-donate-code figcaption {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-mute);
+}
+.set-donate-card .set-update-notes {
+  margin-top: 10px;
 }
 
 /* Settings custom dropdown — Geist-style menu, replaces native <select> */
