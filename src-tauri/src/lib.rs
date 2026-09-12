@@ -1923,8 +1923,9 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 /// 在系统文件管理器中显示该文件。
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
-    let path = nearest_existing(Path::new(&path))
-        .ok_or_else(|| format!("Path no longer exists: {path}"))?
+    let path = crate::util::normalize_windows_path(Path::new(&path));
+    let path = nearest_existing(&path)
+        .ok_or_else(|| format!("Path no longer exists: {}", path.display()))?
         .to_string_lossy()
         .into_owned();
     #[cfg(target_os = "macos")]
@@ -2161,6 +2162,7 @@ fn open_path_external(
             }
         }
     }
+    p = crate::util::normalize_windows_path(&p);
     if !p.exists() {
         return Err(format!("File not found: {}", p.to_string_lossy()));
     }
@@ -2456,6 +2458,9 @@ fn open_with_editor(path: &str, line: Option<u32>, column: Option<u32>) -> Resul
 #[tauri::command]
 fn open_local_path(path: String) -> Result<(), String> {
     let (file_path, line, column) = parse_local_target(&path);
+    let file_path = crate::util::normalize_windows_path(Path::new(&file_path))
+        .to_string_lossy()
+        .into_owned();
     let target = PathBuf::from(&file_path);
 
     if !target.is_absolute() {

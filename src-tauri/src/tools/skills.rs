@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::link;
 use super::risk::{self, RiskFinding, RiskLevel};
 use super::{ConfigOrigin, ConfigScope, SkillSource};
-use crate::util::home;
+use crate::util::{home, normalize_windows_path};
 
 /// 解析链接时最多跟几跳。本机最长是两跳，16 是给成环留的余量。
 const MAX_HOPS: usize = 16;
@@ -343,7 +343,8 @@ struct StoreIdentity {
 fn store_paths(cwd: Option<&Path>, extra: &[String]) -> Vec<StoreIdentity> {
     let mut out: Vec<StoreIdentity> = Vec::new();
     let mut push = |src: SkillSource, agent: Option<&str>| {
-        if let Some(hit) = out.iter_mut().find(|s| s.path == src.path) {
+        let path = normalize_windows_path(&src.path);
+        if let Some(hit) = out.iter_mut().find(|s| s.path == path) {
             if let Some(agent) = agent {
                 if !hit.agents.iter().any(|a| a == agent) {
                     hit.agents.push(agent.to_string());
@@ -357,7 +358,7 @@ fn store_paths(cwd: Option<&Path>, extra: &[String]) -> Vec<StoreIdentity> {
             return;
         }
         out.push(StoreIdentity {
-            path: src.path,
+            path,
             agents: agent.into_iter().map(str::to_string).collect(),
             scope: src.scope,
             origin: src.origin,
@@ -413,7 +414,7 @@ fn absolute_dir(raw: &str) -> Option<PathBuf> {
         return Some(home().join(rest));
     }
     let path = PathBuf::from(raw);
-    path.is_absolute().then_some(path)
+    path.is_absolute().then(|| normalize_windows_path(&path))
 }
 
 /// 走一遍所有 store，只做目录读取和链接解析，**不碰文件内容**。
@@ -661,7 +662,9 @@ fn scan_store(id: &StoreIdentity) -> (StoreCandidate, Vec<SkillRef>) {
     let dir = id.path.as_path();
     let store = dir.to_string_lossy().to_string();
     let mut candidate = StoreCandidate {
-        path: store.clone(),
+        path: normalize_windows_path(Path::new(&store))
+            .to_string_lossy()
+            .to_string(),
         agents: id.agents.clone(),
         scope: id.scope,
         origin: id.origin,
@@ -712,8 +715,10 @@ fn scan_store(id: &StoreIdentity) -> (StoreCandidate, Vec<SkillRef>) {
 fn classify(path: &Path, store: &str, agents: &[String]) -> Option<SkillRef> {
     let mk = |health, hops, resolved| {
         Some(SkillRef {
-            path: path.to_string_lossy().to_string(),
-            store: store.to_string(),
+            path: normalize_windows_path(path).to_string_lossy().to_string(),
+            store: normalize_windows_path(Path::new(store))
+                .to_string_lossy()
+                .to_string(),
             agents: agents.to_vec(),
             // 要看齐同一个名字下的**所有**引用才算得出来，`group()` 里补。
             reached_by: agents.to_vec(),
@@ -764,8 +769,10 @@ fn classify(path: &Path, store: &str, agents: &[String]) -> Option<SkillRef> {
                 let dead = hops
                     .iter()
                     .find(|h| !h.exists)
-                    .map(|h| h.to.clone())
-                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                    .map(|h| normalize_windows_path(Path::new(&h.to)).to_string_lossy().to_string())
+                    .unwrap_or_else(|| {
+                        normalize_windows_path(path).to_string_lossy().to_string()
+                    });
                 mk(RefHealth::Broken(dead), hops, None)
             }
         };
@@ -788,8 +795,10 @@ fn classify(path: &Path, store: &str, agents: &[String]) -> Option<SkillRef> {
 ///
 /// 展示用的逐跳路径保持原样（见 [`build_hops`]）——用户看到的应该是链接真正写的东西。
 fn identity(path: &Path) -> String {
-    std::fs::canonicalize(path)
+    normalize_windows_path(
+        &std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
+    )
         .to_string_lossy()
         .to_string()
 }
@@ -805,8 +814,8 @@ fn self_identity(path: &Path) -> String {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return path.to_string_lossy().to_string();
     };
-    Path::new(&identity(dir))
-        .join(name)
+    let path = Path::new(&identity(dir)).join(name);
+    normalize_windows_path(&path)
         .to_string_lossy()
         .to_string()
 }
@@ -817,8 +826,8 @@ fn build_hops(start: &Path, targets: &[PathBuf]) -> Vec<LinkHop> {
     let mut out = Vec::with_capacity(targets.len());
     for to in targets {
         out.push(LinkHop {
-            from: from.to_string_lossy().to_string(),
-            to: to.to_string_lossy().to_string(),
+            from: normalize_windows_path(&from).to_string_lossy().to_string(),
+            to: normalize_windows_path(to).to_string_lossy().to_string(),
             exists: to.symlink_metadata().is_ok(),
         });
         from = to.clone();
@@ -905,10 +914,10 @@ fn build_body(dir: &Path, stores: &[String]) -> SkillBody {
         truncated |= scan.skipped;
         findings.extend(scan.findings);
     }
-    let path = dir.to_string_lossy().to_string();
+    let path = normalize_windows_path(dir).to_string_lossy().to_string();
     let store = dir
         .parent()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| normalize_windows_path(p).to_string_lossy().to_string())
         .filter(|p| stores.contains(p));
     SkillBody {
         path,

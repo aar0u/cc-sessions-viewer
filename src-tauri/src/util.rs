@@ -39,6 +39,30 @@ const SKIP_DIRS: &[&str] = &[
     ".fvm",
 ];
 
+/// Remove the Windows extended-length prefix from paths that cross the UI or a
+/// shell boundary.
+///
+/// `std::fs::canonicalize` returns `\\?\C:\...` on Windows. Rust can use that
+/// form, but Explorer, `cmd /c start`, and several third-party tools cannot.
+/// Keep the prefix internally where it is useful, but expose ordinary drive
+/// or UNC paths to the rest of the app.
+pub fn normalize_windows_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            let is_drive_path = rest.as_bytes().get(1) == Some(&b':');
+            if is_drive_path {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// 目录是否含**可见子项**（任一非 .DS_Store、非 SKIP_DIRS 的条目）。空目录 / 只含被跳过
 /// 目录 → false，前端据此隐藏「进入」chevron（钻进去也是空的）。只读到第一个命中即返回。
 fn dir_has_visible_child(dir: &Path) -> bool {

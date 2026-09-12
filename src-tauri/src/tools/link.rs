@@ -769,10 +769,11 @@ pub enum RemovalIntent<'a> {
 /// 彻底的做法是在应用私有目录里维护一份「我们建过哪些副本」的登记，但那份登记会和磁盘
 /// 漂移（用户挪走目录之后登记就是错的），需要连同主 store 的配置一起设计 —— 放在阶段 3。
 pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String> {
-    if is_link(path) {
+    let path = crate::util::normalize_windows_path(path);
+    if is_link(&path) {
         match intent {
             RemovalIntent::BrokenOnly => {
-                let (_, resolved) = resolve_chain(path, 16);
+                let (_, resolved) = resolve_chain(&path, 16);
                 if resolved.is_some() {
                     return Err(format!(
                         "Refusing to remove {}: it still resolves to something. \
@@ -783,12 +784,12 @@ pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String>
             }
             RemovalIntent::PointingAt(expected) => {
                 // 解析到底再比。只比第一跳的话，两跳链会被误判。
-                let (_, resolved) = resolve_chain(path, 16);
+                let (_, resolved) = resolve_chain(&path, 16);
                 let matches = match resolved {
                     Some(actual) => same_path(&actual, expected),
                     // 死链没法解析，退一步比字面目标：删除流程是「先解链再删源」，
                     // 所以正常情况下源还在，走不到这儿。
-                    None => read_link_target(path).is_some_and(|t| same_path(&t, expected)),
+                    None => read_link_target(&path).is_some_and(|t| same_path(&t, expected)),
                 };
                 if !matches {
                     return Err(format!(
@@ -804,19 +805,14 @@ pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String>
             // 按**实际类型**选删法，不能「先 remove_dir 失败再 remove_file」：那个
             // 兜底等于说「只要 remove_dir 不行就当文件删」，有人在上面校验之后把一个
             // 普通文件换到这个位置，就会被直接删掉。查一次类型，只删对得上的那种。
-            let meta = fs::symlink_metadata(path)
-                .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?;
-            return if meta.is_dir() {
-                // 目录 symlink 和 junction 都归这儿：remove_dir 只摘 reparse point，
-                // 不会顺着它进去删源目录的内容。
-                fs::remove_dir(path).map_err(|e| format!("Failed to remove link: {e}"))
-            } else {
-                fs::remove_file(path).map_err(|e| format!("Failed to remove link: {e}"))
-            };
+            // Windows 的 junction 在 `symlink_metadata` 上可能既不是 file 也不是
+            // directory，但技能链接只创建目录 reparse point；统一走目录删除，避免
+            // 把 junction 误判成文件链接。
+            return remove_windows_directory_link(&path);
         }
         #[cfg(unix)]
         {
-            return fs::remove_file(path).map_err(|e| format!("Failed to remove link: {e}"));
+            return fs::remove_file(&path).map_err(|e| format!("Failed to remove link: {e}"));
         }
     }
 
@@ -826,7 +822,7 @@ pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String>
             path.display()
         ));
     };
-    let Some(marker) = read_copy_marker(path) else {
+    let Some(marker) = read_copy_marker(&path) else {
         return Err(format!(
             "Refusing to remove {}: it is not a link or a managed copy",
             path.display()
@@ -857,7 +853,7 @@ pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String>
         std::process::id(),
         crate::util::now_millis()
     ));
-    fs::rename(path, &staged)
+    fs::rename(&path, &staged)
         .map_err(|e| format!("Failed to stage {} for removal: {e}", path.display()))?;
 
     // 搬走之后 marker 记的位置就对不上了，所以这里直接读原始内容比对，而不是再走
@@ -868,17 +864,46 @@ pub fn remove_link(path: &Path, intent: RemovalIntent<'_>) -> Result<(), String>
         .is_some_and(|m| {
             m.kind == MARKER_KIND
                 && same_path(&PathBuf::from(&m.original), expected)
-                && same_path(&PathBuf::from(&m.copy_path), path)
+                && same_path(&PathBuf::from(&m.copy_path), &path)
         });
     if staged_ok {
         fs::remove_dir_all(&staged).map_err(|e| format!("Failed to remove copied link: {e}"))
     } else {
         // 搬走的不是我们以为的东西 —— 原样放回去，一个字节都不动。
-        let _ = fs::rename(&staged, path);
+        let _ = fs::rename(&staged, &path);
         Err(format!(
             "Refusing to remove {}: it changed while we were verifying it",
             path.display()
         ))
+    }
+}
+
+#[cfg(windows)]
+fn remove_windows_directory_link(path: &Path) -> Result<(), String> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // Some Windows reparse points are rejected by RemoveDirectory even
+            // though they are safe to remove as links. Ask fsutil to remove
+            // only the reparse metadata, then remove the now-empty directory
+            // entry. The path was already checked as a link immediately before
+            // this helper, and no recursive delete is involved.
+            let status = crate::util::silent_command("fsutil")
+                .args(["reparsepoint", "delete"])
+                .arg(path)
+                .status();
+            if let Ok(status) = status {
+                if status.success() {
+                    return fs::remove_dir(path).map_err(|second| {
+                        format!("Failed to remove link after clearing reparse point: {second}")
+                    });
+                }
+                return Err(format!(
+                    "Failed to remove link: {first} (fsutil exited with {status})"
+                ));
+            }
+            Err(format!("Failed to remove link: {first} (fsutil could not run)"))
+        }
     }
 }
 

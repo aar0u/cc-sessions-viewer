@@ -1328,7 +1328,7 @@ mod tests {
         fs::create_dir_all(&external).unwrap();
         let body = skill(&external, "hyperframes", "---\nname: hyperframes\n---\n");
         // 主 store 里那个位置现在是一条指向实体的链接。
-        std::os::unix::fs::symlink(&body, main.join("hyperframes")).unwrap();
+        link::link_dir(&body, &main.join("hyperframes")).unwrap();
 
         let report = adopt(&[req("hyperframes", &body, None)], &main, false).unwrap();
 
@@ -1362,7 +1362,7 @@ mod tests {
         let body = skill(&real, "pinme", "x");
         // 主 store 是一条指向 `real` 的链接，于是 `main/pinme` 就是 `real/pinme`。
         let main = root.join("main");
-        std::os::unix::fs::symlink(&real, &main).unwrap();
+        link::link_dir(&real, &main).unwrap();
 
         let report = adopt(&[req("pinme", &body, None)], &main, false).unwrap();
 
@@ -1670,7 +1670,7 @@ mod tests {
         let stale = root.join("old-store");
         fs::create_dir_all(&stale).unwrap();
         let at = stale.join("hyperframes");
-        std::os::unix::fs::symlink(&body, &at).unwrap();
+        link::link_dir(&body, &at).unwrap();
 
         let report = unlink_ref(&at, false).unwrap();
 
@@ -1710,7 +1710,7 @@ mod tests {
         let at = root.join("old");
         fs::create_dir_all(&at).unwrap();
         let link_at = at.join("hyperframes");
-        std::os::unix::fs::symlink(&body, &link_at).unwrap();
+        link::link_dir(&body, &link_at).unwrap();
 
         let report = unlink_ref(&link_at, true).unwrap();
 

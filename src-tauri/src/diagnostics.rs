@@ -6,11 +6,13 @@
 //!
 //! 只读，不改任何状态。取不到的项一律给 0 / None，绝不因为诊断本身失败而报错。
 
+#[cfg(windows)]
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use std::{collections::HashSet, ffi::c_void, sync::OnceLock};
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::AppHandle;
@@ -51,7 +53,7 @@ pub struct RuntimeDiagnostics {
     pub trash_bytes: u64,
 }
 
-/// `ps -o rss= -p <pid>` 拿 KB 数。比 mach / procfs 那套省事，而且 macOS 与 Linux 通用。
+/// 读取进程 RSS。Unix 走 `ps`，Windows 走 PSAPI。
 #[cfg(unix)]
 fn rss_bytes(pid: u32) -> u64 {
     std::process::Command::new("ps")
@@ -64,7 +66,35 @@ fn rss_bytes(pid: u32) -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn rss_bytes(pid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if process.is_null() {
+            return 0;
+        }
+
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        let ok = GetProcessMemoryInfo(process, &mut counters, counters.cb);
+        CloseHandle(process);
+        (ok != 0)
+            .then_some(counters.WorkingSetSize as u64)
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn rss_bytes(_pid: u32) -> u64 {
     0
 }
@@ -198,7 +228,9 @@ fn parse_lsof_owners(listing: &str, markers: &[String]) -> HashSet<i32> {
         } else if let Some(name) = line.strip_prefix('n') {
             if let (Some(pid), true) = (
                 current,
-                markers.iter().any(|marker| name.starts_with(marker.as_str())),
+                markers
+                    .iter()
+                    .any(|marker| name.starts_with(marker.as_str())),
             ) {
                 ours.insert(pid);
             }
@@ -236,7 +268,98 @@ fn executable_name() -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn webview_rss_bytes(_data_dir: Option<&Path>) -> u64 {
+    let processes = windows_processes();
+    if processes.is_empty() {
+        return 0;
+    }
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for process in &processes {
+        children
+            .entry(process.parent_pid)
+            .or_default()
+            .push(process.pid);
+    }
+
+    let mut queue = vec![std::process::id()];
+    let mut descendants = HashSet::new();
+    while let Some(parent_pid) = queue.pop() {
+        if let Some(child_pids) = children.get(&parent_pid) {
+            for &child_pid in child_pids {
+                if descendants.insert(child_pid) {
+                    queue.push(child_pid);
+                }
+            }
+        }
+    }
+
+    processes
+        .into_iter()
+        .filter(|process| {
+            descendants.contains(&process.pid)
+                && process
+                    .image_name
+                    .eq_ignore_ascii_case("msedgewebview2.exe")
+        })
+        .map(|process| rss_bytes(process.pid))
+        .sum()
+}
+
+#[cfg(windows)]
+fn windows_processes() -> Vec<WindowsProcessInfo> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                out.push(WindowsProcessInfo {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    image_name: wide_string(&entry.szExeFile),
+                });
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(windows)]
+struct WindowsProcessInfo {
+    pid: u32,
+    parent_pid: u32,
+    image_name: String,
+}
+
+#[cfg(windows)]
+fn wide_string(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn webview_rss_bytes(_data_dir: Option<&Path>) -> u64 {
     0
 }
@@ -260,7 +383,40 @@ fn thread_count(pid: u32) -> usize {
         .unwrap_or(0)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn thread_count(pid: u32) -> usize {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return 0;
+    }
+
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut count = 0;
+    unsafe {
+        if Thread32First(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    count += 1;
+                }
+                if Thread32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    count
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn thread_count(_pid: u32) -> usize {
     0
 }
@@ -337,8 +493,7 @@ pub fn runtime_diagnostics(app: AppHandle) -> RuntimeDiagnostics {
         trash_bytes: crate::storage_gc::total_bytes(Path::new(&crate::trash::trash_dir())),
     };
 
-    if diagnostics.main_rss_bytes > RSS_WARN_BYTES
-        || diagnostics.webview_rss_bytes > RSS_WARN_BYTES
+    if diagnostics.main_rss_bytes > RSS_WARN_BYTES || diagnostics.webview_rss_bytes > RSS_WARN_BYTES
     {
         append_warning(&diagnostics);
     }
@@ -350,7 +505,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn reads_this_process_rss_and_threads() {
         let pid = std::process::id();
         // 自己一定活着，这两个值必须是正数 —— 拿到 0 说明 `ps` 的取法在这个平台上不成立。
