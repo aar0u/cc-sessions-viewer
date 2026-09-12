@@ -14,6 +14,8 @@
 
 <p align="center"><strong>Claude Code</strong>、<strong>Codex</strong>、<strong>Grok Build</strong>、<strong>Kimi Code</strong>、<strong>Pi</strong>、<strong>Antigravity CLI</strong>、<strong>opencode</strong> 専用のネイティブデスクトップブラウザ。<br/>7 つの CLI のローカルセッション履歴を一元的に読み取り、検索し、管理します。</p>
 
+<p align="center">さらに<strong>ツール管理</strong>のページ — 各エージェントに散らばった skill（重複・リンク切れ・同じものが 3 か所に）を整理し、<br/>MCP サーバー・hook・指示ファイルもまとめて掌握。<a href="docs/tools/README.ja.md"><strong>ガイド →</strong></a></p>
+
 </div>
 
 https://github.com/user-attachments/assets/9bcb92a8-e5b8-40e5-b492-af252162309b

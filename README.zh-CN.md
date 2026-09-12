@@ -14,6 +14,8 @@
 
 <p align="center">一个专为 <strong>Claude Code</strong>、<strong>Codex</strong>、<strong>Grok Build</strong>、<strong>Kimi Code</strong>、<strong>Pi</strong>、<strong>Antigravity CLI</strong> 和 <strong>opencode</strong> 打造的原生桌面浏览器。<br/>在一处读取、搜索并管理七个 CLI 的本地会话记录。</p>
 
+<p align="center">另有一整页<strong>工具管理</strong> —— 把散落在各家 agent 的 skills 收拢干净（重复、断链、同一份存了三处），<br/>并接管 MCP server、hooks 与全局指令文件。<a href="docs/tools/README.zh-CN.md"><strong>使用文档 →</strong></a></p>
+
 </div>
 
 https://github.com/user-attachments/assets/9bcb92a8-e5b8-40e5-b492-af252162309b

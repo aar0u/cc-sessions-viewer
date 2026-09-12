@@ -14,6 +14,8 @@
 
 <p align="center">A native desktop browser for <strong>Claude Code</strong>, <strong>Codex</strong>, <strong>Grok Build</strong>, <strong>Kimi Code</strong>, <strong>Pi</strong>, <strong>Antigravity CLI</strong>, and <strong>opencode</strong>.<br/>Read, search, and manage local session transcripts from all seven in one place.</p>
 
+<p align="center">Plus a <strong>tool management</strong> page — round up the skills scattered across your agents (duplicates, dead links, the same one stored three times),<br/>and take over MCP servers, hooks, and instruction files. <a href="docs/tools/README.md"><strong>Guide →</strong></a></p>
+
 </div>
 
 https://github.com/user-attachments/assets/9bcb92a8-e5b8-40e5-b492-af252162309b
