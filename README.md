@@ -24,6 +24,11 @@ https://github.com/user-attachments/assets/9bcb92a8-e5b8-40e5-b492-af252162309b
 
 Sessions Viewer turns local agent transcripts into a searchable workspace. Open a project, inspect exactly what happened, then continue the work from the same place without manually hunting through JSONL files.
 
+> [!TIP]
+> **New — Tool management.** Skills, MCP servers, hooks, and instruction files for all seven agents in one place. Find the duplicate skills and broken links on your machine and repair them, see what your MCP servers cost in context before you type, and dry-run a hook before you trust it. Every change previews the exact file edits first.
+>
+> → **[Read the tool management guide](docs/tools/README.md)**
+
 ### Read and find context
 
 - **Faithful replay** — preserve thinking chains, tool-call pairings, structured diffs, and inline screenshots.

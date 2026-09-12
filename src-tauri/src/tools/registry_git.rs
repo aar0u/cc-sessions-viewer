@@ -263,6 +263,13 @@ fn git(cwd: Option<&Path>, args: &[&str]) -> Result<String, String> {
 ///
 /// `Command::output()` 没有超时；对面不回包时它会一直等下去，而这条路径是用户点一下
 /// 就走一次的。
+///
+/// **两条管道必须一边等一边抽干**，不能等进程退了再一次性读。管道缓冲区满了之后
+/// 子进程会阻塞在 `write` 上永远不退出，而我们在 `try_wait` 里空转 —— 结果是必然
+/// 走到超时那一档，再把一个本来好好的 git 杀掉。`ls-tree -r` 在大仓库上就会踩到：
+/// macOS 的缓冲区是 64 KiB，而 `wshobson/agents` 的输出是 68 KB、
+/// `heygen-com/hyperframes` 是 383 KB。表现是这些仓库的详情**永远**是骨架屏，
+/// 小仓库却一切正常 —— 看上去像网络问题，其实和网络无关。
 fn run_with_timeout(mut cmd: Command, args: &[&str]) -> Result<String, String> {
     // 报错里只提子命令，不回显整条 argv：那里面有仓库地址和一串 `-c`，对用户没用。
     let what = || {
@@ -278,10 +285,23 @@ fn run_with_timeout(mut cmd: Command, args: &[&str]) -> Result<String, String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("git {}: {e}", what()))?;
+    // 接管两条管道，各起一个线程读到 EOF。子进程写多少都不会被堵住，
+    // 而 EOF 只会在它退出（或被我们杀掉）时到来，所以线程一定能收。
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        })
+    };
+    let out_thread = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let err_thread = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let deadline = SystemTime::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if SystemTime::now() > deadline {
                     let _ = child.kill();
@@ -292,12 +312,11 @@ fn run_with_timeout(mut cmd: Command, args: &[&str]) -> Result<String, String> {
             }
             Err(e) => return Err(format!("git {}: {e}", what())),
         }
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("git {}: {e}", what()))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr);
         let err = err.trim();
         return Err(if err.is_empty() {
             format!("git {} failed", what())
@@ -305,7 +324,7 @@ fn run_with_timeout(mut cmd: Command, args: &[&str]) -> Result<String, String> {
             err.to_string()
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -792,5 +811,54 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 大仓库的 `ls-tree -r` 能吐几百 KB，远超管道缓冲区（macOS 64 KiB）。
+    ///
+    /// 曾经这里是「先 `try_wait` 空转、等它退了再 `wait_with_output` 一次性读」——
+    /// 缓冲区一满子进程就阻塞在 `write` 上，永远不退，于是必然走到 60 秒超时，
+    /// 再把一个本来好好的 git 杀掉。用户看到的是 `wshobson/agents`（68 KB）、
+    /// `heygen-com/hyperframes`（383 KB）这类仓库的详情**永远**是骨架屏，而
+    /// `emilkowalski/skills`（647 B）一切正常 —— 分界线恰好是缓冲区大小。
+    ///
+    /// 用 `git hash-object` 造一段远超缓冲区的 stdout：它不联网、哪台机器都有。
+    #[test]
+    fn a_subprocess_that_outdoes_the_pipe_buffer_still_finishes() {
+        let root = scratch("bigpipe");
+        std::fs::create_dir_all(&root).unwrap();
+        // 每行一个 40 字符的 sha，5000 行 ≈ 200 KB，是 64 KiB 的三倍多。
+        let lines = 5000;
+        let paths: Vec<String> = (0..lines)
+            .map(|i| {
+                let f = root.join(format!("f{i}.txt"));
+                std::fs::write(&f, format!("{i}")).unwrap();
+                f.to_string_lossy().into_owned()
+            })
+            .collect();
+        let args: Vec<&str> = std::iter::once("hash-object")
+            .chain(paths.iter().map(|s| s.as_str()))
+            .collect();
+
+        let started = SystemTime::now();
+        let out = git(None, &args).expect("大输出不该超时");
+        let took = started.elapsed().unwrap();
+
+        assert_eq!(out.lines().count(), lines, "stdout 被截断了");
+        assert!(out.len() > 64 * 1024, "样本没超过管道缓冲区: {}", out.len());
+        // 死锁那版会一路耗到 GIT_TIMEOUT_SECS；正常应该是毫秒级。
+        assert!(
+            took < std::time::Duration::from_secs(GIT_TIMEOUT_SECS / 2),
+            "耗时 {took:?}，像是卡在管道上了"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 失败路径上 stderr 同样要抽干，否则报错信息会丢。
+    #[test]
+    fn a_failing_subprocess_still_reports_what_it_said() {
+        let err = git(None, &["cat-file", "-p", "0000000000000000000000000000000000000000"])
+            .unwrap_err();
+        assert!(!err.is_empty(), "报错是空的");
+        assert!(!err.contains("timed out"), "不该走到超时: {err}");
     }
 }

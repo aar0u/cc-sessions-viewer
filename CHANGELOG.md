@@ -6,6 +6,35 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [v0.5.0]
+
+### Features
+
+- **Tool management page** — a new full-page surface for the configuration your agents actually read, reachable from the sidebar footer or `⌘K`. Five master-detail panels share one shell: MCP servers, skills, skill discovery, hooks, and global instruction files. A "only show these agents" filter applies across all of them, and every write goes through a dry-run plan you confirm before anything touches disk.
+- **MCP panel** — reads MCP configuration from all seven agents across JSON and TOML, normalized into one list with scope (user / project / local) and origin (own / shared / read-for-compatibility). It surfaces the override chain that is otherwise invisible — Grok merges `~/.claude.json` by default, so a server you add in Claude quietly appears there too. A context budget bar shows per-server tool counts and approximate token cost so the cost of leaving a server on is visible. Add, edit, remove, enable/disable, and sync a server across agents; credential-looking values are masked by default.
+- **Skills panel** — claims an existing skills store rather than creating a fourth one. Detects broken links, two-hop links, cycles, and duplicate entries across every store and agent directory; adopts scattered real directories into the main store; deletes a skill by unlinking every reference first and only then removing the source, which is the step whose absence produces dead links. Also: per-body delete (drop the global copy, keep the project one), per-agent enable/disable, risk badges with context-aware downgrading, git-backed update for skills installed from GitHub, and sorting by newest / oldest / name with pinned entries unaffected.
+- **Discover skills** — search skills.sh, preview a skill before installing it (description, file list, risk findings, pulled via shallow clone + `ls-tree` + sparse-checkout), then install through a visible embedded terminal you can `Ctrl-C` at any point. The CLI stops at its own agent picker; the app does not answer it for you.
+- **Hooks panel** — groups hooks by command rather than by file, so one command wired to five agents across nine events reads as one row instead of twenty-one. Add, remove (whole row or a single landing spot), and test a hook in place with real stdout / stderr / exit code / duration. The turn-status hooks this app installs are protected from accidental removal.
+- **Global instructions panel** — resolves what each agent *actually* reads, including fallbacks (opencode and Grok fall back to `~/.claude/CLAUDE.md` when their own file is absent) and extra sources outside the conventional paths. Expands `@import` into a tree, flags broken imports, detects forked copies of the same fragment by content and offers a side-by-side diff, and merges duplicate files into a shared store.
+- **Tool bundle export / import** — share a configuration set without shipping secrets: values are never exported, and on import you pick which agents receive each entry.
+- **Built-in code editor** — edit a skill or an instruction file in-app with syntax highlighting and preview, with no new dependency added.
+- **About and support card in Settings** — version status and the GitHub star prompt merged into one card, plus a donation card with WeChat / Alipay QR codes and a GitHub Sponsors link.
+
+### Bug Fixes
+
+- **Embedded terminals no longer inherit the launching agent's identity** — a CLI started from the app could see environment markers such as `CLAUDECODE` and take them as "an agent is driving me", switching itself into non-interactive mode and skipping its own confirmation prompt. In one case that meant an install ran to completion without ever asking. Interactive shells now have all 18 agent-detection markers stripped; shells the app spawns to run an agent CLI are deliberately untouched, since there those markers are the agent's identity.
+- **Code editor gutter alignment** — each logical line is now its own element, so line numbers stay aligned with soft-wrapped rows and with the cursor at end of file.
+
+### Improvements
+
+- **Registry cache is accounted for and bounded** — the shallow clones the discover panel keeps for previews appear in the Storage panel and are pruned during background maintenance (30 repos / 200 MB). Clearing them only makes the next preview slower; installed skills are unaffected.
+- **macOS memory attribution** — webview RSS is attributed via responsible-pid detection in the diagnostics panel.
+- **Chat image thumbnail labels** are localized in all four languages.
+
+### Tests
+
+- 350 new Rust tests across the `tools::` modules (scanning, link handling, risk scoring, and every write path) and 421 new frontend tests across the tools logic modules. The suite now runs 1683 frontend and 913 Rust tests.
+
 ## [v0.3.27]
 
 ### Features

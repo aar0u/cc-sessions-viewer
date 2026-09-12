@@ -24,6 +24,11 @@ https://github.com/user-attachments/assets/9bcb92a8-e5b8-40e5-b492-af252162309b
 
 Sessions Viewer 将本地 agent 会话记录整理成可搜索的工作区。打开项目，准确回看发生了什么，再从同一位置继续工作，无需手动翻找 JSONL 文件。
 
+> [!TIP]
+> **新增 —— 工具管理。** 七家 agent 的 skills、MCP server、hooks 和全局指令文件，集中在一个页面。把本机重复的 skill 和断掉的链接找出来并修好，在开口之前先看清楚 MCP server 吃掉多少上下文，hook 可以先试跑再决定要不要信它。每一次改动都先把会改哪些文件摆给你看。
+>
+> → **[查看工具管理文档](docs/tools/README.zh-CN.md)**
+
 ### 阅读与定位
 
 - **忠实还原** — 完整呈现思考链路、工具调用配对、结构化 Diff 与内嵌截图。
