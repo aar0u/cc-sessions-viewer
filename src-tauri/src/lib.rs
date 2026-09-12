@@ -994,6 +994,15 @@ fn pty_spawn_shell(
     pty::spawn_shell(app, cwd, cols, rows, color_scheme.as_deref())
 }
 
+/// 用户 home。
+///
+/// 「发现」面板那个内嵌终端要有个起步目录：`npx skills add` **在哪儿跑决定了它装到哪儿**，
+/// 而 home 是唯一一个不属于任何项目的中立位置。用户在终端里看得见 cwd，要换自己 `cd`。
+#[tauri::command]
+fn home_dir() -> String {
+    util::home().to_string_lossy().to_string()
+}
+
 #[tauri::command]
 fn pty_write(id: u64, data: String) -> Result<(), String> {
     pty::write(id, &data)
@@ -2640,6 +2649,8 @@ pub fn run() {
             tools::hooks_write::tools_test_hook,
             tools::mcp::tools_scan_mcp,
             tools::mcp_write::tools_apply_mcp,
+            tools::registry::tools_registry_search,
+            tools::registry_git::tools_registry_preview,
             tools::memo::tools_scan_memo,
             tools::memo::tools_read_memo,
             tools::memo::tools_write_memo,
@@ -2705,6 +2716,7 @@ pub fn run() {
             pty_spawn,
             pty_spawn_new,
             pty_spawn_shell,
+            home_dir,
             pty_write,
             pty_resize,
             pty_kill,
@@ -2777,6 +2789,7 @@ pub fn run() {
             // 会话图片的磁盘缓存目录。要 AppHandle 才能定位数据目录，所以在这里解析一次
             // 存起来；解析不到就整体停用，图片照旧内联。
             image_cache::init(app.handle());
+            tools::registry_git::init(app.handle());
             // 磁盘治理：附件目录、图片缓存、回收站保留期。后台线程，启动 + 每 24 小时。
             storage_gc::spawn_maintenance(app.handle().clone());
             if let Err(e) = turn::start_signal_watcher(app.handle().clone()) {

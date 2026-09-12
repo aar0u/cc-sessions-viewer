@@ -21,16 +21,31 @@ export function escapeHtml(s: string): string {
 }
 
 /**
+ * 一行一个块元素。行号是 CSS 计数器画在它的 `::before` 上的。
+ *
+ * **行之间不能有任何分隔符**：高亮层是 `white-space: pre-wrap`，行盒子中间哪怕只夹一个
+ * 换行，屏幕上就是一行空行 —— 从第二行起整层和 textarea 错开。
+ */
+function row(inner: string): string {
+  return `<span class="ce-row">${inner}</span>`
+}
+
+/**
  * 高亮层的 HTML。
  *
- * 末尾补一个换行：textarea 的内容以 `\n` 结尾时，它自己会多留一个空行的高度，而
- * `<pre>` 的最后一个换行会被吃掉 —— 两层的总高度就差一行，光标跑到文档末尾时高亮
- * 整体上移一行。
+ * 为什么要一行一个元素：行号得跟着**逻辑行**走 —— 一行折成三行时号只出现在第一折。
+ * 一整块文本加 `pre-wrap` 数不出行来，只有把号挂在行盒子上才对得齐。
+ *
+ * 行数以**正文**为准（`lineCount`），不以 token 行数为准：结尾那个 `\n` 要不要算最后
+ * 一个空行，shiki 各版本不一样，而 textarea 一定给它留一行的高度。差一行就是「光标
+ * 走到文末，高亮整体上移一行」。
  */
-export function tokensToHtml(lines: HlToken[][]): string {
-  return (
-    lines
-      .map((tokens) =>
+export function tokensToHtml(lines: HlToken[][], lineCount = lines.length): string {
+  const rows: string[] = []
+  for (let i = 0; i < Math.max(lineCount, 1); i += 1) {
+    const tokens = lines[i] ?? []
+    rows.push(
+      row(
         tokens
           .map((t) =>
             t.color
@@ -38,14 +53,18 @@ export function tokensToHtml(lines: HlToken[][]): string {
               : escapeHtml(t.content),
           )
           .join(''),
-      )
-      .join('\n') + '\n'
-  )
+      ),
+    )
+  }
+  return rows.join('')
 }
 
-/** 不高亮时的同款结构：同样补末尾换行，换行规则必须和 `tokensToHtml` 一模一样。 */
+/** 不高亮时的同款结构。分行规则必须和 `tokensToHtml` 一模一样，否则换个语言行号就跳。 */
 export function plainToHtml(code: string): string {
-  return escapeHtml(code) + '\n'
+  return code
+    .split('\n')
+    .map((line) => row(escapeHtml(line)))
+    .join('')
 }
 
 // ---------------------------------------------------------------------------

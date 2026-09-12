@@ -197,6 +197,48 @@ fn build_shell_command(
     cmd
 }
 
+/// 会让命令行工具「认出自己在给 agent 打工」的环境变量。
+///
+/// 本应用是被某个 shell 启动的，而那个 shell 很可能正跑在 Claude Code / Cursor /
+/// Codex 里 —— `CLAUDECODE=1` 之类就这么一路继承进了 app 进程，再继承进这里开的每一个
+/// PTY。可这个 PTY 是**人**在看的终端，不是 agent 的管道，带着这些标记就是在撒谎。
+///
+/// 代价是实打实的：`npx skills add` 一旦检测到 agent 就打印「Agent detected —
+/// installing non-interactively」，**跳过全部确认** —— 不问 y、不让选装到哪些 agent，
+/// 直接铺满全机。同一行命令用户自己在 Terminal.app 里跑是有确认的。也就是说危险的那
+/// 一种行为恰好只出现在用户以为更安全的地方，而且取决于 app 当初是被谁点开的。
+///
+/// 名单抄自 `@vercel/detect-agent`（`skills` CLI 用的就是它）。宁可多清几个：这些变量
+/// 对一个人类终端本来就没有任何正当用途。**只清交互式 shell**，跑 agent CLI 的那条
+/// 路径（`build_shell_command`）不动 —— 那儿本来就该是 agent。
+const AGENT_ENV_MARKERS: &[&str] = &[
+    "AI_AGENT",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_IS_COWORK",
+    "CURSOR_TRACE_ID",
+    "CURSOR_AGENT",
+    "CURSOR_EXTENSION_HOST_ROLE",
+    "GEMINI_CLI",
+    "CODEX_SANDBOX",
+    "CODEX_CI",
+    "CODEX_THREAD_ID",
+    "ANTIGRAVITY_AGENT",
+    "AUGMENT_AGENT",
+    "OPENCODE_CLIENT",
+    "REPL_ID",
+    "COPILOT_MODEL",
+    "COPILOT_ALLOW_ALL",
+    "COPILOT_GITHUB_TOKEN",
+];
+
+/// 把上面那些标记从一条待起的命令里摘掉。
+fn strip_agent_markers(cmd: &mut CommandBuilder) {
+    for key in AGENT_ENV_MARKERS {
+        cmd.env_remove(key);
+    }
+}
+
 /// 纯交互式 shell（不带 -c），用于"新建终端"场景。
 #[cfg(unix)]
 fn build_interactive_shell(cwd: &str, color_scheme: PtyColorScheme) -> CommandBuilder {
@@ -227,6 +269,7 @@ fn build_interactive_shell(cwd: &str, color_scheme: PtyColorScheme) -> CommandBu
     ));
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("npm_config_prefix");
+    strip_agent_markers(&mut cmd);
 
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
@@ -261,6 +304,7 @@ fn build_interactive_shell(cwd: &str, color_scheme: PtyColorScheme) -> CommandBu
     // shell_init = 静默写一份 PATH 诊断快照到 %TEMP%\sv-pathdiag.txt + 刷新 PATH。
     cmd.arg(crate::agent_command::powershell_shell_init());
     cmd.env("TERM", "xterm-256color");
+    strip_agent_markers(&mut cmd);
     cmd.env("COLORTERM", "truecolor");
     cmd.env("COLORFGBG", color_scheme.colorfgbg());
     cmd.cwd(cwd);
@@ -561,5 +605,72 @@ pub fn kill_all() {
     };
     for handle in handles {
         stop_handle(handle.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这个名单丢一个都可能让一条 `npx skills add` 跳过全部确认，铺满全机。
+    ///
+    /// 钉的是「`@vercel/detect-agent` 认得的每一个信号我们都清掉了」。那个库的名单会涨；
+    /// 涨了之后这个测试不会自己报错，但至少 review 的人能看见我们当初照着哪几个抄的。
+    #[test]
+    fn every_agent_signal_that_detect_agent_reads_is_stripped() {
+        for key in [
+            "AI_AGENT",
+            "CLAUDECODE",
+            "CLAUDE_CODE",
+            "CLAUDE_CODE_IS_COWORK",
+            "CURSOR_TRACE_ID",
+            "CURSOR_AGENT",
+            "CURSOR_EXTENSION_HOST_ROLE",
+            "GEMINI_CLI",
+            "CODEX_SANDBOX",
+            "CODEX_CI",
+            "CODEX_THREAD_ID",
+            "ANTIGRAVITY_AGENT",
+            "AUGMENT_AGENT",
+            "OPENCODE_CLIENT",
+            "REPL_ID",
+            "COPILOT_MODEL",
+            "COPILOT_ALLOW_ALL",
+            "COPILOT_GITHUB_TOKEN",
+        ] {
+            assert!(
+                AGENT_ENV_MARKERS.contains(&key),
+                "{key} 会让 CLI 以为自己在给 agent 打工，必须清掉"
+            );
+        }
+    }
+
+    /// 人的终端不能冒充 agent。
+    ///
+    /// `CommandBuilder::new` 会把**本进程整个环境**抄进 builder，`env_remove` 删的就是
+    /// 那份抄件里的条目 —— 所以这儿断言的是「这条命令带出去的环境里没有这些键」，
+    /// 而不是去动进程自己的环境（那会和并行跑的别的测试抢同一个全局状态）。
+    #[test]
+    fn an_interactive_shell_never_inherits_the_launching_agents_identity() {
+        let cmd = build_interactive_shell(
+            &crate::util::home().to_string_lossy(),
+            PtyColorScheme::parse(Some("dark")),
+        );
+        let leaked: Vec<&str> = AGENT_ENV_MARKERS
+            .iter()
+            .copied()
+            .filter(|key| cmd.get_env(key).is_some())
+            .collect();
+        assert!(leaked.is_empty(), "泄漏了 agent 标记：{leaked:?}");
+    }
+
+    /// 上面那条在一台没设这些变量的机器上会空过，所以再钉一次摘除动作本身。
+    #[test]
+    fn a_marker_that_is_present_really_does_get_removed() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("CLAUDECODE", "1");
+        assert!(cmd.get_env("CLAUDECODE").is_some());
+        strip_agent_markers(&mut cmd);
+        assert!(cmd.get_env("CLAUDECODE").is_none());
     }
 }

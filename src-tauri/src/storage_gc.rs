@@ -129,7 +129,9 @@ pub fn prune(root: &Path, policy: Policy, now: SystemTime) -> Pruned {
 /// 三件事都在同一个后台线程里串行做完，谁也不阻塞 setup：
 ///   1. 附件目录按 30 天 / 500 MB 收口；
 ///   2. 图片缓存按 500 MB 收口；
-///   3. 回收站按用户设置的保留期清理（默认 0 = 不清）。
+///   3. skill registry 的 clone 缓存按 30 个仓库 / 200 MB 收口（整目录删，见
+///      `registry_git::prune_in`）；
+///   4. 回收站按用户设置的保留期清理（默认 0 = 不清）。
 ///
 /// 另外在启动那一轮顺手收拾旧版本散在 `$TMPDIR` 里的附件，只做一次。
 pub fn spawn_maintenance(app: tauri::AppHandle) {
@@ -149,6 +151,7 @@ pub fn spawn_maintenance(app: tauri::AppHandle) {
 
             crate::attachments::prune(&app);
             crate::image_cache::prune();
+            crate::tools::registry_git::prune();
 
             let days = crate::app_storage::trash_retention_days();
             // 用户还没被告知「回收站会自动清理了」之前，一条都不许删 —— 否则那次提示

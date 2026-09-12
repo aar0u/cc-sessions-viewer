@@ -8,14 +8,20 @@ import { ref, watch } from 'vue'
 import type { Agent, ToolCapabilities } from './types'
 import { ALL_AGENTS } from './settings'
 
-/** 四个面板。次序就是 tab 的显示次序。 */
-export const TOOL_TABS = ['mcp', 'skills', 'hooks', 'memo'] as const
+/**
+ * 五个面板。次序就是 tab 的显示次序。
+ *
+ * `discover` 紧挨着 `skills`：它装出来的东西就落在 Skills 面板里，两者是同一件事的
+ * 「找」和「管」两半。
+ */
+export const TOOL_TABS = ['mcp', 'skills', 'discover', 'hooks', 'memo'] as const
 export type ToolTab = (typeof TOOL_TABS)[number]
 
 /** tab → i18n key。 */
 export const TAB_LABEL: Record<ToolTab, string> = {
   mcp: 'tools.tab.mcp',
   skills: 'tools.tab.skills',
+  discover: 'tools.tab.discover',
   hooks: 'tools.tab.hooks',
   memo: 'tools.tab.memo',
 }
@@ -25,12 +31,37 @@ export const TAB_LABEL: Record<ToolTab, string> = {
  *
  * 后端 `ToolSurface::capabilities()` 是从各家的路径方法**派生**出来的（阶段 1），
  * 所以这里只是把 tab 映到字段名，不重复声明「谁支持什么」—— 那是会漂的。
+ *
+ * `discover` 是 `null`：它搜的是 skills.sh，**跟本机装了哪几家 agent 没有关系**。
+ * 硬塞一个能力位进去就等于声称「某家 agent 不支持搜索」，那是假的。
  */
-export const TAB_CAPABILITY: Record<ToolTab, keyof ToolCapabilities> = {
+export const TAB_CAPABILITY: Record<ToolTab, keyof ToolCapabilities | null> = {
   mcp: 'mcp',
   skills: 'skills',
+  discover: null,
   hooks: 'hooks',
   memo: 'globalMemo',
+}
+
+/**
+ * 这个 tab 认不认左侧那排 agent 勾选。
+ *
+ * 只有 `discover` 不认 —— 它列的是网上有什么，不是本机哪几家装了什么。不压暗的话
+ * 用户会以为「勾掉几家能筛掉一些结果」，点了却毫无反应。
+ */
+export function tabUsesAgentFilter(tab: ToolTab): boolean {
+  return TAB_CAPABILITY[tab] !== null
+}
+
+/**
+ * 切到这个 tab 要不要把光标送进搜索框。
+ *
+ * 只有 `discover` 要。另外四个面板一进去就有内容 —— 本机装了什么直接列出来，
+ * 搜索框是**筛掉一些**用的，抢焦点会打断「先看看有什么」这个动作。
+ * 发现面板一进去是空的，不输入就永远是空的，搜索框是它唯一的入口。
+ */
+export function tabAutoFocusesSearch(tab: ToolTab): boolean {
+  return tab === 'discover'
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +72,21 @@ export const toolsTab = ref<ToolTab>('skills')
 /** 被勾上的 agent。空集 = 全选（见 `isAgentOn`）。 */
 export const toolsAgents = ref<Set<Agent>>(new Set())
 export const toolsQuery = ref('')
+
+/**
+ * 用户在搜索框里按过几次回车。
+ *
+ * 存在的理由只有一个：「发现」面板的输入是一次 HTTP，在顶栏那 200 ms 之上还叠了
+ * 500 ms 防抖；知道要搜什么的人不该干等。按一下回车这个数 +1，面板 watch 到就立刻发。
+ *
+ * 做成计数器而不是布尔：连按两次回车（第一次超时了想重试）必须是两个事件，
+ * 布尔翻不动第二下。顶栏因此**不需要知道**有谁在监听、更不需要知道那边要发网络请求。
+ */
+export const toolsSearchSubmit = ref(0)
+
+export function submitToolsSearch() {
+  toolsSearchSubmit.value += 1
+}
 
 /**
  * 配置集弹框开着没有。
@@ -113,6 +159,7 @@ export function switchToolsTab(tab: ToolTab) {
 export function resetToolsPanel() {
   toolsTab.value = 'skills'
   toolsBundleOpen.value = false
+  toolsSearchSubmit.value = 0
   clearToolsFilter()
 }
 

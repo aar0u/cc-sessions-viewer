@@ -215,21 +215,6 @@ export function chainLines(ref: SkillRef, home: string): ChainLine[] {
 }
 
 /**
- * 这条引用能不能单独删掉。
- *
- * 两个条件缺一不可：它自己是一份**实体内容**（链接要删的是链接，走「停用」那条路），
- * 而且**没有任何 agent 够得着它**。
- *
- * 第二个条件看的是 `reachedBy` 而不是 `agents`。`agents` 只说「这个目录被哪几家直接
- * 扫」——`~/.skills-manager/skills/X` 没有任何一家直接扫 `.skills-manager`，可它是
- * `~/.claude/skills/X` 和 `~/.agents/skills/X` 两条链的终点。按 `agents` 判就会在那一行
- * 上长出一个删除按钮，点下去两条链一起断。
- */
-export function deletableBody(ref: SkillRef): boolean {
-  return ref.health.state === 'realDir' && ref.reachedBy.length === 0
-}
-
-/**
  * 这条引用是不是一条**没人读的活链接** —— 除了拆掉它，没有别的出路。
  *
  * 「停用」是**按 agent 关**的：它删掉的是那家自己目录里的那一条。而第三方 store
@@ -377,23 +362,67 @@ export function visibleSkills(
   filter: SkillFilter,
   agents: Agent[],
   pinned: string[] = [],
+  sort: SkillSort = 'newest',
 ): SkillEntry[] {
   return sortSkills(
     filterSkills(skills, filter).filter((s) => matchesAgents(s, agents)),
     pinned,
     filter.query,
+    sort,
   )
 }
 
 /**
- * 有问题的排前面 —— 这个面板存在的理由就是「机器上没有任何东西告诉你哪些坏了」，
- * 按字母序排等于把结论埋进列表中间。同档内按风险，再按名字。
+ * 列表次序。
  *
- * `pinned` 里的排在最前，**压过上面全部规则**：自动排序猜的是「你大概最该先看哪个」，
- * 置顶是用户自己说的「我就要看这个」，后者永远该赢。置顶之间保持置顶顺序不变
- * （先置顶的在上），不跟着 badge 重排 —— 那一列的次序是用户自己攒出来的。
+ * `newest` 是默认：这一列每天要回答的是「我刚才装的那个在哪」。`oldest` 给的是另一个
+ * 问题 ——「哪些是很久没碰过的」，那通常就是该清掉的一批。`name` 是在心里已经有名字、
+ * 只是想按字母扫过去的时候用的。
  */
-export function sortSkills(skills: SkillEntry[], pinned: string[] = [], query = ''): SkillEntry[] {
+export type SkillSort = 'newest' | 'oldest' | 'name'
+
+export const SKILL_SORTS: readonly SkillSort[] = ['newest', 'oldest', 'name'] as const
+
+/**
+ * 这条 skill 最近一次被动过是什么时候（毫秒）。
+ *
+ * 同名重复时取**最新**那份：用户问的是「这个名字最近动过没有」，而不是「最老的那份
+ * 多老」。一份时间都读不到返回 0 —— 那是「没有内容可读」，排序里另有安排（见 `sortSkills`）。
+ */
+export function newestBody(entry: SkillEntry): number {
+  let newest = 0
+  for (const body of entry.bodies) {
+    if (body.modified != null && body.modified > newest) newest = body.modified
+  }
+  return newest
+}
+
+/**
+ * 最近动过的排前面。
+ *
+ * 早先是「有问题的排前面」，理由是机器上没有任何东西告诉你哪些坏了。那个理由还在，
+ * 但答案已经搬到面板顶上那条健康条了 —— 重复 28 / 绕远路 12 是可点的筛子，问「哪些
+ * 坏了」一下就到。而列表本身每天要回答的是另一个问题：**我刚才装的那个在哪**。按
+ * 健康度排会把它扔进 49 条的中段，得一行行找。
+ *
+ * 时间取各份 body 里最新的那个 mtime。**一个时间戳都读不到的排在最前**，不是最后：
+ * 那种条目多半压根没有实体目录（链接断了、指到别处去了），它不是「很旧」而是「不在了」，
+ * 正是这个面板要喊的那一种。它们内部仍按角标和风险排。
+ *
+ * 用户能在健康条上换 `sort`（时间倒序 / 时间正序 / 按名称）。换成 `name` 时整段时间
+ * 判断直接跳过，落回角标 → 风险 → 名字那一套。
+ *
+ * `pinned` 里的排在最前，**压过上面全部规则**（换哪一档都一样）：自动排序猜的是
+ * 「你大概最该先看哪个」，置顶是用户自己说的「我就要看这个」，后者永远该赢。置顶
+ * 之间保持置顶顺序不变（先置顶的在上），不跟着时间重排 —— 那一列的次序是用户自己
+ * 攒出来的。
+ */
+export function sortSkills(
+  skills: SkillEntry[],
+  pinned: string[] = [],
+  query = '',
+  sort: SkillSort = 'newest',
+): SkillEntry[] {
   const pinRank = (name: string) => {
     const i = pinned.indexOf(name)
     return i === -1 ? Number.MAX_SAFE_INTEGER : i
@@ -409,6 +438,17 @@ export function sortSkills(skills: SkillEntry[], pinned: string[] = [], query = 
     const qa = queryRank(a, query)
     const qb = queryRank(b, query)
     if (qa !== qb) return qa - qb
+    // 按名称就是**纯字母序**，角标和风险一概不插队。用户选这一档是因为心里已经有
+    // 名字、只想扫过去找到它；再让「坏的排前面」插一手，找的那个还是不在该在的位置。
+    if (sort === 'name') return a.name.localeCompare(b.name)
+    {
+      const ta = newestBody(a)
+      const tb = newestBody(b)
+      // 读不到时间的先走 —— **两档时间序都这样**：「没有时间」不是「很旧」，
+      // 按正序把它排到最前、按倒序把它排到最后，两次得到的都不是用户问的东西。
+      if ((ta === 0) !== (tb === 0)) return ta === 0 ? -1 : 1
+      if (ta !== tb) return sort === 'newest' ? tb - ta : ta - tb
+    }
     const ba = worstBadge(a.badges)
     const bb = worstBadge(b.badges)
     const ra = ba ? badgeRank(ba) : -1
@@ -482,6 +522,32 @@ function loadPins(): string[] {
 }
 
 export const pinnedSkills = ref<string[]>(loadPins())
+
+const SORT_KEY = 'toolsSkillSort:v1'
+
+function loadSort(): SkillSort {
+  try {
+    const raw = localStorage.getItem(SORT_KEY)
+    return SKILL_SORTS.includes(raw as SkillSort) ? (raw as SkillSort) : 'newest'
+  } catch {
+    return 'newest'
+  }
+}
+
+/**
+ * 当前次序。存下来 —— 这是「我习惯怎么看这一列」，不是一次性的动作，每开一次面板
+ * 重新选一遍是纯粹的重复劳动。
+ */
+export const skillSort = ref<SkillSort>(loadSort())
+
+export function setSkillSort(sort: SkillSort) {
+  skillSort.value = sort
+  try {
+    localStorage.setItem(SORT_KEY, sort)
+  } catch {
+    // 隐私模式下 localStorage 会抛。次序没记住不影响这个面板能用。
+  }
+}
 
 export function isSkillPinned(name: string): boolean {
   return pinnedSkills.value.includes(name)

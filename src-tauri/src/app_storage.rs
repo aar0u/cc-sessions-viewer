@@ -245,6 +245,14 @@ pub fn storage_usage(app: AppHandle) -> Result<Vec<StorageUsageEntry>, String> {
             crate::storage_gc::total_bytes(&data.join("image-cache")),
             true,
         ),
+        // 「发现」面板为了看详情拉下来的浅克隆。删了只是下次打开详情慢 3 秒，
+        // 已装的 skill 一个都不受影响 —— 它是加速，不是数据。
+        entry(
+            "skillRegistry",
+            data.join("skill-registry"),
+            crate::storage_gc::total_bytes(&data.join("skill-registry")),
+            true,
+        ),
         entry(
             "desktopPets",
             data.join("desktop-pets"),
@@ -299,6 +307,8 @@ pub fn clear_storage(app: AppHandle, key: String) -> Result<u64, String> {
         "attachments" => Ok(clear_dir(&data.join("attachments"))),
         // 内容寻址的缓存，删了下次读会话会重新写出来。
         "imageCache" => Ok(crate::image_cache::clear()),
+        // 缓存是加速不是数据：删了下次打开详情重新 clone 一次。
+        "skillRegistry" => Ok(crate::tools::registry_git::clear()),
         // 下次打开宠物设置会从内置资源 / Codex asar 重新装一遍。
         "desktopPets" => Ok(clear_dir(&data.join("desktop-pets"))),
         "logs" => {

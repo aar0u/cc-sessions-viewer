@@ -57,7 +57,9 @@ afterEach(() => {
 describe('the two layers', () => {
   it('shows escaped plain text before any highlighting has run', async () => {
     const { wrapper } = await editor('<a> & </a>')
-    expect(wrapper.get('.ce-hl').element.innerHTML).toBe('&lt;a&gt; &amp; &lt;/a&gt;\n')
+    expect(wrapper.get('.ce-hl').element.innerHTML).toBe(
+      '<span class="ce-row">&lt;a&gt; &amp; &lt;/a&gt;</span>',
+    )
   })
 
   it('upgrades to tokens once shiki comes back', async () => {
@@ -77,7 +79,7 @@ describe('the two layers', () => {
     highlightLines.mockResolvedValue(null)
     const { wrapper } = await editor('zzz', { lang: 'brainfuck' })
     await vi.waitFor(() => expect(highlightLines).toHaveBeenCalled())
-    expect(wrapper.get('.ce-hl').element.innerHTML).toBe('zzz\n')
+    expect(wrapper.get('.ce-hl').element.innerHTML).toBe('<span class="ce-row">zzz</span>')
   })
 
   it('stays on plain text when shiki throws', async () => {
@@ -85,7 +87,7 @@ describe('the two layers', () => {
     highlightLines.mockRejectedValue(new Error('too big'))
     const { wrapper } = await editor('boom', { lang: 'ts' })
     await vi.waitFor(() => expect(highlightLines).toHaveBeenCalled())
-    expect(wrapper.get('.ce-hl').element.innerHTML).toBe('boom\n')
+    expect(wrapper.get('.ce-hl').element.innerHTML).toBe('<span class="ce-row">boom</span>')
   })
 
   it('drops a highlight result that came back for text the user has already changed', async () => {

@@ -11,7 +11,6 @@ import {
   badgeCounts,
   bodyStores,
   chainLines,
-  deletableBody,
   removableLink,
   emptyFilter,
   filterSkills,
@@ -30,6 +29,8 @@ import {
   pinnedSkills,
   agentReach,
   sharedDirRef,
+  newestBody,
+  SKILL_SORTS,
   sortSkills,
   toggleSkillPin,
   visibleSkills,
@@ -287,34 +288,6 @@ describe('两跳链', () => {
   })
 })
 
-describe('能不能单独删这一份内容', () => {
-  it('只有「没人够得着的实体目录」才给删除按钮', () => {
-    expect(deletableBody(realDir(MAIN, 'x'))).toBe(true)
-  })
-
-  it('有 agent 直接读它的实体目录不给删 —— 那是「删除整个 skill」的事', () => {
-    expect(deletableBody({ ...realDir(MAIN, 'x'), agents: ['claude'], reachedBy: ['claude'] })).toBe(
-      false,
-    )
-  })
-
-  /**
-   * 真机上报出来的那一幕：`~/.skills-manager/skills/css-animations` 没有任何 agent
-   * 直接扫 `.skills-manager`，`agents` 是空的 —— 但 `~/.claude/skills/css-animations`
-   * 和 `~/.agents/skills/css-animations` 两条链最后都落在它身上。按 `agents` 判会在
-   * 那一行长出删除按钮，点下去两条链一起断。
-   */
-  it('被别人的链子指着的实体目录不给删，哪怕没人直接扫它所在的目录', () => {
-    expect(deletableBody(realDir(MAIN, 'x', ['claude', 'codex']))).toBe(false)
-  })
-
-  it('链接和断链都不给删 —— 拆入口走「停用」，清死链走「修链接」', () => {
-    expect(deletableBody(linked(CLAUDE, 'x', [`${MAIN}/x`]))).toBe(false)
-    expect(deletableBody(broken(CLAUDE, 'x', `${MAIN}/gone`))).toBe(false)
-    expect(deletableBody({ ...realDir(MAIN, 'x'), health: { state: 'managedCopy', detail: `${MAIN}/y` } })).toBe(false)
-  })
-})
-
 describe('没人读的活链接', () => {
   /**
    * 收编完成之后就是这一幕：旧 store（`~/.skills-manager`、`~/.cc-switch`）里各剩
@@ -346,18 +319,6 @@ describe('没人读的活链接', () => {
   /** 死链有「修链 · 清理死链」兜着，在这儿再开一个入口是两个按钮做同一件事。 */
   it('死链不给 —— 那条走「修链接」', () => {
     expect(removableLink(broken(CLAUDE, 'x', `${MAIN}/gone`))).toBe(false)
-  })
-
-  /** 两个按钮永远不会同时出现在一行上：一个只认实体，一个只认链接。 */
-  it('和「删这份内容」互斥，同一行上不会冒出两个垃圾桶', () => {
-    const rows = [
-      realDir(MAIN, 'x'),
-      linked(`${HOME}/.cc-switch/skills`, 'x', [`${MAIN}/x`]),
-      broken(CLAUDE, 'x', `${MAIN}/gone`),
-    ]
-    for (const r of rows) {
-      expect(deletableBody(r) && removableLink(r), r.health.state).toBe(false)
-    }
   })
 })
 
@@ -566,6 +527,117 @@ describe('排序', () => {
   it('visibleSkills 把置顶一路传到排序', () => {
     const out = visibleSkills(skills, emptyFilter(), [], ['git-push'])
     expect(out[0].name).toBe('git-push')
+  })
+})
+
+describe('按时间排', () => {
+  // 这一组自己造数据：上面那批 fixture 的 mtime 全一样（那正是它们在测别的东西时
+  // 需要的），往里塞时间差会把它们的断言全打乱。
+  function timed(name: string, modified: number | null, over: Partial<SkillEntry> = {}): SkillEntry {
+    return {
+      name,
+      refs: [realDir(MAIN, name)],
+      bodies: [body(MAIN, name, { modified })],
+      badges: [],
+      risk: 'none',
+      truncated: false,
+      description: null,
+      git: null,
+      ...over,
+    }
+  }
+
+  it('刚装的排最上面', () => {
+    // 列表每天要回答的是「我刚才装的那个在哪」。按健康度排会把它扔进 49 条的中段。
+    const out = sortSkills([timed('old', 1_000), timed('fresh', 9_000), timed('mid', 5_000)])
+    expect(out.map((s) => s.name)).toEqual(['fresh', 'mid', 'old'])
+  })
+
+  it('时间压过角标 —— 「哪些坏了」交给顶上那条健康条', () => {
+    const out = sortSkills([
+      timed('broken-but-old', 1_000, { badges: ['duplicate'], risk: 'high' }),
+      timed('clean-but-new', 9_000),
+    ])
+    expect(out.map((s) => s.name)).toEqual(['clean-but-new', 'broken-but-old'])
+  })
+
+  it('同名重复取最新那份的时间', () => {
+    // 用户问的是「这个名字最近动过没有」，不是「最老的那份多老」。
+    const dup = timed('dup', null, {
+      bodies: [body(MAIN, 'dup', { modified: 1_000 }), body(MID, 'dup', { modified: 9_000 })],
+    })
+    expect(newestBody(dup)).toBe(9_000)
+    expect(sortSkills([timed('other', 5_000), dup]).map((s) => s.name)).toEqual(['dup', 'other'])
+  })
+
+  it('一个时间戳都读不到的排最前，不是最后', () => {
+    // 那种条目多半压根没有实体目录（链接断了），它不是「很旧」而是「不在了」——
+    // 正是这个面板要喊的那一种。沉底等于把它藏起来。
+    const gone = timed('gone', null, { bodies: [], badges: ['broken'] })
+    expect(newestBody(gone)).toBe(0)
+    expect(sortSkills([timed('fresh', 9_000), gone]).map((s) => s.name)).toEqual(['gone', 'fresh'])
+  })
+
+  it('置顶仍然压过时间', () => {
+    const out = sortSkills([timed('fresh', 9_000), timed('old', 1_000)], ['old'])
+    expect(out.map((s) => s.name)).toEqual(['old', 'fresh'])
+  })
+
+  it('时间正序把最久没碰过的翻上来', () => {
+    // 另一个问题：「哪些是很久没动过的」—— 那通常就是该清掉的一批。
+    const out = sortSkills([timed('old', 1_000), timed('fresh', 9_000), timed('mid', 5_000)], [], '', 'oldest')
+    expect(out.map((s) => s.name)).toEqual(['old', 'mid', 'fresh'])
+  })
+
+  it('读不到时间的两档都排最前，不是正序排头倒序排尾', () => {
+    // 「没有时间」不是「很旧」。跟着正序沉到最后的话，同一条 skill 换个档就不见了。
+    const gone = timed('gone', null, { bodies: [] })
+    expect(sortSkills([timed('a', 9_000), gone], [], '', 'newest').map((s) => s.name)).toEqual(['gone', 'a'])
+    expect(sortSkills([timed('a', 9_000), gone], [], '', 'oldest').map((s) => s.name)).toEqual(['gone', 'a'])
+  })
+
+  it('按名称那一档整段时间判断都跳过', () => {
+    const out = sortSkills([timed('zeta', 9_000), timed('alpha', 1_000)], [], '', 'name')
+    expect(out.map((s) => s.name)).toEqual(['alpha', 'zeta'])
+  })
+
+  it('按名称是纯字母序，角标也不插队', () => {
+    // 选这一档是因为心里已经有名字、只想扫过去找到它。再让「坏的排前面」插一手，
+    // 找的那个还是不在该在的位置。
+    const out = sortSkills(
+      [timed('zeta', 1_000), timed('alpha', 9_000, { badges: ['broken'], risk: 'high' })],
+      [],
+      '',
+      'name',
+    )
+    expect(out.map((s) => s.name)).toEqual(['alpha', 'zeta'])
+  })
+
+  it('按名称时没有实体目录的也不再冒头', () => {
+    const gone = timed('zulu', null, { bodies: [], badges: ['broken'] })
+    expect(sortSkills([gone, timed('alpha', 9_000)], [], '', 'name').map((s) => s.name)).toEqual([
+      'alpha',
+      'zulu',
+    ])
+  })
+
+  it('换档不动置顶那一批', () => {
+    // 那一列的次序是用户自己攒出来的。
+    const all = [timed('fresh', 9_000), timed('old', 1_000), timed('mid', 5_000)]
+    for (const sort of SKILL_SORTS) {
+      expect(sortSkills(all, ['mid', 'old'], '', sort).slice(0, 2).map((s) => s.name)).toEqual([
+        'mid',
+        'old',
+      ])
+    }
+  })
+
+  it('visibleSkills 把次序一路传下去', () => {
+    const all = [timed('fresh', 9_000), timed('old', 1_000)]
+    expect(visibleSkills(all, emptyFilter(), [], [], 'oldest').map((s) => s.name)).toEqual([
+      'old',
+      'fresh',
+    ])
   })
 })
 

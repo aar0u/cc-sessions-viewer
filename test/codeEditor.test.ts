@@ -34,40 +34,51 @@ describe('escaping', () => {
   })
 })
 
+/** 一行的盒子。行号是这个盒子的 `::before` 画的，所以每一行都得是一个真元素。 */
+const R = (inner: string) => `<span class="ce-row">${inner}</span>`
+
 describe('the highlight layer', () => {
   it('wraps only the tokens that carry a colour', () => {
     const html = tokensToHtml([[{ content: 'let', color: '#f00' }, { content: ' x' }]])
-    expect(html).toBe('<span style="color:#f00">let</span> x\n')
+    expect(html).toBe(R('<span style="color:#f00">let</span> x'))
   })
 
   it('escapes inside the spans too', () => {
     const html = tokensToHtml([[{ content: '<div>', color: '#0f0' }]])
-    expect(html).toBe('<span style="color:#0f0">&lt;div&gt;</span>\n')
+    expect(html).toBe(R('<span style="color:#0f0">&lt;div&gt;</span>'))
   })
 
-  it('joins lines with a newline and appends exactly one more', () => {
-    // 末尾那个换行是两层高度对齐的关键：textarea 给结尾的 `\n` 留一行的高度，
-    // `<pre>` 不留，少了它光标走到文末时高亮整体上移一行。
+  it('puts every line in its own box, with nothing in between', () => {
+    // 行之间夹任何字符都不行：高亮层是 `pre-wrap`，一个换行就是一行空行，从第二行
+    // 起整层和 textarea 错开。
     const html = tokensToHtml([[{ content: 'a' }], [{ content: 'b' }]])
-    expect(html).toBe('a\nb\n')
+    expect(html).toBe(R('a') + R('b'))
   })
 
-  it('renders an empty line as an empty line, not as nothing', () => {
-    expect(tokensToHtml([[{ content: 'a' }], [], [{ content: 'b' }]])).toBe('a\n\nb\n')
+  it('renders an empty line as an empty box, not as nothing', () => {
+    expect(tokensToHtml([[{ content: 'a' }], [], [{ content: 'b' }]])).toBe(R('a') + R('') + R('b'))
   })
 
-  it('gives no tokens at all the same single trailing newline', () => {
-    expect(tokensToHtml([])).toBe('\n')
+  it('always has at least one line — an empty file still shows line 1', () => {
+    expect(tokensToHtml([])).toBe(R(''))
+    expect(plainToHtml('')).toBe(R(''))
   })
 
-  it('produces the same trailing newline without highlighting', () => {
-    // 两条路径的换行规则必须一模一样，否则上色跑完的那一刻整层会跳一行。
-    expect(plainToHtml('a\nb')).toBe('a\nb\n')
-    expect(plainToHtml('')).toBe('\n')
+  it('行数以正文为准，不以 token 行数为准', () => {
+    // 结尾那个 `\n` 要不要算最后一个空行，shiki 各版本不一样，而 textarea 一定给它
+    // 留一行的高度。少一行就是「光标走到文末，高亮整体上移一行」。
+    expect(tokensToHtml([[{ content: 'a' }]], 2)).toBe(R('a') + R(''))
+    // 多出来的 token 行也不画：正文只有一行，就只有一行。
+    expect(tokensToHtml([[{ content: 'a' }], [{ content: 'b' }]], 1)).toBe(R('a'))
+  })
+
+  it('分行规则两条路径一模一样，否则上色跑完那一刻整层会跳行', () => {
+    expect(plainToHtml('a\nb')).toBe(R('a') + R('b'))
+    expect(plainToHtml('a\nb')).toBe(tokensToHtml([[{ content: 'a' }], [{ content: 'b' }]]))
   })
 
   it('keeps a text that already ends in a newline distinguishable', () => {
-    expect(plainToHtml('a\n')).toBe('a\n\n')
+    expect(plainToHtml('a\n')).toBe(R('a') + R(''))
   })
 })
 

@@ -560,7 +560,7 @@ export function clearAllTabs() {
 
 // ============================ 主题 ============================
 
-function xtermTheme(isDark: boolean) {
+export function xtermTheme(isDark: boolean) {
   // xterm 的画布默认会用 theme.background 填满。启用自定义壁纸时改成
   // 透明，让终端 / Codex TUI 的空白区域能显示图片或视频；ANSI 显式设置
   // 背景色的内容仍维持原样，保证交互界面的信息层级。
@@ -647,11 +647,11 @@ function systemDarkActive(): boolean {
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
 }
 
-function isDarkActive(): boolean {
+export function isDarkActive(): boolean {
   return theme.value === 'dark' || theme.value === 'dracula' || (theme.value === 'system' && systemDarkActive())
 }
 
-function terminalColorScheme(): 'light' | 'dark' {
+export function terminalColorScheme(): 'light' | 'dark' {
   return isDarkActive() ? 'dark' : 'light'
 }
 
@@ -963,7 +963,7 @@ window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', (
 // ============================ base64 双向 ============================
 // btoa / atob 对多字节字符不友好，统一走 Uint8Array 转换 + 分块避免栈溢出。
 
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   let bin = ''
   const CHUNK = 0x8000
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -973,7 +973,7 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin)
 }
 
-function base64ToBytes(b64: string): Uint8Array {
+export function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64)
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)

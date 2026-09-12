@@ -6,6 +6,8 @@ import {
   TOOLS_LIST_MAX_WIDTH,
   TOOLS_LIST_MIN_WIDTH,
   TAB_CAPABILITY,
+  tabAutoFocusesSearch,
+  tabUsesAgentFilter,
   TAB_LABEL,
   TOOL_TABS,
   activeToolsAgents,
@@ -29,8 +31,16 @@ import { HOOK_STATES } from '../src/toolsHooks'
 import { BADGE_ORDER, RISK_ORDER } from '../src/toolsSkills'
 import { STEP_KINDS } from '../src/toolsSkillsActions'
 import { BUNDLE_CATEGORIES } from '../src/toolsBundle'
+import { HIT_SORTS } from '../src/toolsRegistry'
 import { ALL_AGENTS, setLang, type Lang } from '../src/settings'
-import type { FileStatus, RefHealth, RiskContext, StepNote } from '../src/types'
+import type {
+  FileStatus,
+  PreviewErrKind,
+  RefHealth,
+  RegistryErrKind,
+  RiskContext,
+  StepNote,
+} from '../src/types'
 import { t } from '../src/i18n'
 
 /** 这三组联合类型在 types.ts 里没有运行时值，列一遍；漏一个编译就报错。 */
@@ -77,6 +87,19 @@ const HOOK_BLOCK_REASONS = [
   'emptyCommand',
   'alreadyThere',
 ] as const
+/** 接口只回这两种。多词查询会切到语义搜索，两个都得有文案。 */
+const SEARCH_TYPES = ['fuzzy', 'semantic'] as const
+
+const REGISTRY_ERR_KINDS: RegistryErrKind[] = ['offline', 'tooShort', 'http', 'badJson']
+
+const PREVIEW_ERR_KINDS: PreviewErrKind[] = [
+  'notInstallable',
+  'cache',
+  'clone',
+  'notFound',
+  'checkout',
+]
+
 const MCP_BLOCK_REASONS = [
   'unsupported',
   'noWritableSource',
@@ -88,14 +111,52 @@ const MCP_BLOCK_REASONS = [
 ] as const
 
 describe('tab', () => {
-  it('四个面板，次序固定', () => {
-    expect(TOOL_TABS).toEqual(['mcp', 'skills', 'hooks', 'memo'])
+  it('五个面板，次序固定', () => {
+    // discover 夹在 skills 和 hooks 中间：它装出来的东西就落在 Skills 面板里，
+    // 两者是同一件事的「找」和「管」两半，隔开只会让人来回跳。
+    expect(TOOL_TABS).toEqual(['mcp', 'skills', 'discover', 'hooks', 'memo'])
   })
 
-  it('每个 tab 都有文案和能力位，漏一个就会渲染成空白', () => {
+  it('每个 tab 都有文案，漏一个就会渲染成空白', () => {
     for (const tab of TOOL_TABS) {
       expect(TAB_LABEL[tab]).toMatch(/^tools\.tab\./)
-      expect(TAB_CAPABILITY[tab]).toBeTruthy()
+    }
+  })
+
+  /**
+   * 能力位要么是 `ToolCapabilities` 的合法键，要么**显式**为 null。
+   *
+   * 原来这条断言写的是 `toBeTruthy()`，那等于规定「每个面板都必须对应某一家 agent
+   * 的某个能力」—— discover 搜的是 skills.sh，跟本机装了哪几家毫无关系，硬塞一个
+   * 能力位进去就是在声称「某家 agent 不支持搜索」，那是假的。
+   *
+   * 但也不能干脆不检查：漏写一项会得到 `undefined`，而 `undefined` 和「我想好了，
+   * 这个面板跟 agent 无关」长得一样。所以要求 `null` 必须是**写出来**的。
+   */
+  it('能力位要么是合法字段，要么显式写成 null', () => {
+    const fields = ['mcp', 'skills', 'hooks', 'globalMemo']
+    for (const tab of TOOL_TABS) {
+      expect(tab in TAB_CAPABILITY).toBe(true)
+      const cap = TAB_CAPABILITY[tab]
+      if (cap !== null) expect(fields).toContain(cap)
+    }
+    expect(TAB_CAPABILITY.discover).toBeNull()
+  })
+
+  /** 只有 discover 不认 agent 勾选 —— 压暗那一排靠的就是这个。 */
+  it('只有发现面板不吃 agent 过滤', () => {
+    for (const tab of TOOL_TABS) {
+      expect(tabUsesAgentFilter(tab)).toBe(tab !== 'discover')
+    }
+  })
+
+  /**
+   * 也只有 discover 抢焦点。另外四个一进去就有内容，抢焦点会打断「先看看有什么」；
+   * 发现面板一进去是空的，不输入就永远是空的。
+   */
+  it('只有发现面板进去就抢搜索框的焦点', () => {
+    for (const tab of TOOL_TABS) {
+      expect(tabAutoFocusesSearch(tab)).toBe(tab === 'discover')
     }
   })
 
@@ -223,6 +284,7 @@ describe('文案', () => {
     'tools.back',
     'tools.agentFilter',
     'tools.agentFilterHint',
+    'tools.agentFilterOff',
     'tools.filterReset',
     'tools.healthPending',
     'tools.listPane',
@@ -233,6 +295,55 @@ describe('文案', () => {
     'settings.shortcut.tools',
     ...TOOL_TABS.map((tab) => TAB_LABEL[tab]),
     ...TOOL_TABS.map((tab) => `tools.search.${tab}`),
+    // 发现面板。四个错误分类和两档排序都是拼接 key，漏一种只会在界面上蹦出 key 字面量。
+    'tools.discover.idle',
+    'tools.discover.idleHint',
+    'tools.discover.tooShort',
+    'tools.discover.loading',
+    'tools.discover.empty',
+    'tools.discover.found',
+    'tools.discover.searchTypeTip',
+    'tools.discover.installed',
+    'tools.discover.installedTip',
+    'tools.discover.badge.installed',
+    'tools.discover.badge.blocked',
+    'tools.discover.blockedTip',
+    'tools.discover.blockedNote',
+    'tools.discover.installsTip',
+    'tools.discover.retry',
+    'tools.discover.detailPending',
+    'tools.discover.errDetail',
+    'tools.discover.openRepo',
+    'tools.discover.openPage',
+    'tools.discover.copyAndInstall',
+    'tools.discover.closeTerminal',
+    'tools.discover.terminal',
+    'tools.discover.terminalHint',
+    'tools.discover.ran',
+    'tools.discover.detail.source',
+    'tools.discover.detail.repo',
+    'tools.discover.detail.id',
+    'tools.discover.detail.installs',
+    'tools.discover.detail.path',
+    'tools.discover.detail.commit',
+    'tools.discover.detail.otherPaths',
+    'tools.discover.detail.cached',
+    'tools.discover.detail.noFrontmatter',
+    'tools.discover.detail.truncated',
+    'tools.discover.loadingDetail',
+    'tools.discover.refreshPreview',
+    ...SEARCH_TYPES.map((k) => `tools.discover.searchType.${k}`),
+    ...HIT_SORTS.map((s) => `tools.discover.sort.${s}`),
+    ...REGISTRY_ERR_KINDS.map((k) => `tools.discover.err.${k}`),
+    ...PREVIEW_ERR_KINDS.map((k) => `tools.discover.perr.${k}`),
+    // 详情三节和本地 Skills 面板共用组件，所以它用的也是那边的 key ——
+    // 漏一个的表现是发现面板里蹦出 `tools.skills.risk.high` 这样的字面量。
+    'tools.skills.findings',
+    'tools.skills.frontmatter',
+    'tools.skills.files',
+    'tools.skills.truncatedRisk',
+    'tools.skills.downgraded',
+    'tools.skills.loadingDetail',
     // Skills 面板。枚举出来的那几组尤其容易漏：模板里写的是 `tools.skills.step.${s.kind}`
     // 这种拼接 key，少一种取值不会有任何编译期提示，只会在计划框里蹦出一行 key 字面量。
     'tools.skills.total',
@@ -642,8 +753,13 @@ describe('文案', () => {
     expect(MEMO_TARGET_KINDS).toHaveLength(3)
     expect(MEMO_BLOCKS).toHaveLength(3)
     expect(BUNDLE_PROBLEMS).toHaveLength(3)
-    // 四类和四个面板一一对应；对不上的话弹框里那四行标题会蹦出 key 字面量。
-    expect([...BUNDLE_CATEGORIES].sort()).toEqual([...TOOL_TABS].sort())
+    // 配置集的四类必须都是真实存在的面板（弹框里那四行标题直接用面板的文案），
+    // 但**不是每个面板都有东西可打包** —— discover 搜的是网上有什么，本机没有对应
+    // 的配置可导出。所以是子集关系，不是相等。
+    expect(BUNDLE_CATEGORIES.every((c) => (TOOL_TABS as readonly string[]).includes(c))).toBe(true)
+    expect([...TOOL_TABS].filter((tab) => !BUNDLE_CATEGORIES.includes(tab as never))).toEqual([
+      'discover',
+    ])
     expect(BUNDLE_IMPORTABLE).toHaveLength(3)
   })
 

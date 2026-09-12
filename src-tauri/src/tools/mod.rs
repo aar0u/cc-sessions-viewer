@@ -18,6 +18,8 @@ pub mod hooks_write;
 pub mod link;
 pub mod mcp;
 pub mod mcp_write;
+pub mod registry;
+pub mod registry_git;
 pub mod bundle;
 pub mod memo;
 pub mod memo_merge;
@@ -1143,8 +1145,12 @@ impl ToolSurface for OpencodeSurface {
     }
 }
 
-/// agy 只有目录级的 `GEMINI.md` / `AGENTS.md`（从 cwd 往上找），没有 home 级全局约定，
-/// 所以不给 `memo_path` —— 全局配置面板对它是禁用态。
+/// agy 的全局指令在 `~/.gemini/config/` 下，见 [`AgySurface::memo_path`]。
+///
+/// 这里原先写的是「只有目录级的 `GEMINI.md` / `AGENTS.md`（从 cwd 往上找），没有 home
+/// 级全局约定」——**错了**，那只看了「目录规则逐层往上找」那一档。`~/.gemini/config/`
+/// 本身就是一个定制根，根下的 `GEMINI.md` / `AGENTS.md` 是全局规则。照旧结论走，面板
+/// 对 agy 是禁用态，用户写在那儿的一整套全局规则一个字都看不到。
 pub struct AgySurface;
 impl ToolSurface for AgySurface {
     fn config_home(&self) -> Option<PathBuf> {
@@ -1191,6 +1197,28 @@ impl ToolSurface for AgySurface {
     fn hooks_config_path(&self) -> Option<PathBuf> {
         Some(agy_config_dir().join("hooks.json"))
     }
+    /// 全局规则：`~/.gemini/config/` 是它的**全局定制根**，根下的标准规则文件就是
+    /// 「Rules … 或者独立的 `GEMINI.md` / `AGENTS.md` 文件」（agy 1.2.1 二进制里自带的
+    /// 定制文档，`## Customization Elements` 那节）。
+    ///
+    /// 两个名字都认，所以取现存的那个（见 [`agy_global_memo`]）；两份都在时另一份进
+    /// `memo_extra_sources` —— 它是**两份都读**（规则按解析后的路径去重，不是二选一），
+    /// 少报一份，面板上的「生效内容」就比 agy 实际读到的少一截。
+    ///
+    /// 全局根下的 `rules/*.md` 不在这儿报：那些带 frontmatter，只有 `always_on` 的才
+    /// 无条件加载，报成「全局指令」会把 `model_decision` 的那几份说成一直生效。
+    fn memo_path(&self) -> Option<PathBuf> {
+        Some(agy_global_memo())
+    }
+    fn memo_extra_sources(&self) -> Vec<PathBuf> {
+        let dir = agy_config_dir();
+        let own = agy_global_memo();
+        AGY_MEMO_NAMES
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| *path != own && path.is_file())
+            .collect()
+    }
     fn hook_format(&self) -> HookFormat {
         HookFormat::AgyJson
     }
@@ -1213,12 +1241,27 @@ fn agy_config_dir() -> PathBuf {
     home().join(".gemini").join("config")
 }
 
-/// Pi 的 MCP 由 `npm:pi-mcp-adapter` 提供、全局指令由 `npm:pi-memory` 提供，都是可装可
-/// 不装的扩展，所以这两个能力位要**看扩展装没装**，不能因为本机恰好装了就写死。没装
-/// `pi-memory` 的用户，`~/.pi/agent/memory/MEMORY.md` 写了也没人读——给他一个能编辑的
-/// 面板等于骗他白写。
+/// agy 全局根下的规则文件名。两个都认，`GEMINI.md` 在前 —— 它自己的文档两处都把
+/// `GEMINI.md` 写在前面，一份都没有时也该按这个名字新建。
+const AGY_MEMO_NAMES: &[&str] = &["GEMINI.md", "AGENTS.md"];
+
+/// agy 现在实际读的那份全局规则。两份都在时报第一个，另一份由 `memo_extra_sources`
+/// 补上。
+fn agy_global_memo() -> PathBuf {
+    let dir = agy_config_dir();
+    AGY_MEMO_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join(AGY_MEMO_NAMES[0]))
+}
+
+/// Pi 的 MCP 由 `npm:pi-mcp-adapter` 提供，是可装可不装的扩展，所以那个能力位要**看
+/// 扩展装没装**，不能因为本机恰好装了就写死。
 ///
-/// **skills 不一样，它是内建的**，见 `skills_dir`。
+/// **skills 和全局指令都是内建的**，见 `skills_dir` / `memo_path`。`npm:pi-memory` 的
+/// `~/.pi/agent/memory/MEMORY.md` 是它**额外**喂进去的一份，不是 Pi 的约定文件——这两件
+/// 事一度被记成同一件，于是面板把没装扩展的机器整片报成「Pi 没有全局指令」。
 pub struct PiSurface;
 impl ToolSurface for PiSurface {
     fn config_home(&self) -> Option<PathBuf> {
@@ -1305,8 +1348,21 @@ impl ToolSurface for PiSurface {
         ));
         out
     }
+    /// 全局指令是 pi **内建**的，不看扩展：`loadProjectContextFiles()` 无条件先从
+    /// `agentDir` 读一份（0.85.1 bundle `chunk-JVUZSMYM.js`），候选名和项目级那套一样，
+    /// 见 [`pi_global_memo`]。
     fn memo_path(&self) -> Option<PathBuf> {
-        pi_has_package("npm:pi-memory").then(|| pi_agent_dir().join("memory").join("MEMORY.md"))
+        Some(pi_global_memo())
+    }
+    /// `npm:pi-memory` 会把 `~/.pi/agent/memory/MEMORY.md` 也喂进上下文。它不是约定文件
+    /// （约定文件是上面那份 `AGENTS.md`），但装了扩展的机器上确实有人读——不报出来的话，
+    /// 面板显示的「生效内容」比 pi 实际读到的少一份。
+    fn memo_extra_sources(&self) -> Vec<PathBuf> {
+        if pi_has_package("npm:pi-memory") {
+            vec![pi_agent_dir().join("memory").join("MEMORY.md")]
+        } else {
+            Vec::new()
+        }
     }
     /// skills 是 pi **原生**的，不像 MCP / 全局指令那样要装扩展 —— 它的加载器把
     /// `<agentDir>/skills` 和 `<cwd>/.pi/skills` 写成了默认档（`includeDefaults`），不看
@@ -1357,6 +1413,32 @@ fn pi_agent_dir() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".pi").join("agent"))
+}
+
+/// Pi 读全局指令时认的文件名，**顺序即优先级**，取第一个存在的。原样抄自 0.85.1
+/// bundle 的 `loadContextFileFromDir()`：
+/// `["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`。
+/// 同一个函数既用于项目目录也用于 `agentDir`，所以全局这份也吃这套候选。
+const PI_MEMO_NAMES: &[&str] = &[
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
+
+/// Pi 现在实际读的那份全局指令。
+///
+/// 一个都不存在时报 `AGENTS.md` —— 面板拿这个路径当「新建」的落点，而 `AGENTS.md` 是
+/// 这五个名字里唯一该由我们写出来的那个（`.override.` 是用来盖掉别的，大写那两个是
+/// 兼容老写法）。
+fn pi_global_memo() -> PathBuf {
+    let dir = pi_agent_dir();
+    PI_MEMO_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join("AGENTS.md"))
 }
 
 /// Pi 的扩展装在 `~/.pi/agent/settings.json` 的 `packages` 数组里。
@@ -1529,17 +1611,10 @@ mod tests {
             ("grok", true, true, true, true),
             ("kimicode", true, true, true, true),
             ("opencode", true, true, false, true),
-            ("agy", true, true, true, false),
-            // Pi 的 MCP 和全局指令都由可选扩展提供，所以这两格跟着本机装没装走 ——
-            // 写死的话，换一台没装那两个包的机器这条就会红。
-            // skills 那格相反：它是内建的，和装没装扩展无关。
-            (
-                "pi",
-                pi_has_package("npm:pi-mcp-adapter"),
-                true,
-                false,
-                pi_has_package("npm:pi-memory"),
-            ),
+            ("agy", true, true, true, true),
+            // Pi 只有 MCP 那格跟着本机装没装扩展走 —— 写死的话，换一台没装
+            // `pi-mcp-adapter` 的机器这条就会红。skills 和全局指令都是内建的。
+            ("pi", pi_has_package("npm:pi-mcp-adapter"), true, false, true),
         ];
         for (agent, mcp, skills, hooks, memo) in expect {
             let caps = surface(agent).unwrap().capabilities();
@@ -1989,9 +2064,37 @@ mod tests {
     }
 
     #[test]
-    fn only_opencode_declares_extra_instruction_sources() {
+    fn agys_global_memo_lives_under_its_global_customization_root() {
+        // 这条一度写成「agy 没有 home 级全局约定」，面板对它整片禁用。它自带的定制文档
+        // 把 `~/.gemini/config/` 列为全局定制根，根下的独立 `GEMINI.md` / `AGENTS.md`
+        // 就是全局规则。
+        let s = surface("agy").unwrap();
+        assert!(s.capabilities().global_memo);
+        let own = s.memo_path().expect("agy 的全局规则在全局定制根下");
+        assert!(
+            own.starts_with(agy_config_dir()),
+            "{own:?} 不在 ~/.gemini/config 下"
+        );
+        assert!(
+            AGY_MEMO_NAMES.contains(&own.file_name().unwrap().to_str().unwrap()),
+            "{own:?} 不是 agy 认的规则文件名"
+        );
+        // 额外那份只会是另一个名字，且一定和约定路径不是同一个文件。
+        for extra in s.memo_extra_sources() {
+            assert_ne!(extra, own);
+            assert!(AGY_MEMO_NAMES.contains(&extra.file_name().unwrap().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn only_opencode_pi_and_agy_declare_extra_instruction_sources() {
+        // 「额外来源」是约定路径之外、这家确实还会读的那些：opencode 的 `instructions`
+        // 数组、pi 的 `npm:pi-memory`、agy 全局根下的第二个规则文件名。别家凭空多报一个
+        // 文件，面板就会说 agent 读了一份它根本没读的东西。
         for agent in AGENTS {
-            if *agent == "opencode" {
+            // agy 只在 `GEMINI.md` 和 `AGENTS.md` 两份都在时才多报一份（另一份也会被
+            // 读），所以它进不进这张表跟本机有什么文件有关，不能反过来断言它一定有。
+            if matches!(*agent, "opencode" | "pi" | "agy") {
                 continue;
             }
             assert!(
@@ -2080,12 +2183,24 @@ mod tests {
     }
 
     #[test]
-    fn pi_only_claims_a_global_memo_when_the_extension_is_installed() {
-        // Pi 的 MEMORY.md 是 npm:pi-memory 维护的。没装就没人读，不能给编辑面板。
-        let installed = pi_has_package("npm:pi-memory");
+    fn pis_global_memo_is_native_and_the_extension_only_adds_one() {
+        // 这条一度写反：把 `npm:pi-memory` 的 MEMORY.md 当成了 Pi 的约定文件，于是没装
+        // 扩展的机器被报成「Pi 没有全局指令」。Pi 自己无条件读 `<agentDir>/AGENTS.md`
+        // （https://pi.dev/docs/latest/quickstart#give-pi-project-instructions）。
         let s = surface("pi").unwrap();
-        assert_eq!(s.capabilities().global_memo, installed);
-        assert_eq!(s.memo_path().is_some(), installed);
+        assert!(s.capabilities().global_memo);
+        let own = s.memo_path().expect("pi 的全局指令是内建的");
+        assert!(own.starts_with(pi_agent_dir()), "{own:?} 不在 agent 目录下");
+        assert!(
+            PI_MEMO_NAMES.contains(&own.file_name().unwrap().to_str().unwrap()),
+            "{own:?} 不是 pi 认的候选名"
+        );
+        // 扩展只往上加一份，加不加都不影响约定文件那份。
+        let extra = s.memo_extra_sources();
+        assert_eq!(extra.len(), usize::from(pi_has_package("npm:pi-memory")));
+        assert!(extra
+            .iter()
+            .all(|p| p.ends_with("memory/MEMORY.md") && p != &own));
     }
 
     #[test]

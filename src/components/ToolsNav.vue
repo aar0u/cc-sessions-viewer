@@ -9,7 +9,7 @@ import type { Agent } from '../types'
 import { t } from '../i18n'
 import * as api from '../api'
 import { agentLabel } from '../agentMeta'
-import { agentIcons, IconFileDoc, IconLayers, IconRefresh, IconSkill, IconWebhook } from './icons'
+import { agentIcons, IconCompass, IconFileDoc, IconLayers, IconRefresh, IconSkill, IconWebhook } from './icons'
 import SidebarFooter from './SidebarFooter.vue'
 import {
   TAB_LABEL,
@@ -20,6 +20,7 @@ import {
   isAgentOn,
   panelAgents,
   switchToolsTab,
+  tabUsesAgentFilter,
   toggleToolsAgent,
   toolsFilterDirty,
   toolsTab,
@@ -30,10 +31,11 @@ const emit = defineEmits<{
   (e: 'close'): void
 }>()
 
-// 四个入口各自的图标。次序由 TOOL_TABS 定，这里只管长相。
+// 五个入口各自的图标。次序由 TOOL_TABS 定，这里只管长相。
 const TAB_ICON: Record<ToolTab, Component> = {
   mcp: IconLayers,
   skills: IconSkill,
+  discover: IconCompass,
   hooks: IconWebhook,
   memo: IconFileDoc,
 }
@@ -43,6 +45,7 @@ const TAB_ICON: Record<ToolTab, Component> = {
 // 本机没装的（`~/.claude` 之类的配置目录都不存在）列出来只会是个点不出东西的空壳。
 const agents = computed(() => panelAgents())
 const shownCount = computed(() => agents.value.filter(isAgentOn).length)
+const agentFilterOn = computed(() => tabUsesAgentFilter(toolsTab.value))
 
 onMounted(() => void ensureInstalledAgents(() => api.toolSurfaces()))
 
@@ -55,14 +58,17 @@ function agentTip(agent: Agent) {
   <aside class="sidebar tools-nav" :aria-label="t('tools.title')">
     <div class="sidebar-top">
       <!-- agent 过滤器。列表项右侧那排角标也按这个次序，所以两处要用同一份 `agents`。 -->
-      <div class="tools-agent-row">
+      <!-- 「发现」面板搜的是 skills.sh，跟本机勾了哪几家没关系 —— 整排压暗不可点。
+           不压暗的话用户会以为勾掉几家能筛掉一些结果，点了却毫无反应。 -->
+      <div class="tools-agent-row" :class="{ inert: !agentFilterOn }">
         <button
           v-for="a in agents"
           :key="a"
           class="tools-agent"
           :class="{ off: !isAgentOn(a) }"
           :aria-pressed="isAgentOn(a)"
-          v-tooltip="agentTip(a)"
+          :disabled="!agentFilterOn"
+          v-tooltip="agentFilterOn ? agentTip(a) : t('tools.agentFilterOff')"
           @click="toggleToolsAgent(a)"
         >
           <component :is="agentIcons[a]" />
@@ -71,7 +77,7 @@ function agentTip(agent: Agent) {
       <div class="sidebar-sub">
         <span class="sidebar-sub-label">
           {{ t('tools.agentFilter') }} ·
-          {{ t('tools.agentFilterHint', { n: String(shownCount) }) }}
+          {{ agentFilterOn ? t('tools.agentFilterHint', { n: String(shownCount) }) : t('tools.agentFilterOff') }}
         </span>
         <!-- 只在动过过滤器时出现：清掉 agent 勾选和搜索词，但**留在当前面板**。 -->
         <button
@@ -120,6 +126,13 @@ function agentTip(agent: Agent) {
   padding: 2px;
   background: var(--surface-2);
   border-radius: 8px;
+}
+/* 整排不可用时压暗并吃掉指针事件 —— 光靠 disabled 视觉上看不出来。 */
+.tools-agent-row.inert {
+  opacity: 0.4;
+}
+.tools-agent-row.inert .tools-agent {
+  cursor: default;
 }
 .tools-agent {
   flex: 1;

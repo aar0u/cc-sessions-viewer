@@ -20,11 +20,11 @@ import type {
 } from './types'
 import { isAgentOn } from './toolsPanel'
 
-/** 左栏的一行：要么是一家 agent，要么是一个被引用进来的片段。 */
+/** 左栏的一行：一家 agent、一个被引用进来的片段，或者一份额外来源。 */
 export interface MemoRow {
   /** 列表 key。agent 行按 agent 排重（两家回退到同一个文件时不能挤成一行）。 */
   key: string
-  kind: 'agent' | 'fragment'
+  kind: 'agent' | 'fragment' | 'extra'
   agent: Agent | null
   /**
    * 点开它编辑哪个文件。null = 点不开（这家没有 home 级约定）。
@@ -48,9 +48,17 @@ export interface MemoRow {
  * - `missing` —— 自己那份没有，也没有回退（能新建）
  * - `unsupported` —— 这家没有 home 级约定，禁用态
  * - `fragment` —— 被 `@import` 进来的片段
- * - `broken` —— 片段的目标文件不存在
+ * - `extra` —— 约定路径之外、某家还会读进去的一份（pi 的 `MEMORY.md` 这种）
+ * - `broken` —— 片段 / 额外来源的目标文件不存在
  */
-export type MemoRowState = 'ok' | 'fallback' | 'missing' | 'unsupported' | 'fragment' | 'broken'
+export type MemoRowState =
+  | 'ok'
+  | 'fallback'
+  | 'missing'
+  | 'unsupported'
+  | 'fragment'
+  | 'extra'
+  | 'broken'
 
 function fileAt(scan: MemoScan | null, path: string | null): MemoFile | null {
   if (!scan || !path) return null
@@ -92,18 +100,26 @@ export function allMemoRows(scan: MemoScan | null): MemoRow[] {
   if (!scan) return []
   const rows: MemoRow[] = scan.agents.map((a) => agentRow(scan, a))
 
-  // 片段 = 被 import 进来的文件，且不是任何一家的约定路径（后者已经在上面了）。
+  // 剩下两类都不是任何一家的约定路径（那些已经在上面了）：
+  //
+  // - **片段** —— 被 `@import` 进来的。
+  // - **额外来源** —— 某家在约定文件之外还会读的一份：pi 的 `~/.pi/agent/memory/MEMORY.md`
+  //   （`npm:pi-memory` 喂的）、agy 全局根下的第二个规则文件、opencode `instructions`
+  //   里列的那些。不单列一行的话它们在这个面板上根本不存在，而 agent 确实在读 ——
+  //   这个面板的全部意义就是「别漏掉任何一份会进上下文的东西」。
   const owned = new Set(scan.agents.map((a) => a.path).filter(Boolean) as string[])
   for (const f of scan.files) {
-    if (f.importedBy === null || owned.has(f.path)) continue
+    if (owned.has(f.path)) continue
+    const extra = f.readers.some((r) => r.role === 'extra')
+    if (!extra && f.importedBy === null) continue
     rows.push({
       key: f.path,
-      kind: 'fragment',
+      kind: extra ? 'extra' : 'fragment',
       agent: null,
       path: f.path,
       own: f.path,
       name: f.name,
-      state: f.exists ? 'fragment' : 'broken',
+      state: !f.exists ? 'broken' : extra ? 'extra' : 'fragment',
       bytes: f.bytes,
     })
   }

@@ -33,6 +33,8 @@ import type {
   McpEdit,
   McpFileStamp,
   McpWriteReport,
+  RegistryPreview,
+  RegistrySearch,
   HookScan,
   HookEdit,
   HookWriteReport,
@@ -447,6 +449,9 @@ export const ptySpawnNew = (
     useReclaude,
   })
 
+/** 用户 home。内嵌终端的起步目录 —— `npx skills add` 在哪儿跑决定了它装到哪儿。 */
+export const homeDir = () => invoke<string>('home_dir')
+
 /** 启动一个纯 shell PTY（不跑任何 agent CLI）。 */
 export const ptySpawnShell = (
   cwd: string,
@@ -803,6 +808,29 @@ export const toolsScanHooks = (cwd?: string) =>
   invoke<HookScan>('tools_scan_hooks', { cwd: cwd ?? null })
 
 /** 改 hook 配置。同样一律先 dry-run 出计划。 */
+/**
+ * 在 skills.sh 上搜 skill。
+ *
+ * **这是四个本地面板之外唯一会发网络请求的调用。** 失败时 reject 的是一个
+ * `RegistryError` 对象而不是字符串，所以调用方要用 `registryErrorText()` 翻，
+ * 直接 `String(e)` 会得到 `[object Object]`。
+ */
+export const toolsRegistrySearch = (query: string, limit: number) =>
+  invoke<RegistrySearch>('tools_registry_search', { query, limit })
+
+/**
+ * 把这个 skill 从远端仓库取到本地缓存里，并描述它（frontmatter / 文件 / 风险）。
+ *
+ * **首次 3 秒级**（浅克隆 + sparse-checkout），同仓库的第二个 skill 快一个数量级。
+ * 所以调用方必须有骨架屏，且要能丢弃过期响应。失败时 reject 的是 `PreviewError`
+ * 对象，不是字符串。
+ *
+ * `refresh` = 忘掉缓存重新克隆。缓存是浅克隆，只看得见克隆那一刻的 HEAD，
+ * 仓库后来更新了不重新克隆是看不到的。
+ */
+export const toolsRegistryPreview = (source: string, skillId: string, refresh = false) =>
+  invoke<RegistryPreview>('tools_registry_preview', { source, skillId, refresh })
+
 export const toolsApplyHooks = (edits: HookEdit[], cwd: string | undefined, dryRun: boolean) =>
   invoke<HookWriteReport>('tools_apply_hooks', { edits, cwd: cwd ?? null, dryRun })
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 工具管理主区 —— 四个面板的容器。
+// 工具管理主区 —— 五个面板的容器。
 //
 // 形态依据方案文档 3.1 加上用户的当面纠正：它不是弹框。设置弹窗已经 9 个 tab 了，
 // 工具管理的信息密度（agent × 四类工具 × 状态）塞不进 880×640；而它又是跨项目跨
@@ -15,6 +15,7 @@ import ToolsSkillsPanel from './ToolsSkillsPanel.vue'
 import ToolsMcpPanel from './ToolsMcpPanel.vue'
 import ToolsHooksPanel from './ToolsHooksPanel.vue'
 import ToolsMemoPanel from './ToolsMemoPanel.vue'
+import ToolsDiscoverPanel from './ToolsDiscoverPanel.vue'
 import ToolsBundleModal from '../modals/ToolsBundleModal.vue'
 
 defineProps<{ cwd?: string }>()
@@ -47,6 +48,13 @@ const reloadKey = ref(0)
     v-else-if="toolsTab === 'mcp'"
     :key="reloadKey"
     :cwd="cwd"
+    @notify="(msg, error) => emit('notify', msg, error)"
+  />
+
+  <!-- 唯一一个发网络请求的面板。它不读磁盘，所以不接 `cwd`，也不参与 `reloadKey`
+       的重挂 —— 导入一份配置集不会让搜索结果过期。 -->
+  <ToolsDiscoverPanel
+    v-else-if="toolsTab === 'discover'"
     @notify="(msg, error) => emit('notify', msg, error)"
   />
 

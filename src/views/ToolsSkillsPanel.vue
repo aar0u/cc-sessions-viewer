@@ -35,13 +35,16 @@ import {
   BADGE_ORDER,
   agentsOf,
   chainLines,
-  deletableBody,
   removableLink,
   healthTip,
   agentReach,
   isSkillPinned,
   mainStoreOptions,
   pinnedSkills,
+  SKILL_SORTS,
+  setSkillSort,
+  skillSort,
+  type SkillSort,
   queryPath,
   riskIsConclusive,
   sharedDirRef,
@@ -77,6 +80,8 @@ import ConfirmModal from '../modals/ConfirmModal.vue'
 import SkillPlanModal from '../modals/SkillPlanModal.vue'
 import SkillConflictModal from '../modals/SkillConflictModal.vue'
 import SkillEditor from '../components/SkillEditor.vue'
+import SkillDetailSkeleton from '../components/SkillDetailSkeleton.vue'
+import SkillFindings from '../components/SkillFindings.vue'
 
 const props = defineProps<{ cwd?: string }>()
 const emit = defineEmits<{ (e: 'notify', msg: string, error?: boolean): void }>()
@@ -123,6 +128,7 @@ const list = computed(() =>
     { ...skillFilter.value, query: toolsQuery.value },
     [...toolsAgents.value],
     pinnedSkills.value,
+    skillSort.value,
   ),
 )
 
@@ -799,45 +805,6 @@ function supportsSkills(agent: Agent): boolean {
 
 // 骨架的宽度写死成一张不规则的表。等宽的骨架看起来像表格而不像列表，
 // 反而提示不出「这儿马上会是一行行长短不一的 skill」。
-/**
- * 详情骨架的三节：风险点 / Frontmatter / 文件。每行是一串灰条，照着那一节**真实行**
- * 的分段来：风险行是「等级药丸 + 规则名 + 出处」，frontmatter 是「键 + 值」，
- * 文件行是「图标 + 文件名 + 大小」。
- *
- * 一行画成一根通长的灰条是不行的 —— 详情栏有六七百像素宽，那看上去是几段正文，
- * 不像正在到位的记录。宽度也写死：每次点一条都重掷骰子的话，骨架自己会闪。
- */
-const DETAIL_SKEL = [
-  {
-    key: 'findings',
-    head: '74px',
-    rows: [
-      ['30px', '92px', '46%'],
-      ['30px', '108px', '38%'],
-      ['30px', '86px', '52%'],
-    ],
-  },
-  {
-    key: 'frontmatter',
-    head: '96px',
-    rows: [
-      ['62px', '22%'],
-      ['62px', '54%'],
-    ],
-  },
-  {
-    key: 'files',
-    head: '60px',
-    rows: [
-      ['15px', '26%', '40px'],
-      ['15px', '34%', '36px'],
-      ['15px', '22%', '44px'],
-      ['15px', '30%', '38px'],
-      ['15px', '19%', '42px'],
-    ],
-  },
-] as const
-
 const SKEL_ROWS = [
   { name: '46%', chip: '34px', desc: '88%' },
   { name: '62%', chip: '28px', desc: '71%' },
@@ -858,6 +825,14 @@ const SKEL_COUNT = 20
 // 滚动期间临时隐藏、停 140ms 再恢复，否则光标不动、内容在动时浮块会跟着抖。
 // （这段和那三个视图逐字相同，值得抽成 composable，但那要一次改四处，留给后面单独做。）
 const listEl = ref<HTMLElement>()
+/** 这一轮 `list` 变化是不是换次序引起的 —— 决定上面那个 watch 走哪一条。 */
+let sortJustChanged = false
+
+function changeSort(sort: SkillSort) {
+  if (sort === skillSort.value) return
+  sortJustChanged = true
+  setSkillSort(sort)
+}
 const spotlightEl = ref<HTMLElement>()
 let scrolling = false
 let scrollIdle = 0
@@ -907,6 +882,14 @@ function onListMouseLeave() {
 watch(list, async () => {
   resetSpotlight(listEl.value, spotlightEl.value)
   await nextTick()
+  // 换次序是个例外：这时候「把选中那行追回来」恰好是反的。用户点「按名称」问的是
+  // 「从头按字母看一遍」，而 `revealSelected` 会把列表停在那条 skill 的新位置上 ——
+  // 可能是第 37 条，屏幕上是一段中间，看上去像没排。
+  if (sortJustChanged) {
+    sortJustChanged = false
+    if (listEl.value) listEl.value.scrollTop = 0
+    return
+  }
   revealSelected(listEl.value, '.skill-row.active')
 })
 
@@ -1123,6 +1106,20 @@ function rowSubtitle(s: SkillEntry): string {
       @mouseover="onListMouseOver"
       @mouseleave="onListMouseLeave"
     >
+      <!-- 次序摆在列表列自己头上，不摆进健康条：健康条横跨列表和详情两栏，而排序
+           只管左边这一列；混在那一排角标里还会被当成又一个筛子。跟着列表一起滚会
+           在最需要它的时候（翻到一半想换个看法）滚没了，所以 sticky 钉住。 -->
+      <div v-if="summary" class="skill-sort" role="group" :aria-label="t('tools.skills.sortLabel')">
+        <button
+          v-for="s in SKILL_SORTS"
+          :key="s"
+          type="button"
+          class="tools-chip"
+          :class="{ active: skillSort === s }"
+          @click="changeSort(s)"
+        >{{ t(`tools.skills.sort.${s}`) }}</button>
+      </div>
+
       <p v-if="error" class="tools-placeholder error">{{ error }}</p>
       <div
         v-else-if="loading && !scan"
@@ -1376,6 +1373,21 @@ function rowSubtitle(s: SkillEntry): string {
             >
               <IconFolder />
             </button>
+            <!-- 每一份都能单独删。同一个 skill 常常一份在全局、一份在某个项目里
+                 （`~/.skills-manager/skills/X` 和 `~/apps/proj/.agents/skills/X`），
+                 而右上角那个「删除」是连同所有内容和入口一起清掉 —— 想只退掉全局那份、
+                 留着项目里那份，原来一个入口都没有。 -->
+            <button
+              type="button"
+              class="skill-reveal danger"
+              :disabled="busy"
+              v-tooltip="t('tools.skills.action.deleteBodyTip')"
+              :aria-label="t('tools.skills.action.deleteBody')"
+              @click="deleteBody(b.path)"
+            >
+              <span v-if="pending === `delBody:${b.path}`" class="chip-spinner" aria-hidden="true" />
+              <IconTrash v-else />
+            </button>
           </div>
         </div>
 
@@ -1444,18 +1456,6 @@ function rowSubtitle(s: SkillEntry): string {
               >
                 <IconFolder />
               </button>
-              <button
-                v-if="line.depth === 0 && deletableBody(r)"
-                type="button"
-                class="skill-reveal skill-chain-btn danger"
-                :disabled="busy"
-                v-tooltip="t('tools.skills.action.deleteBodyTip')"
-                :aria-label="t('tools.skills.action.deleteBody')"
-                @click="deleteBody(line.abs)"
-              >
-                <span v-if="pending === `delBody:${line.abs}`" class="chip-spinner" aria-hidden="true" />
-                <IconTrash v-else />
-              </button>
               <!-- 没人读的活链接：除了拆掉它没有别的出路。「停用」是按 agent 关的，
                    碰不到第三方 store 里这一条；「清理死链」只碰解析不到东西的。 -->
               <button
@@ -1474,25 +1474,13 @@ function rowSubtitle(s: SkillEntry): string {
           </div>
         </div>
 
-        <!-- 风险明细 -->
-        <div v-if="detail && detail.findings.length > 0" class="skill-section">
-          <h4>
-            {{ t('tools.skills.findings', { n: String(detail.findings.length) }) }}
-            <span v-if="detail.truncated" class="skill-note">{{ t('tools.skills.truncatedRisk') }}</span>
-          </h4>
-          <div v-for="(f, i) in detail.findings" :key="i" class="skill-finding">
-            <span class="skill-risk" :class="f.level">{{ t(`tools.skills.risk.${f.level}`) }}</span>
-            <span class="skill-finding-rule">{{ f.rule }}</span>
-            <span class="skill-meta">{{ f.file }}:{{ f.line }}</span>
-            <code class="skill-finding-code">{{ f.excerpt }}</code>
-            <span v-if="f.level !== f.baseLevel" class="skill-note">
-              {{ t('tools.skills.downgraded', {
-                base: t(`tools.skills.risk.${f.baseLevel}`),
-                context: t(`tools.skills.context.${f.context}`),
-              }) }}
-            </span>
-          </div>
-        </div>
+        <!-- 风险明细。和发现面板共用一个组件：装之前看到的和装完看到的必须一样。 -->
+        <SkillFindings
+          v-if="detail"
+          :findings="detail.findings"
+          :truncated="detail.truncated"
+          :heading="t('tools.skills.findings', { n: String(detail.findings.length) })"
+        />
 
         <!-- frontmatter -->
         <div v-if="detail?.frontmatter" class="skill-section">
@@ -1515,24 +1503,7 @@ function rowSubtitle(s: SkillEntry): string {
         <!-- 详情还在读。骨架照着下面三节的真实版式摆：标题 + 几行，让右半边先占住
              位置。只在**还没有内容**的时候出现 —— 刷新时旧内容留着原地换掉，
              把已经看得见的东西换成骨架比空着还难受。 -->
-        <div
-          v-if="detailLoading && !detail && !detailError"
-          class="skill-detail-skel"
-          role="status"
-          :aria-label="t('tools.skills.loadingDetail')"
-        >
-          <div v-for="sec in DETAIL_SKEL" :key="sec.key" class="skill-section">
-            <span class="skill-skel-bar head" :style="{ width: sec.head }" />
-            <div v-for="(row, i) in sec.rows" :key="i" class="skill-skel-line">
-              <span
-                v-for="(w, j) in row"
-                :key="j"
-                class="skill-skel-bar"
-                :style="{ width: w }"
-              />
-            </div>
-          </div>
-        </div>
+        <SkillDetailSkeleton v-if="detailLoading && !detail && !detailError" />
 
         <!-- 文件清单 -->
         <div v-if="detail && detail.files.length > 0" class="skill-section">
@@ -1741,9 +1712,19 @@ function rowSubtitle(s: SkillEntry): string {
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
 }
-.skill-reveal:hover {
+.skill-reveal:hover:not(:disabled) {
   background: var(--surface-hover);
   color: var(--text);
+}
+/* 删除那一个悬停变红 —— 和链路里那些垃圾桶（`.skill-chain-btn.danger`）同一套记号，
+   不然「打开目录」和「删掉目录」在同一行上长得一模一样。 */
+.skill-reveal.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.skill-reveal:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .skill-reveal :deep(svg) {
   width: 13px;
@@ -1809,6 +1790,22 @@ function rowSubtitle(s: SkillEntry): string {
 .skill-row.active {
   background: var(--surface-hover);
   border-color: var(--border);
+}
+.skill-sort {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* `.tools-list` 自己有 6px 8px 的内边距，这儿只补下边距，左右和行对齐。 */
+  padding: 2px 0 8px;
+  /* 钉住时底下会滚过一整列行，不给底色的话文字会叠在一起。负 margin + 同宽 padding
+     让底色铺满整列，包括 `.tools-list` 那 8px 的左右内边距。 */
+  position: sticky;
+  top: -6px;
+  z-index: 2;
+  margin: -6px -8px 0;
+  padding-inline: 8px;
+  padding-top: 8px;
+  background: var(--surface);
 }
 /* 置顶行左侧一条 brand 竖条 —— 和会话卡片的 `.sess-pinned` 同一套记号。 */
 .skill-row.pinned::before {
@@ -1972,40 +1969,11 @@ function rowSubtitle(s: SkillEntry): string {
 .skill-skel-bar.desc {
   height: 9px;
 }
-/* 详情骨架。详情是按名字单独读一次（走目录 + 逐个文件过风险规则），大的要两秒，
-   而左边点一下是瞬时的 —— 右半边空着两秒看上去像点了没反应。 */
-.skill-detail-skel {
-  display: flex;
-  flex-direction: column;
-}
-/* 标题条是 `.skill-section` 的直接子元素（行里那些在 flex 里已经被拉成块级了），
-   不显式 block 的话 span 还是行内，写死的 width 根本不生效。 */
-.skill-skel-bar.head {
-  display: block;
-  height: 12px;
-  margin-bottom: 10px;
-}
-.skill-detail-skel .skill-skel-line {
-  padding: 4px 0;
-}
-/* 每行头一段是药丸 / 图标那一格，圆一点、短一点，整行才有「一条记录」的形状。 */
-.skill-detail-skel .skill-skel-line .skill-skel-bar:first-child {
-  height: 13px;
-  border-radius: 999px;
-  flex-shrink: 0;
-}
-
 /* 整齐同步地闪会看成一块面板在呼吸；错开之后才像一条条正在到位的记录。 */
 .skill-skel-row:nth-child(2n) .skill-skel-bar {
   animation-delay: 0.12s;
 }
 .skill-skel-row:nth-child(3n) .skill-skel-bar {
-  animation-delay: 0.24s;
-}
-.skill-detail-skel .skill-section:nth-child(2n) .skill-skel-bar {
-  animation-delay: 0.12s;
-}
-.skill-detail-skel .skill-section:nth-child(3n) .skill-skel-bar {
   animation-delay: 0.24s;
 }
 .skill-skel-bar.desc {
@@ -2028,7 +1996,7 @@ function rowSubtitle(s: SkillEntry): string {
 }
 
 .skill-badge,
-.skill-risk,
+/* `.skill-risk` 的样式在 style.css（全局）—— 发现面板也要用同一个药丸。 */
 .skill-tag,
 .skill-health {
   flex-shrink: 0;
@@ -2052,19 +2020,6 @@ function rowSubtitle(s: SkillEntry): string {
 .skill-badge.copyStale {
   background: color-mix(in srgb, var(--brand) 14%, transparent);
   color: var(--brand);
-}
-.skill-risk {
-  background: var(--surface-2);
-  color: var(--text-dim);
-}
-/* 中危没有专用 token，用 brand 做区分色 —— 只有高危和严重才配红。 */
-.skill-risk.medium {
-  color: var(--brand);
-}
-.skill-risk.high,
-.skill-risk.critical {
-  background: var(--danger-soft);
-  color: var(--danger);
 }
 .skill-tag {
   background: var(--surface-2);
@@ -2415,26 +2370,4 @@ function rowSubtitle(s: SkillEntry): string {
   cursor: default;
 }
 
-.skill-finding {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 4px 0;
-  border-bottom: 1px solid var(--border);
-}
-.skill-finding-rule {
-  font-size: 12px;
-  color: var(--text);
-}
-.skill-finding-code {
-  flex: 1;
-  min-width: 160px;
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-  font-size: 11px;
-  color: var(--text-mute);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 </style>

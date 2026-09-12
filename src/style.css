@@ -10133,3 +10133,78 @@ select.input {
 .tools-form-modal .modal-actions {
   margin-top: 18px;
 }
+
+/* 风险等级药丸。
+   在 style.css 而不是某个面板的 scoped 块里，是因为**两个面板要用同一个**：
+   本地 Skills 详情和「发现」面板装之前那一屏。同一个 `high` 在两处长得不一样的话，
+   用户没法把「这个比那个危险」这件事跨面板对起来。 */
+.skill-risk {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+/* 中危没有专用 token，用 brand 做区分色 —— 只有高危和严重才配红。 */
+.skill-risk.medium {
+  color: var(--brand);
+}
+.skill-risk.high,
+.skill-risk.critical {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* ---------------------------------------------------------------------------
+ * 骨架屏的公共零件
+ *
+ * 详情骨架（`SkillDetailSkeleton`）和列表骨架（`ToolsListSkeleton`）共用这一套条形和
+ * 这一条脉冲。两边各画一套的话，同一个应用里会出现两种「正在读」的语言 —— 闪的快慢
+ * 不一样、灰的深浅不一样，看上去像两个产品。
+ * ------------------------------------------------------------------------- */
+.skill-skel-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.skill-skel-bar {
+  height: 11px;
+  border-radius: 4px;
+  /* 不用 `--surface-hover`：那是给「悬停时比底色亮一点」用的，和底色差不到一档，
+     摊在那六百像素宽的空白上几乎看不见。跟着 `--text-mute` 调，深浅两套主题都
+     保证和底色分得开。 */
+  background: color-mix(in srgb, var(--text-mute) 26%, transparent);
+  animation: skill-skel-pulse 1.4s ease-in-out infinite;
+}
+/* 标题条是容器的直接子元素（行里那些在 flex 里已经被拉成块级了），不显式 block
+   的话 span 还是行内，写死的 width 根本不生效。 */
+.skill-skel-bar.head {
+  display: block;
+  height: 12px;
+  margin-bottom: 10px;
+}
+/* 每行头一段是药丸 / 图标那一格，圆一点、短一点，整行才有「一条记录」的形状。 */
+.skill-skel-line .skill-skel-bar:first-child {
+  height: 13px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+/* 整齐同步地闪会看成一块面板在呼吸；错开之后才像一条条正在到位的记录。 */
+@keyframes skill-skel-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skill-skel-bar {
+    animation: none;
+  }
+}

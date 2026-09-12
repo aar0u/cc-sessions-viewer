@@ -19,11 +19,12 @@
 //    拒绝盲写并给出「外面改了什么」的 diff。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { revealSelected } from '../listScroll'
-import { highlightSegments } from '../format'
+import { highlightSegments, renderText } from '../format'
 import type { MemoDiff, MemoDoc, MemoRevision, MemoScan } from '../types'
 import type { PlanView } from '../toolsPlan'
 import * as api from '../api'
 import { t } from '../i18n'
+import { theme } from '../settings'
 import { shortenPath } from '../toolsSkills'
 import { selectFirstRow, shownOfTotal, startToolsListResize, toolsQuery } from '../toolsPanel'
 import {
@@ -55,12 +56,15 @@ import {
   setMemoStore,
 } from '../toolsMemoActions'
 import { agentLabel } from '../agentMeta'
-import { langOfPath } from '../shikiHighlight'
+import { highlightAllCodeBlocks, langOfPath, rehighlightAllCodeBlocks } from '../shikiHighlight'
 import {
   agentIcons,
   IconExternalLink,
+  IconEye,
   IconFile,
+  IconFilePlus,
   IconFolder,
+  IconPencil,
   IconLink,
   IconRefresh,
   IconSave,
@@ -189,9 +193,37 @@ const saved = ref('')
 const rev = ref<MemoRevision | null>(null)
 const fileError = ref('')
 const busy = ref(false)
+/** 「现在建」之后要把光标送进去 —— 按完按钮还得自己点一下编辑区，等于没建。 */
+const editorEl = ref<InstanceType<typeof CodeEditor> | null>(null)
 
 const dirty = computed(() => text.value !== saved.value)
 const canEdit = computed(() => selected.value !== null && editable(selected.value))
+
+/**
+ * 右边默认是**读**。这几份文件绝大多数时候是拿来看的 —— 一上来就是编辑器，既容易误改，
+ * 又把写好的 markdown 拍回一堆 `##` 和 `**`。要改按「编辑」。
+ *
+ * 只有 markdown 有预览这回事，别的后缀（真出现了）只能是编辑器，所以真正生效的是
+ * `viewMode` 而不是 `mode`。
+ */
+const mode = ref<'read' | 'edit'>('read')
+const isMarkdown = computed(() => /\.mdx?$/i.test(openPath.value ?? ''))
+const viewMode = computed(() => (isMarkdown.value ? mode.value : 'edit'))
+const previewEl = ref<HTMLElement | null>(null)
+
+/* 预览里的围栏代码块交给 shiki，和聊天里那份是同一条路；换主题要重上色（颜色是烤进
+   行内 style 的，不跟 CSS 变量走）。 */
+watch(
+  [() => viewMode.value, () => text.value, () => openPath.value],
+  () => {
+    if (viewMode.value !== 'read') return
+    void nextTick(() => void highlightAllCodeBlocks(previewEl.value))
+  },
+  { immediate: true },
+)
+watch(theme, () => {
+  if (viewMode.value === 'read') void rehighlightAllCodeBlocks(previewEl.value)
+})
 
 /** 现在编辑的是不是「给这家新建的一份」—— 决定要不要显示接管提示。 */
 const takingOver = computed(
@@ -205,22 +237,48 @@ async function openFile(path: string, prefill?: string) {
     const doc = await api.toolsReadMemo(path)
     openPath.value = path
     rev.value = doc.revision
-    // 不存在的那种：后端回的是空正文加 `exists: false`。预填的优先级更高 —— 接管时
-    // 预填的是现在生效的内容，新建时是一行标题。
-    const body = doc.revision.exists ? doc.text : (prefill ?? template(path))
-    text.value = body
-    // 预填出来的内容算「没存」：它还不在磁盘上，`dirty` 必须是 true。
+    // 文件不存在时**不预填**：预填等于点一下列表就凭空造出一个未保存的改动，下一次
+    // 切行还要被拦住问「要不要丢弃」—— 用户什么都没写，却要替他决定丢不丢。右边改成
+    // 问一句「要现在建吗」，建不建他自己说。
+    //
+    // `prefill` 是显式动作带来的（「让这家接管」预填的是现在生效的那份内容），那种是
+    // 用户已经开口要了，直接进编辑器。
+    text.value = doc.revision.exists ? doc.text : (prefill ?? '')
     saved.value = doc.revision.exists ? doc.text : ''
+    drafting.value = !doc.revision.exists && prefill !== undefined
+    // 每换一个文件都回到「读」。唯一的例外是接管：那份正文是刚预填的，人就是来写的。
+    mode.value = prefill === undefined ? 'read' : 'edit'
   } catch (e) {
     openPath.value = path
     rev.value = null
     text.value = ''
     saved.value = ''
+    drafting.value = false
     fileError.value = String(e)
   } finally {
     busy.value = false
   }
 }
+
+/**
+ * 这个位置还没有文件，而用户已经说了「现在建」——从这一刻起右边才是编辑器。
+ *
+ * 单独记一个状态而不是看 `dirty`：把模板全删光再接着写是正常操作，那一瞬间 `dirty`
+ * 是 false，编辑器不能在手底下变回一张卡片。
+ */
+const drafting = ref(false)
+
+function startDraft() {
+  const path = openPath.value
+  if (!path || busy.value) return
+  text.value = template(path)
+  drafting.value = true
+  mode.value = 'edit'
+  void nextTick(() => editorEl.value?.focus())
+}
+
+/** 右边现在该画编辑器，还是画「要不要建」那张卡片。 */
+const showEditor = computed(() => rev.value?.exists === true || drafting.value)
 
 /** 点了另一行 / 另一个片段。当前这个改了没存就先问一句。 */
 const leaving = ref<{ key: string; path: string; prefill?: string } | null>(null)
@@ -301,9 +359,8 @@ onMounted(() => {
   window.addEventListener('focus', onFocus)
 })
 
-// 「自己那份还不存在」的行（`missing` / 断掉的片段 `broken`）不自动选：点开它们是
-// 预填一份模板，等于开面板就凭空造出一个未保存的改动，下一次切行会被拦住问"要不要
-// 丢弃"。用户自己点是他要的，自动点不是。
+// 「自己那份还不存在」的行（`missing` / 断掉的片段 `broken`）不自动选：开面板第一眼
+// 落在一个「这个文件还没有」的空位置上，说的是全机器最不重要的那件事。
 selectFirstRow(
   () => rows.value,
   () => selectedKey.value !== null,
@@ -714,6 +771,18 @@ function importRowKey(path: string) {
           >
             {{ t('tools.memo.action.takeover') }}
           </button>
+          <!-- 读 / 改来回切。默认在「读」，改完可以切回去看渲染后的样子。 -->
+          <button
+            v-if="showEditor && isMarkdown && canEdit"
+            type="button"
+            class="tools-act"
+            v-tooltip="mode === 'read' ? t('tools.memo.action.editTip') : t('tools.memo.action.readTip')"
+            @click="mode = mode === 'read' ? 'edit' : 'read'"
+          >
+            <IconPencil v-if="mode === 'read'" />
+            <IconEye v-else />
+            {{ mode === 'read' ? t('tools.memo.action.edit') : t('tools.memo.action.read') }}
+          </button>
           <button
             type="button"
             class="tools-act"
@@ -788,7 +857,7 @@ function importRowKey(path: string) {
               own: short(selected.own ?? ''),
             }) }}
           </p>
-          <p v-else-if="rev && !rev.exists" class="tools-note memo-note">
+          <p v-else-if="rev && !rev.exists && drafting" class="tools-note memo-note">
             {{ t('tools.memo.missingNote') }}
           </p>
 
@@ -865,8 +934,31 @@ function importRowKey(path: string) {
             </button>
           </div>
 
+          <!-- 还没有这个文件，而且用户还没说要建。**不替他建**：右边问一句，按钮他自己按。 -->
+          <div v-if="openPath && !showEditor" class="memo-create">
+            <IconFilePlus class="memo-create-icon" aria-hidden="true" />
+            <p class="memo-create-msg">{{ t('tools.memo.create.msg') }}</p>
+            <code class="memo-create-path">{{ short(openPath) }}</code>
+            <button
+              type="button"
+              class="btn primary memo-create-btn"
+              :disabled="busy"
+              v-tooltip="t('tools.memo.create.tip')"
+              @click="startDraft"
+            >
+              {{ t('tools.memo.create.btn') }}
+            </button>
+          </div>
+          <!-- 默认这一屏：渲染后的 markdown。改完切回来也看的是当前正文（含未保存的）。 -->
+          <div
+            v-else-if="openPath && viewMode === 'read'"
+            ref="previewEl"
+            class="memo-preview md"
+            v-html="renderText(text)"
+          />
           <CodeEditor
-            v-if="openPath"
+            v-else-if="openPath"
+            ref="editorEl"
             :key="openPath"
             v-model="text"
             :lang="langOfPath(openPath)"
@@ -946,7 +1038,10 @@ function importRowKey(path: string) {
   border-radius: 4px;
   background: var(--surface-2);
 }
+/* Tailwind 的 preflight 把 `svg` 设成了 `display: block` —— 这条注记是个普通 `<p>`，
+   不是 flex，图标于是自己占一行、`vertical-align` 也就没人理。写回 inline-block。 */
 .memo-note-ic {
+  display: inline-block;
   width: 12px;
   height: 12px;
   flex-shrink: 0;
@@ -1128,6 +1223,68 @@ function importRowKey(path: string) {
 .memo-editor {
   flex: 1;
   min-height: 0;
+}
+
+/* 读模式那一屏。边框、圆角、底色都跟编辑器一样 —— 来回切的时候框不动，只是里头的内容
+   从源码变成渲染结果。 */
+.memo-preview {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.memo-preview :deep(> *:first-child) {
+  margin-top: 0;
+}
+
+/* 「还没建」这一屏。给的是一句话加一个按钮，不是一个空编辑器 —— 空编辑器长得和
+   「这份是空的」一模一样，而这两件事差着一个文件。
+   画法照 `.empty` 那一套：居中一列、图标压淡，不套框 —— 一个虚线大框撑满整块内容区
+   只会把「什么都没有」放大一遍。 */
+.memo-create {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+.memo-create-icon {
+  width: 30px;
+  height: 30px;
+  color: var(--text-mute);
+  opacity: 0.5;
+  stroke-width: 1.3;
+}
+.memo-create-msg {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+/* 路径是这屏里唯一的事实，单独拎成一枚 chip；太长时自己横滚，不撑破内容区。 */
+.memo-create-path {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-mute);
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.memo-create-btn {
+  margin-top: 6px;
 }
 
 /* 没有 home 级约定的那几家在列表里压暗。禁用态的行仍然可点（右边要说明原因），

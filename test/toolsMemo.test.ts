@@ -2,7 +2,8 @@
 //
 // 装置数据照本机实测的形状造：`~/.claude/CLAUDE.md` 全文只有一行 `@RTK.md`（相对），
 // `~/.codex/AGENTS.md` 只有一行绝对路径的 `@…/RTK.md`，两个 RTK.md 内容已经漂了；
-// grok / opencode 自己那份没有、回退去读 Claude 的；agy 根本没有 home 级约定。
+// grok / opencode 自己那份没有、回退去读 Claude 的；pi 除了自己那份 `AGENTS.md`，
+// 还被 `npm:pi-memory` 额外喂一份 `MEMORY.md`。
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import type { MemoAgentInfo, MemoFile, MemoScan } from '../src/types'
@@ -33,6 +34,9 @@ const CODEX_MD = `${HOME}/.codex/AGENTS.md`
 const CODEX_RTK = `${HOME}/.codex/RTK.md`
 const GROK_MD = `${HOME}/.grok/AGENTS.md`
 const OPENCODE_MD = `${HOME}/.config/opencode/AGENTS.md`
+const AGY_MD = `${HOME}/.gemini/config/GEMINI.md`
+const PI_MD = `${HOME}/.pi/agent/AGENTS.md`
+const PI_MEMORY = `${HOME}/.pi/agent/memory/MEMORY.md`
 
 const rev = (size: number) => ({ exists: size > 0, size, mtimeMs: size > 0 ? 1_700_000_000_000 : null })
 
@@ -78,7 +82,7 @@ const scan: MemoScan = {
       effective: CLAUDE_MD,
       fallenBack: true,
     }),
-    agent({ agent: 'agy', supported: false }),
+    agent({ agent: 'agy', path: AGY_MD, exists: false }),
     agent({
       agent: 'opencode',
       path: OPENCODE_MD,
@@ -88,6 +92,13 @@ const scan: MemoScan = {
       fallenBack: true,
     }),
     agent({ agent: 'kimicode', path: `${HOME}/.kimi-code/AGENTS.md`, exists: false }),
+    agent({
+      agent: 'pi',
+      path: PI_MD,
+      exists: true,
+      effective: PI_MD,
+      extra: [PI_MEMORY],
+    }),
   ],
   files: [
     file({
@@ -126,6 +137,17 @@ const scan: MemoScan = {
       revision: rev(0),
       readers: [{ agent: 'opencode', role: 'own', active: false }],
     }),
+    file({
+      path: PI_MD,
+      bytes: 300,
+      readers: [{ agent: 'pi', role: 'own', active: true }],
+    }),
+    // 约定路径之外那一份：没人 import 它，只有 `role: 'extra'` 这一个身份。
+    file({
+      path: PI_MEMORY,
+      bytes: 2705,
+      readers: [{ agent: 'pi', role: 'extra', active: true }],
+    }),
   ],
   forks: [
     {
@@ -137,36 +159,58 @@ const scan: MemoScan = {
     },
   ],
   dups: [],
-  summary: { files: 6, present: 4, broken: 0, forks: 1, dups: 0 },
+  summary: { files: 8, present: 6, broken: 0, forks: 1, dups: 0 },
 }
 
 beforeEach(() => resetToolsPanel())
 
 describe('左栏', () => {
-  it('先七家 agent，再是被引用进来的片段', () => {
+  it('先七家 agent，再是片段和额外来源', () => {
     const rows = memoRows(scan, '')
-    expect(rows.filter((r) => r.kind === 'agent')).toHaveLength(6)
+    expect(rows.filter((r) => r.kind === 'agent')).toHaveLength(7)
     expect(rows.filter((r) => r.kind === 'fragment').map((r) => r.path)).toEqual([
       CLAUDE_RTK,
       CODEX_RTK,
     ])
   })
 
-  it('四种 agent 状态各自分清楚', () => {
+  // 不单列一行的话，pi 的 MEMORY.md 在这个面板上根本不存在 —— 而 pi 确实在读它。
+  it('约定路径之外、agent 还会读的那些也各占一行', () => {
+    const extras = memoRows(scan, '').filter((r) => r.kind === 'extra')
+    expect(extras.map((r) => r.path)).toEqual([PI_MEMORY])
+    expect(extras[0].state).toBe('extra')
+    expect(extras[0].name).toBe('MEMORY.md')
+    expect(editable(extras[0])).toBe(true)
+  })
+
+  it('额外来源的文件不在了就是断链，不是「额外读到」', () => {
+    const gone: MemoScan = {
+      ...scan,
+      files: scan.files.map((f) =>
+        f.path === PI_MEMORY ? { ...f, exists: false, bytes: 0, revision: rev(0) } : f,
+      ),
+    }
+    expect(allMemoRows(gone).find((r) => r.path === PI_MEMORY)!.state).toBe('broken')
+  })
+
+  it('三种 agent 状态各自分清楚', () => {
     const byAgent = Object.fromEntries(memoRows(scan, '').map((r) => [r.agent, r.state]))
     expect(byAgent.claude).toBe('ok')
     // 自己没有、实际读别人的 —— 和「什么都没有」不是一回事
     expect(byAgent.grok).toBe('fallback')
     // 自己没有、也没有回退，能新建
     expect(byAgent.kimicode).toBe('missing')
-    // 没有 home 级约定，禁用态
-    expect(byAgent.agy).toBe('unsupported')
   })
 
+  // 现在七家都有 home 级约定了（pi 是 `~/.pi/agent/AGENTS.md`，agy 是
+  // `~/.gemini/config/GEMINI.md`），但这一档由后端的 `memo_path()` 决定 —— 哪天多一家
+  // 没有这套机制的，行还得画得出来。
   it('不支持的那家点不开 —— 给个输入框让用户白写比什么都不给更糟', () => {
-    const agy = memoRows(scan, '').find((r) => r.agent === 'agy')!
-    expect(agy.path).toBeNull()
-    expect(editable(agy)).toBe(false)
+    const none: MemoScan = { ...scan, agents: [agent({ agent: 'agy', supported: false })] }
+    const row = memoRows(none, '').find((r) => r.agent === 'agy')!
+    expect(row.state).toBe('unsupported')
+    expect(row.path).toBeNull()
+    expect(editable(row)).toBe(false)
   })
 
   it('回退中的那一行点开的是**实际生效**的那份，不是自己那个空位置', () => {
@@ -203,6 +247,8 @@ describe('左栏', () => {
     expect(rows.filter((r) => r.kind === 'agent').map((r) => r.agent)).toEqual(['codex'])
     // 两个 RTK.md 都还在：`~/.claude/RTK.md` 是被 CLAUDE.md 引用的，而 CLAUDE.md 有三家在读
     expect(rows.filter((r) => r.kind === 'fragment')).toHaveLength(2)
+    // 额外来源同理：它挂在 pi 上，但点掉 pi 不该让这个文件从面板上消失
+    expect(rows.filter((r) => r.kind === 'extra')).toHaveLength(1)
   })
 
   it('搜文件名、搜路径、搜 agent 都算', () => {
@@ -228,18 +274,18 @@ describe('全量行', () => {
   it('agent 勾选也不管 —— 健康条的分母不该跟着过滤器缩水', () => {
     toggleToolsAgent('codex')
     expect(memoRows(scan, '').filter((r) => r.kind === 'agent')).toHaveLength(1)
-    expect(allMemoRows(scan).filter((r) => r.kind === 'agent')).toHaveLength(6)
+    expect(allMemoRows(scan).filter((r) => r.kind === 'agent')).toHaveLength(7)
   })
 
   it('搜索词也不管', () => {
     expect(memoRows(scan, 'rtk')).toHaveLength(2)
-    expect(allMemoRows(scan)).toHaveLength(8)
+    expect(allMemoRows(scan)).toHaveLength(10)
   })
 
   it('比后端数到的文件多 —— 这正是不能拿 summary.files 当分母的原因', () => {
-    // 六行 agent 里有三家自己那份根本不存在（grok / opencode 在回退，kimicode 空着），
-    // agy 更是连约定路径都没有 —— 扫描数不到这些位置，列表却实实在在摆着这些行。
-    expect(allMemoRows(scan)).toHaveLength(8)
+    // 七行 agent 里有四家自己那份根本不存在（grok / opencode 在回退，kimicode 和 agy
+    // 空着）—— 扫描数不到这些位置，列表却实实在在摆着这些行。
+    expect(allMemoRows(scan)).toHaveLength(10)
     expect(scan.summary.files).toBeLessThan(allMemoRows(scan).length)
   })
 

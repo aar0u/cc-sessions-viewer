@@ -1650,3 +1650,80 @@ export interface Bundle {
   /** 哪些位置的值被抹掉了，逐条列出来（`github.env.GITHUB_TOKEN` 这样）。 */
   redacted: string[]
 }
+
+// ---------------------------------------------------------------------------
+// 发现面板（skills.sh）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一条搜索结果。
+ *
+ * 接口只给五个字段，**没有描述** —— 所以列表第二行放的是 `source` 而不是描述。
+ * 这是数据决定的，不是设计偏好（方案文档 1.1）。
+ */
+export interface RegistryHit {
+  /** `emilkowalski/skills`（GitHub 仓库）或 `code.deepline.com`（厂商自托管）。 */
+  source: string
+  /** 目录名、安装名。**永远用它**，`name` 只用来显示（两者可能不一样）。 */
+  skillId: string
+  name: string
+  installs: number
+  /** `source` 是 `owner/repo` 形态才装得了；域名源只能在浏览器里打开。 */
+  installable: boolean
+}
+
+export interface RegistrySearch {
+  /** 接口回显的查询词。判断响应过不过期看它，不看我们发出去的那个。 */
+  query: string
+  /** `fuzzy` / `semantic`。多词会切到语义搜索，原样显示出来省得用户猜。 */
+  searchType: string
+  hits: RegistryHit[]
+}
+
+/** `offline` 断网 · `tooShort` 查询词太短 · `http` 对方 4xx/5xx · `badJson` 形状不认识。 */
+export type RegistryErrKind = 'offline' | 'tooShort' | 'http' | 'badJson'
+
+export interface RegistryError {
+  kind: RegistryErrKind
+  /** 底层原文。界面默认只显示按 `kind` 翻出来的那句话，这个留给「展开详情」。 */
+  detail: string
+}
+
+/**
+ * 装之前能看清楚的全部东西。
+ *
+ * `frontmatter` / `files` / `findings` / `risk` / `truncated` **全是本地 Skills 详情
+ * 用的那几个类型** —— 后端那边也是同一份 `describe_body`。两处对「一个 skill 目录
+ * 长什么样」的定义必须是同一个，否则装之前那一屏等于没答。
+ */
+export interface RegistryPreview {
+  source: string
+  skillId: string
+  /** 仓库内路径，例如 `skills/prototype`。布局千奇百怪，所以这条要显示出来。 */
+  repoPath: string
+  /** 同名目录出现在多处时没被选中的那些。只有一条命中时是空的。 */
+  otherPaths: string[]
+  /** HEAD 的短 sha，只用来显示。 */
+  commit: string
+  /** 这个子目录的 tree sha。阶段 D 的「有没有更新」比的是它，不是 `commit`。 */
+  treeSha: string
+  frontmatter: SkillFrontmatter | null
+  files: SkillFile[]
+  findings: RiskFinding[]
+  risk: RiskLevel
+  /** 文件没列全（数量 / 深度触顶，或有文件扫不动）。 */
+  truncated: boolean
+  /** 这一次省掉了 clone。耗时差两个数量级。 */
+  cached: boolean
+}
+
+/**
+ * `notInstallable` 域名源 · `cache` 缓存目录不可用 · `clone` 拉不下来（断网 / 仓库
+ * 不存在 / 私有）· `notFound` 仓库里没有这个 skill · `checkout` 找到了却检出不了。
+ */
+export type PreviewErrKind = 'notInstallable' | 'cache' | 'clone' | 'notFound' | 'checkout'
+
+export interface PreviewError {
+  kind: PreviewErrKind
+  detail: string
+}

@@ -8,6 +8,10 @@
 // `white-space` / `tab-size` / `word-break`。差一项光标就和高亮错位，而且是那种
 // 「短文本看不出来、写到第三屏才发现」的错位。所以这些值都写在 `.ce-layer` 这一个
 // 类里，两层共用，不给任何一层单独覆盖的机会。
+//
+// 行号不是第三层：它是高亮层里每一行那个块盒子的 `::before`（CSS 计数器）。单开一条
+// 行号栏就得自己算「这一行折了几折」，而这一层本来就是按逻辑行分块的 —— 号挂在盒子上，
+// 折行自然只在第一折出号。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { plainToHtml, tokensToHtml, indentEdit, newlineIndent, type HlToken } from '../codeEditor'
 import { highlightLines } from '../shikiHighlight'
@@ -54,7 +58,7 @@ async function paintHighlighted() {
   // 跑 shiki 是异步的，回来时用户可能已经又敲了几个字或者换了文件 —— 那一轮的上色
   // 贴到新文本上就是整屏错位，宁可这一轮不上色。
   if (code !== props.modelValue || lang !== props.lang) return
-  if (lines) html.value = tokensToHtml(lines)
+  if (lines) html.value = tokensToHtml(lines, code.split('\n').length)
 }
 
 function schedule() {
@@ -176,12 +180,36 @@ defineExpose({ focus: () => taEl.value?.focus() })
 </template>
 
 <style scoped>
+/* 有边框、有行号栏、聚焦有光圈 —— 一片只有浅底色的方块看上去就是段静态文案，
+   没人知道它能打字。 */
 .ce {
   position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  border: 1px solid var(--border);
   border-radius: 8px;
+  background: var(--surface-2);
+  transition: border-color 0.12s;
+}
+/* 聚焦只把边框加深一档。小输入框那种 3px 光圈套在一整块编辑区上就是一圈粗粗的彩边，
+   而这块地方本来就占满右半屏，不靠光圈也知道光标在哪。 */
+.ce:focus-within {
+  border-color: var(--border-strong);
+}
+/* 行号栏的底色。画在 `.ce` 自己身上而不是高亮层里 —— 它不跟着横向滚。 */
+.ce::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 50px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  pointer-events: none;
+}
+.ce.readonly::before {
   background: var(--surface-2);
 }
 
@@ -190,7 +218,9 @@ defineExpose({ focus: () => taEl.value?.focus() })
   position: absolute;
   inset: 0;
   margin: 0;
-  padding: 10px 12px;
+  /* 左边这一大截是行号栏。**两层都得留**：只给高亮层留的话 textarea 的折行宽度不一样，
+     写到折行的那一刻整段错开。 */
+  padding: 10px 12px 10px 60px;
   border: 0;
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 12.5px;
@@ -206,6 +236,30 @@ defineExpose({ focus: () => taEl.value?.focus() })
   overflow: hidden;
   color: var(--text);
   pointer-events: none;
+  counter-reset: ce-line;
+}
+
+/* 一行一个块。空行也得占一行的高 —— 空盒子高度是 0，下面所有行就往上串一行。
+   **必须 `:deep()`**：行盒子是 `v-html` 贴进去的，身上没有 scoped 的 `data-v-` 属性，
+   普通选择器一条都命中不了（表现是行号整片不显示）。 */
+:deep(.ce-row) {
+  display: block;
+  position: relative;
+  min-height: 1lh;
+  counter-increment: ce-line;
+}
+:deep(.ce-row)::before {
+  content: counter(ce-line);
+  position: absolute;
+  /* 号靠右排在 8..44，分隔线在 50，正文从 60 起 —— 号和正文之间留 16px。挨着正文
+     的行号会被当成正文的一部分读（尤其正文本身也是数字开头的列表）。 */
+  left: -52px;
+  width: 36px;
+  text-align: right;
+  color: var(--text-mute);
+  opacity: 0.75;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .ce-ta {

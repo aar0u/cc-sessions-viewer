@@ -29,12 +29,14 @@ describe('ToolsNav', () => {
     expect(w.find('.proj-list').exists()).toBe(true)
   })
 
-  it('四个入口各一行，次序跟 TOOL_TABS 走', () => {
+  it('五个入口各一行，次序跟 TOOL_TABS 走', () => {
     const items = factory().findAll('.tools-nav-item')
     expect(items).toHaveLength(TOOL_TABS.length)
+    // Discover 紧挨着 Skills：它装出来的东西就落在 Skills 面板里，是同一件事的两半。
     expect(items.map((i) => i.text())).toEqual([
       'MCP',
       'Skills',
+      'Discover skills',
       'Hooks',
       'Global config',
     ])

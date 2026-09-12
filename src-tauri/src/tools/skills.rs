@@ -487,20 +487,31 @@ pub fn detail(name: &str, cwd: Option<&Path>, extra: &[String]) -> Result<SkillD
 
 /// 详情页只展开**主 body** 的文件清单和风险明细。别的 body 的存在本身就是「重复」
 /// 角标要说的事，把几份内容混在一个清单里反而看不出谁是谁。
+/// 一个 skill 目录长什么样：文件清单、风险发现、frontmatter、有没有列全。
+///
+/// 抽出来是因为**「发现」面板从陌生仓库检出的目录也要问同一个问题**
+/// （`registry_git::preview`）。复制一份的话，两边对「什么算这个 skill 的文件」
+/// 「哪些算风险」的定义会各自漂移 —— 而这正是装之前那一屏要回答的东西，
+/// 两处答案不一样就等于没答。
+pub(super) fn describe_body(
+    dir: &Path,
+) -> (Vec<SkillFile>, Vec<RiskFinding>, Option<SkillFrontmatter>, bool) {
+    let (listed, mut truncated) = list_files(dir);
+    let mut findings = Vec::new();
+    for f in &listed {
+        let scan = risk::scan_file(&f.path, &dir.join(&f.path));
+        // 扫不动的文件（太大、非文本）也算「没看全」：一份只扫了一半的目录和一份
+        // 真的干净的目录在界面上长得一模一样，不报出来就是在骗人。
+        truncated |= scan.skipped;
+        findings.extend(scan.findings);
+    }
+    (listed, findings, read_frontmatter(dir), truncated)
+}
+
 fn build_detail(entry: SkillEntry) -> SkillDetail {
     let primary = primary_body(&entry.refs, &entry.bodies);
     let (files, findings, frontmatter, truncated) = match primary.as_deref() {
-        Some(dir) => {
-            let dir = Path::new(dir);
-            let (listed, mut truncated) = list_files(dir);
-            let mut findings = Vec::new();
-            for f in &listed {
-                let scan = risk::scan_file(&f.path, &dir.join(&f.path));
-                truncated |= scan.skipped;
-                findings.extend(scan.findings);
-            }
-            (listed, findings, read_frontmatter(dir), truncated)
-        }
+        Some(dir) => describe_body(Path::new(dir)),
         None => (Vec::new(), Vec::new(), None, false),
     };
 

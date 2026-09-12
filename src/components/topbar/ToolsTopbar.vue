@@ -4,9 +4,16 @@
 // 工具管理不是弹框，是和统计 / 回收站同一档的主区视图，所以搜索框必须落在顶栏中列
 // —— 和别的视图同一个位置，用户的眼睛不用换地方找。关闭按钮贴最右（顶栏第三列），
 // 那儿平时是空的。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { t } from '../../i18n'
-import { toolsBundleOpen, toolsQuery, toolsTab } from '../../toolsPanel'
+import {
+  submitToolsSearch,
+  tabAutoFocusesSearch,
+  toolsBundleOpen,
+  toolsQuery,
+  toolsTab,
+  type ToolTab,
+} from '../../toolsPanel'
 import { useDebouncedSearch } from '../../useDebouncedSearch'
 import { IconArchive, IconClose, IconSearch } from '../icons'
 
@@ -38,7 +45,40 @@ function onFindShortcut(e: KeyboardEvent) {
   searchInput.value?.focus()
   searchInput.value?.select()
 }
-onMounted(() => window.addEventListener('keydown', onFindShortcut))
+/**
+ * 回车 = 立刻按当前输入搜。
+ *
+ * 本地那几个面板用不上（它们输入即过滤），「发现」面板的一次输入是一次 HTTP，
+ * 防抖叠到 700 ms，知道要搜什么的人不该干等。顶栏只管说「用户提交了」，
+ * **不知道也不需要知道**是谁在听、那边要干什么。
+ */
+function onSubmit() {
+  commitSearch(searchDraft.value)
+  submitToolsSearch()
+}
+
+/**
+ * 进「发现」面板时把光标送进搜索框。
+ *
+ * 哪个 tab 要这个待遇由 `tabAutoFocusesSearch` 说了算，不写成 `=== 'discover'`：
+ * 那条判断有理由（见它的注释），而理由该和判断待在一处，且那儿测得到。
+ *
+ * `nextTick` 不能省 —— tab 刚换，面板还没渲染完，此刻 focus 会被随后的
+ * 渲染/滚动抢走。
+ */
+async function focusSearchFor(tab: ToolTab) {
+  if (!tabAutoFocusesSearch(tab)) return
+  await nextTick()
+  searchInput.value?.focus()
+}
+
+watch(toolsTab, focusSearchFor)
+
+onMounted(() => {
+  window.addEventListener('keydown', onFindShortcut)
+  // 顶栏和面板是一起挂上来的：如果打开工具管理时停在的就是「发现」，watch 不会触发。
+  void focusSearchFor(toolsTab.value)
+})
 onUnmounted(() => window.removeEventListener('keydown', onFindShortcut))
 </script>
 
@@ -58,6 +98,7 @@ onUnmounted(() => window.removeEventListener('keydown', onFindShortcut))
         @input="onSearchInput"
         @compositionstart="onSearchCompStart"
         @compositionend="onSearchCompEnd"
+        @keydown.enter="onSubmit"
       />
       <button
         v-if="hasQuery"
