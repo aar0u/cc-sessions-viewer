@@ -13,6 +13,44 @@ beforeEach(() => {
 })
 
 describe('api wrappers', () => {
+  it('toolSurfaces → tool_surfaces without a cwd', () => {
+    api.toolSurfaces()
+    expect(invoke).toHaveBeenCalledWith('tool_surfaces', { cwd: null })
+  })
+
+  it('toolSurfaces → tool_surfaces with a cwd for project-scoped sources', () => {
+    api.toolSurfaces('/repo')
+    expect(invoke).toHaveBeenCalledWith('tool_surfaces', { cwd: '/repo' })
+  })
+
+  it('toolsScanSkills -> tools_scan_skills without a cwd', () => {
+    api.toolsScanSkills()
+    expect(invoke).toHaveBeenCalledWith('tools_scan_skills', { cwd: null, extra: [] })
+  })
+
+  it('toolsScanSkills -> tools_scan_skills with a cwd for project-level skills', () => {
+    api.toolsScanSkills('/repo')
+    expect(invoke).toHaveBeenCalledWith('tools_scan_skills', { cwd: '/repo', extra: [] })
+  })
+
+  it('toolsScanSkills 带上用户自己加的目录', () => {
+    // 漏掉这一截，用户挑的主目录后端根本不扫：收编搬进去，下一次扫描看不见。
+    api.toolsScanSkills('/repo', ['/Volumes/ssd/skills'])
+    expect(invoke).toHaveBeenCalledWith('tools_scan_skills', {
+      cwd: '/repo',
+      extra: ['/Volumes/ssd/skills'],
+    })
+  })
+
+  it('toolsSkillDetail -> tools_skill_detail with the skill name', () => {
+    api.toolsSkillDetail('hyperframes', '/repo', ['/Volumes/ssd/skills'])
+    expect(invoke).toHaveBeenCalledWith('tools_skill_detail', {
+      name: 'hyperframes',
+      cwd: '/repo',
+      extra: ['/Volumes/ssd/skills'],
+    })
+  })
+
   it('cleanupPtyChildren -> cleanup_pty_children', () => {
     api.cleanupPtyChildren()
     expect(invoke).toHaveBeenCalledWith('cleanup_pty_children')

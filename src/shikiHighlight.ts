@@ -259,6 +259,33 @@ async function rehighlightDiffBlocks(root: HTMLElement, hl: HighlighterCore, the
   }
 }
 
+/**
+ * 内置编辑器专用：把源码切成逐行 token，调用方自己拼 DOM。
+ *
+ * 不用 `codeToHtml`：那出来的是 shiki 自己的 `<pre>`，带它自己的背景和内边距，而编辑器
+ * 的高亮层必须和 textarea **逐像素同款**（同字体、同行高、同 padding、同换行规则）。
+ * 拿 token 自己拼，这些就全在我们手里。
+ *
+ * `null` = 这一份不高亮（语言不认识、没加载成功、或者超过 `SHIKI_MAX_CHARS`），
+ * 调用方退化成纯文本 —— shiki 是 tokenizer，大文件每次按键全量跑必卡。
+ */
+export async function highlightLines(
+  code: string,
+  lang: string,
+): Promise<{ content: string; color?: string }[][] | null> {
+  const canonical = canonicalLang(lang)
+  if (!canonical || !code || code.length > SHIKI_MAX_CHARS) return null
+  const hl = await getHighlighter()
+  if (!(await tryLoadLang(hl, canonical))) return null
+  const { tokens } = hl.codeToTokens(code, { lang: canonical as any, theme: currentTheme() })
+  return tokens.map((line) => line.map((t) => ({ content: t.content, color: t.color })))
+}
+
+/** 按文件名猜语言。编辑器打开一个文件时用它决定高亮成什么。 */
+export function langOfPath(filePath: string): string | null {
+  return langFromPath(filePath)
+}
+
 export async function highlightAllCodeBlocks(root: HTMLElement | null): Promise<void> {
   if (!root) return
 

@@ -18,6 +18,7 @@ import type {
   StatsRange,
   StatsScope,
   RuntimeDiagnostics,
+  ToolSurfaceInfo,
   StorageUsageEntry,
   TrashItem,
   TrayStats,
@@ -28,6 +29,19 @@ import type {
   GitFileStatus,
   GitDiffFile,
   GitRepositoryState,
+  McpScan,
+  McpEdit,
+  McpFileStamp,
+  McpWriteReport,
+  HookScan,
+  HookEdit,
+  HookWriteReport,
+  HookTestResult,
+  MemoScan,
+  MemoMergeReport,
+  MemoDoc,
+  MemoDiff,
+  MemoRevision,
   PiTreeNode,
 } from './types'
 
@@ -101,6 +115,14 @@ export const setTrashRetention = (days: number) =>
 
 /** 运行时自检：内存 / 线程 / 各缓存占用。 */
 export const runtimeDiagnostics = () => invoke<RuntimeDiagnostics>('runtime_diagnostics')
+
+/**
+ * 七家 agent 的工具面快照（能力位 + 配置落点）。工具管理浮层打开时拉一次。
+ *
+ * `cwd` 给了才能算出项目级的 MCP 来源（`.mcp.json`、grok 的 `.grok/config.toml`、
+ * kimi 的 `.kimi-code/mcp.json`）；不给就只报 user 级的。
+ */
+export const toolSurfaces = (cwd?: string) => invoke<ToolSurfaceInfo[]>('tool_surfaces', { cwd: cwd ?? null })
 
 export const addBookmark = (agent: Agent, path: string) =>
   invoke<void>('add_bookmark', { agent, path })
@@ -702,3 +724,207 @@ export const upgradeAllClis = () =>
 
 export const diagnoseCli = (cliName: string) =>
   invoke<CliDiagnosisResult>('diagnose_cli', { cliName })
+
+import type {
+  AdoptRequest,
+  Bundle,
+  BundleInclude,
+  DeleteOptions,
+  FileRev,
+  RepairRequest,
+  SkillDetail,
+  SkillFileList,
+  SkillFileText,
+  SkillScan,
+  SkillUpdateCheck,
+  WriteReport,
+} from './types'
+
+/**
+ * 工具管理 · Skills 全盘扫描（只读）。
+ *
+ * `cwd` 是当前项目目录 —— 不给就只扫 user 级，项目里的 `.claude/skills/` 等一概看不到。
+ */
+export const toolsScanSkills = (cwd?: string, extra: string[] = []) =>
+  invoke<SkillScan>('tools_scan_skills', { cwd: cwd ?? null, extra })
+
+/** 单个 skill 的详情：完整链路、主 body 的文件清单与风险明细。 */
+export const toolsSkillDetail = (name: string, cwd?: string, extra: string[] = []) =>
+  invoke<SkillDetail>('tools_skill_detail', { name, cwd: cwd ?? null, extra })
+
+/**
+ * 收编：把散落的实体目录搬进主 store，原位留链。
+ *
+ * `dryRun` 先拿计划给确认框，用户点了再用**同样的参数**真跑一遍。同名冲突不会静默
+ * 跳过 —— 那些条目一步都不做，原样回到 `conflicts` 里等用户三选一。
+ */
+export const toolsAdoptSkills = (items: AdoptRequest[], mainStore: string, dryRun: boolean) =>
+  invoke<WriteReport>('tools_adopt_skills', { items, mainStore, dryRun })
+
+/** 启停：在某个 agent 的 skills 目录里建 / 拆链接。永远不碰实体内容。 */
+export const toolsToggleSkill = (
+  name: string,
+  store: string,
+  body: string | null,
+  on: boolean,
+  dryRun: boolean,
+) => invoke<WriteReport>('tools_toggle_skill', { name, store, body, on, dryRun })
+
+/** 删除：按反向索引全量解链，再删实体目录。 */
+export const toolsDeleteSkill = (
+  name: string,
+  opts: DeleteOptions,
+  cwd: string | undefined,
+  extra: string[],
+  dryRun: boolean,
+) => invoke<WriteReport>('tools_delete_skill', { name, opts, cwd: cwd ?? null, extra, dryRun })
+
+/** 扫全机器的 MCP 配置。只读，不启动任何 server。 */
+export const toolsScanMcp = (cwd?: string) =>
+  invoke<McpScan>('tools_scan_mcp', { cwd: cwd ?? null })
+
+/**
+ * 改 MCP 配置。**一律先 `dryRun: true` 跑一遍给用户看计划**，确认了再跑一次
+ * `dryRun: false` —— 改的是用户全机器的 agent 配置文件。
+ */
+/**
+ * `stamps` 是 dry-run 报告里那一份，点确认时原样回传。每个要碰的文件都得在里面、
+ * 且指纹对得上，后端才写 —— 否则整批拒绝，一个文件都不动。dry-run 时传空。
+ */
+export const toolsApplyMcp = (
+  edits: McpEdit[],
+  cwd: string | undefined,
+  dryRun: boolean,
+  stamps: McpFileStamp[],
+) => invoke<McpWriteReport>('tools_apply_mcp', { edits, cwd: cwd ?? null, dryRun, stamps })
+
+/** 扫全机器的 hook 配置。同 MCP：读不出来的文件把错带回来，不静默跳过。 */
+export const toolsScanHooks = (cwd?: string) =>
+  invoke<HookScan>('tools_scan_hooks', { cwd: cwd ?? null })
+
+/** 改 hook 配置。同样一律先 dry-run 出计划。 */
+export const toolsApplyHooks = (edits: HookEdit[], cwd: string | undefined, dryRun: boolean) =>
+  invoke<HookWriteReport>('tools_apply_hooks', { edits, cwd: cwd ?? null, dryRun })
+
+/**
+ * 拿一份假事件把命令**真跑一遍**，把 stdin 喂进去的 JSON 连同 stdout/stderr 一起带回来。
+ *
+ * 这是写 hook 唯一靠谱的验证方式：装上去之后它只在真实回合里触发，出了错也只是
+ * 「agent 那边好像卡了一下」。
+ */
+export const toolsTestHook = (command: string, event: string, cwd?: string) =>
+  invoke<HookTestResult>('tools_test_hook', { command, event, cwd: cwd ?? null })
+
+/** 扫全机器的全局指令文件：路径、`@import`、生效链路、分叉。 */
+export const toolsScanMemo = () => invoke<MemoScan>('tools_scan_memo')
+
+/** 读一个全局指令文件。不存在不是错误 —— 回来的是空正文加 `exists: false`。 */
+export const toolsReadMemo = (path: string) => invoke<MemoDoc>('tools_read_memo', { path })
+
+/**
+ * 写回一个全局指令文件。
+ *
+ * `expected` 是**打开时**拿到的那份指纹。对不上后端直接拒绝 —— 这些文件用户随时会在别的
+ * 编辑器里改，拿旧内容盖掉是这个面板最坏的失败方式。
+ */
+export const toolsWriteMemo = (path: string, text: string, expected: MemoRevision) =>
+  invoke<MemoDoc>('tools_write_memo', { path, text, expected })
+
+/** 两份同名文件的逐行差异。只看，不合并。 */
+export const toolsDiffMemo = (left: string, right: string) =>
+  invoke<MemoDiff>('tools_diff_memo', { left, right })
+
+/**
+ * 保存被拒之后那一问：「外面到底改了什么」。
+ *
+ * 两边都只在内存里 —— 一边是打开时读到的原文，一边是刚重新读回来的，磁盘上没有第二个
+ * 路径可以传给 `toolsDiffMemo`。后端是同一个 `diff_text`。
+ */
+export const toolsDiffMemoText = (
+  left: string,
+  right: string,
+  leftLabel: string,
+  rightLabel: string,
+) => invoke<MemoDiff>('tools_diff_memo_text', { left, right, leftLabel, rightLabel })
+
+/**
+ * 合并若干组「同名同内容」的重复：搬一份进主 store，原位全换成链接。
+ *
+ * `names` 是文件名（`RTK.md` 这种），一次可以给多组 —— 健康条上那个「合并全部重复」
+ * 就是把所有组一起交过来，共用一张计划、一次确认。先 `dryRun: true` 拿计划给用户看。
+ */
+export const toolsMergeMemo = (names: string[], store: string, dryRun: boolean) =>
+  invoke<MemoMergeReport>('tools_merge_memo', { names, store, dryRun })
+
+/**
+ * 把一份受管副本按它的源重拷一遍。
+ *
+ * 没有 dry-run：这一步只做一件事，而且做什么完全由那份副本自己的状态决定。会吃掉数据
+ * 的那几种（副本被就地改过 / 两边都变了）后端直接拒，不靠前端记得禁按钮。
+ */
+export const toolsResyncCopy = (path: string) => invoke<void>('tools_resync_copy', { path })
+
+/** 拆掉一条没人读的活链接。死链走 `tools_repair_links`，那条只碰解析不到东西的。 */
+export const toolsUnlinkRef = (path: string, dryRun: boolean) =>
+  invoke<WriteReport>('tools_unlink_ref', { path, dryRun })
+
+/** 只删一份内容：先解掉落在它身上的每一条链接，再删目录。 */
+export const toolsDeleteBody = (
+  name: string,
+  body: string,
+  cwd: string | undefined,
+  extra: string[],
+  dryRun: boolean,
+) => invoke<WriteReport>('tools_delete_body', { name, body, cwd: cwd ?? null, extra, dryRun })
+
+/** 修复：批量改指向 / 清死链。 */
+export const toolsRepairLinks = (items: RepairRequest[], dryRun: boolean) =>
+  invoke<WriteReport>('tools_repair_links', { items, dryRun })
+
+/** 更新前的对比：fetch 一次，算出落后几个提交、有哪些本地改动会被冲掉。 */
+export const toolsCheckSkillUpdate = (body: string) =>
+  invoke<SkillUpdateCheck>('tools_check_skill_update', { body })
+
+/** 强制更新到远端最新（`reset --hard`）。返回新的短 sha。 */
+export const toolsUpdateSkill = (body: string) => invoke<string>('tools_update_skill', { body })
+
+// ---------------------------------------------------------------------------
+// 内置编辑器
+//
+// `body` 是 skill 的实体目录，后端拿它当作用域的根；`rel` 一律是相对它的路径，
+// 越界由后端再挡一次（前端那道只是省一次往返，不是防线）。
+// ---------------------------------------------------------------------------
+
+/** 列出一个 skill 目录里的所有文件。 */
+export const toolsListSkillFiles = (body: string) =>
+  invoke<SkillFileList>('tools_list_skill_files', { body })
+
+export const toolsReadSkillFile = (body: string, rel: string) =>
+  invoke<SkillFileText>('tools_read_skill_file', { body, rel })
+
+/**
+ * 写回一个文件。`rev` 必须是**读的时候拿到的那份** —— 文件在别处被改过时后端会拒，
+ * 不会把用户在另一个编辑器里的改动默默盖掉。返回写完之后的新 `rev`。
+ */
+export const toolsWriteSkillFile = (body: string, rel: string, text: string, rev: FileRev) =>
+  invoke<FileRev>('tools_write_skill_file', { body, rel, text, rev })
+
+// ---------------------------------------------------------------------------
+// 配置集
+// ---------------------------------------------------------------------------
+
+/**
+ * 把当前这台机器上的一套配置打成一个包。
+ *
+ * **只有导出走后端。** 导入那一半是把包里的条目翻成 `McpEdit` / `HookEdit` /
+ * 一次 `toolsWriteMemo`，再走上面那三条已经有校验、dry-run、备份和回读的路 ——
+ * 在后端再写一个 `tools_import_bundle`，等于把那几道闸重造一遍。
+ */
+export const toolsExportBundle = (cwd: string | undefined, include: BundleInclude) =>
+  invoke<Bundle>('tools_export_bundle', { cwd: cwd ?? null, include })
+
+/**
+ * 把用户挑中的那个文件读成文本。只读原文 —— 认不认、哪几条能装，全在
+ * `toolsBundle.ts` 里判。
+ */
+export const toolsReadBundle = (path: string) => invoke<string>('tools_read_bundle', { path })

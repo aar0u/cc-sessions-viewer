@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -220,13 +220,6 @@ fn task_title(agent: &str, path: &str) -> String {
         .unwrap_or(fallback)
 }
 
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// 已结束的桌宠任务保留多久。
 ///
 /// 任务表按「agent + 会话路径」记账，原本只增不删 —— 长期使用后会攒下每一个跑过
@@ -436,7 +429,7 @@ pub fn emit_turn_signal(app: &AppHandle, mut payload: TerminalTurnPayload) -> Re
     }
     if !payload.path.trim().is_empty() {
         let mut tasks = desktop_tasks().lock().map_err(|error| error.to_string())?;
-        upsert_desktop_task(&mut tasks, &payload, current_timestamp_ms());
+        upsert_desktop_task(&mut tasks, &payload, crate::util::now_millis());
     }
     app.emit("terminal-turn://state", payload)
         .map_err(|e| e.to_string())
@@ -741,7 +734,7 @@ fn uninstall_grok_turn_hooks(
         .map_err(|error| format!("Failed to lock Grok config: {error}"))?;
     let mut doc = read_toml_document(path, "Grok config.toml")?;
     strip_grok_turn_hooks(&mut doc, script_path, legacy_script_path);
-    atomic_write_toml(path, &doc)
+    crate::util::atomic_write_toml(path, &doc, "Grok config.toml")
 }
 
 fn strip_grok_turn_hooks(doc: &mut Document, script_path: &Path, legacy_script_path: &Path) {
@@ -799,7 +792,7 @@ fn uninstall_kimi_turn_hooks(
         .map_err(|error| format!("Failed to lock Kimi config: {error}"))?;
     let mut doc = read_toml_document(path, "Kimi config.toml")?;
     strip_kimi_turn_hooks(&mut doc, script_path, legacy_script_path);
-    atomic_write_toml(path, &doc)
+    crate::util::atomic_write_toml(path, &doc, "Kimi config.toml")
 }
 
 fn strip_kimi_turn_hooks(doc: &mut Document, script_path: &Path, legacy_script_path: &Path) {
@@ -829,7 +822,7 @@ fn uninstall_pi_turn_extension() -> Result<(PathBuf, PathBuf), String> {
     let extension_path = crate::agents::pi::pi_status_extension_path();
     let settings_path = crate::agents::pi::pi_settings_path();
     if settings_path.exists() {
-        let settings_before = pi_file_revision(&settings_path)?;
+        let settings_before = crate::util::file_revision(&settings_path)?;
         let mut settings = read_json_object(&settings_path, "Pi settings.json")?;
         let expected = extension_path.to_string_lossy().to_string();
         if let Some(list) = settings
@@ -847,7 +840,7 @@ fn uninstall_pi_turn_extension() -> Result<(PathBuf, PathBuf), String> {
             "{}\n",
             serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?
         );
-        atomic_write_pi_file(
+        crate::util::atomic_write_file(
             &settings_path,
             bytes.as_bytes(),
             &settings_before,
@@ -981,78 +974,6 @@ fn turn_hook_config_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PiFileRevision {
-    exists: bool,
-    size: u64,
-    modified: Option<SystemTime>,
-}
-
-fn pi_file_revision(path: &Path) -> Result<PiFileRevision, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PiFileRevision {
-                exists: false,
-                size: 0,
-                modified: None,
-            });
-        }
-        Err(error) => return Err(format!("Failed to inspect {}: {error}", path.display())),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "Pi config path is not a regular file: {}",
-            path.display()
-        ));
-    }
-    Ok(PiFileRevision {
-        exists: true,
-        size: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
-}
-
-fn atomic_write_pi_file(
-    path: &Path,
-    bytes: &[u8],
-    expected: &PiFileRevision,
-    label: &str,
-) -> Result<(), String> {
-    if pi_file_revision(path)? != *expected {
-        return Err(format!(
-            "{label} changed while installing Pi status extension"
-        ));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} has no parent directory"))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Failed to create Pi config directory: {error}"))?;
-    let temp = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("pi"),
-        std::process::id(),
-        current_timestamp_ms()
-    ));
-    let result = (|| {
-        let mut file = File::create(&temp)
-            .map_err(|error| format!("Failed to create Pi config temporary file: {error}"))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("Failed to write Pi config temporary file: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("Failed to flush Pi config temporary file: {error}"))?;
-        fs::rename(&temp, path)
-            .map_err(|error| format!("Failed to atomically replace {label}: {error}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
 fn pi_extension_source(signal_path: &Path) -> String {
     let signal = serde_json::to_string(&signal_path.to_string_lossy().to_string())
         .unwrap_or_else(|_| "\"\"".to_string());
@@ -1154,11 +1075,11 @@ fn install_pi_turn_extension(signal_path: &Path) -> Result<(PathBuf, PathBuf), S
     let _guard = pi_config_lock().lock().map_err(|error| error.to_string())?;
     let extension_path = crate::agents::pi::pi_status_extension_path();
     let settings_path = crate::agents::pi::pi_settings_path();
-    let settings_before = pi_file_revision(&settings_path)?;
+    let settings_before = crate::util::file_revision(&settings_path)?;
     let mut settings = read_json_object(&settings_path, "Pi settings.json")?;
-    let extension_before = pi_file_revision(&extension_path)?;
+    let extension_before = crate::util::file_revision(&extension_path)?;
     let extension_source = pi_extension_source(signal_path);
-    atomic_write_pi_file(
+    crate::util::atomic_write_file(
         &extension_path,
         extension_source.as_bytes(),
         &extension_before,
@@ -1170,7 +1091,7 @@ fn install_pi_turn_extension(signal_path: &Path) -> Result<(PathBuf, PathBuf), S
         "{}\n",
         serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?
     );
-    atomic_write_pi_file(
+    crate::util::atomic_write_file(
         &settings_path,
         bytes.as_bytes(),
         &settings_before,
@@ -1505,6 +1426,17 @@ fn turn_hook_command(agent: &str, state: &str, script_path: &Path, signal_path: 
     })
 }
 
+/// 一条命令是不是本 app 装的回合信号 hook。
+///
+/// 工具管理的 Hooks 面板拿它判「受保护」。判定必须和这里的安装 / 卸载走**同一份**路径：
+/// 各写一份，迟早出现「面板说这不是我们的、卸载却把它删了」。
+pub fn is_turn_hook_command(command: &str) -> bool {
+    let (Ok(script), Ok(legacy)) = (hook_script_path(), legacy_hook_script_path()) else {
+        return false;
+    };
+    command_references_path(command, &script) || command_references_path(command, &legacy)
+}
+
 fn is_our_hook(item: &Value, script_path: &Path, legacy_script_path: &Path) -> bool {
     item.get("command")
         .and_then(Value::as_str)
@@ -1667,70 +1599,6 @@ fn merge_grok_hook(
     }
 }
 
-fn atomic_write_toml(path: &Path, doc: &Document) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Grok config path has no parent directory".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let original_permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    if path.exists() {
-        let backup = path.with_extension("toml.bak");
-        fs::copy(path, backup).map_err(|e| format!("Failed to back up Grok config: {e}"))?;
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let temp = parent.join(format!(
-        ".{file_name}.viewer-{}-{}.tmp",
-        std::process::id(),
-        current_timestamp_ms()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|e| format!("Failed to create Grok config temp file: {e}"))?;
-    let write_result = file
-        .write_all(doc.to_string().as_bytes())
-        .and_then(|_| file.sync_all());
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("Failed to write Grok config: {error}"));
-    }
-    drop(file);
-    if let Some(permissions) = original_permissions {
-        fs::set_permissions(&temp, permissions)
-            .map_err(|e| format!("Failed to preserve Grok config permissions: {e}"))?;
-    }
-
-    if let Err(first_error) = fs::rename(&temp, path) {
-        // std::fs::rename does not replace an existing destination on Windows.
-        let replacement_backup = parent.join(format!(
-            ".{file_name}.viewer-{}-{}.bak",
-            std::process::id(),
-            current_timestamp_ms()
-        ));
-        if !path.exists() || fs::rename(path, &replacement_backup).is_err() {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("Failed to replace Grok config: {first_error}"));
-        }
-        if let Err(error) = fs::rename(&temp, path) {
-            let _ = fs::rename(&replacement_backup, path);
-            let _ = fs::remove_file(&temp);
-            return Err(format!("Failed to install Grok config: {error}"));
-        }
-        let _ = fs::remove_file(replacement_backup);
-    }
-    if let Ok(directory) = File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
-}
-
 fn install_grok_turn_hooks(
     path: &Path,
     script_path: &Path,
@@ -1762,7 +1630,7 @@ fn install_grok_turn_hooks(
             }
             return Err("Grok config changed while installing hooks; try again".to_string());
         }
-        return atomic_write_toml(path, &doc);
+        return crate::util::atomic_write_toml(path, &doc, "Grok config.toml");
     }
     unreachable!()
 }
@@ -1950,7 +1818,7 @@ fn install_kimi_turn_hooks(
             }
             return Err("Kimi config changed while installing hooks; try again".to_string());
         }
-        return atomic_write_toml(path, &doc);
+        return crate::util::atomic_write_toml(path, &doc, "Kimi config.toml");
     }
     unreachable!()
 }
@@ -2196,7 +2064,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "cc-sessions-viewer-pet-title-{}-{}.jsonl",
             std::process::id(),
-            current_timestamp_ms()
+            crate::util::now_millis()
         ));
         std::fs::write(
             &path,
@@ -2743,14 +2611,14 @@ timeout = 2
         let path = std::env::temp_dir().join(format!(
             "cc-sessions-viewer-grok-config-{}-{}.toml",
             std::process::id(),
-            current_timestamp_ms()
+            crate::util::now_millis()
         ));
         let backup = path.with_extension("toml.bak");
         fs::write(&path, "# original\n[model]\nname = \"grok-4\"\n").unwrap();
         let mut doc = Document::new();
         doc["model"] = Item::Table(Table::new());
         doc["model"]["name"] = Item::Value(TomlValue::from("grok-4.1"));
-        atomic_write_toml(&path, &doc).unwrap();
+        crate::util::atomic_write_toml(&path, &doc, "Grok config.toml").unwrap();
         assert_eq!(
             fs::read_to_string(&backup).unwrap(),
             "# original\n[model]\nname = \"grok-4\"\n"

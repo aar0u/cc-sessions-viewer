@@ -33,6 +33,7 @@ mod pty;
 mod runtime;
 pub mod stats;
 mod storage_gc;
+mod tools;
 mod trash;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -2627,6 +2628,34 @@ pub fn run() {
             app_storage::trash_retention_notice,
             app_storage::ack_trash_retention,
             diagnostics::runtime_diagnostics,
+            tools::tool_surfaces,
+            tools::skills::tools_scan_skills,
+            tools::skills::tools_skill_detail,
+            tools::skills_write::tools_adopt_skills,
+            tools::skills_write::tools_toggle_skill,
+            tools::skills_write::tools_delete_skill,
+            tools::skills_write::tools_delete_body,
+            tools::hooks::tools_scan_hooks,
+            tools::hooks_write::tools_apply_hooks,
+            tools::hooks_write::tools_test_hook,
+            tools::mcp::tools_scan_mcp,
+            tools::mcp_write::tools_apply_mcp,
+            tools::memo::tools_scan_memo,
+            tools::memo::tools_read_memo,
+            tools::memo::tools_write_memo,
+            tools::memo::tools_diff_memo,
+            tools::memo::tools_diff_memo_text,
+            tools::memo_merge::tools_merge_memo,
+            tools::bundle::tools_export_bundle,
+            tools::bundle::tools_read_bundle,
+            tools::skills_write::tools_repair_links,
+            tools::skills_write::tools_unlink_ref,
+            tools::skills_write::tools_resync_copy,
+            tools::skills_git::tools_check_skill_update,
+            tools::skills_git::tools_update_skill,
+            tools::files::tools_list_skill_files,
+            tools::files::tools_read_skill_file,
+            tools::files::tools_write_skill_file,
             list_sessions,
             read_session,
             session_tree,

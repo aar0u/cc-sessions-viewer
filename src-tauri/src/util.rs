@@ -8,6 +8,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use toml_edit::Document;
+
 use crate::types::{Block, DiffHunk, DiffLine, Msg, ProjectFileEntry};
 
 /// `@` 文件浮层永远跳过的重目录（构建产物 / 依赖 / VCS）。点文件（`.codex` 等）保留 ——
@@ -839,6 +841,215 @@ fn path_ends_with_segments(path: &Path, want: &[String]) -> bool {
         return false;
     }
     segs[segs.len() - want.len()..] == *want
+}
+
+// ---------------------------------------------------------------------------
+// 配置文件的原子写
+//
+// 这两个函数原本埋在 `turn.rs` 里，只服务于装/卸回合信号 hook。工具管理要写同一
+// 批文件（codex 的 `config.toml`、grok 的 `config.toml`、kimi 的 `mcp.json`、
+// claude 的 `settings.json`……），所以提到这里共用 —— 是移动，不是复制。
+//
+// 错误信息里的对象名改成由调用方传 `label`：原来的文案一律写死 "Grok config"，
+// 而实际上 codex 和 kimi 也在用它，写坏的时候报错会指向错误的文件。
+// ---------------------------------------------------------------------------
+
+/// 文件的版本指纹：存在性 + 大小 + mtime。
+///
+/// 用途是「读 → 改 → 写」之间的防抢：写之前拿它和当初读到的比一次，不一致就
+/// 拒绝落盘，不去覆盖别人（用户的编辑器、另一个 agent 进程）刚写进去的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRevision {
+    pub exists: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// 读取 `path` 的指纹。文件不存在不是错误 —— 返回 `exists: false`，这样「从无到有
+/// 地创建」和「覆盖已有文件」能走同一条校验路径。
+pub fn file_revision(path: &Path) -> Result<FileRevision, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileRevision {
+                exists: false,
+                size: 0,
+                modified: None,
+            })
+        }
+        Err(error) => return Err(format!("Failed to inspect {}: {error}", path.display())),
+    };
+    // 必须是普通文件。目标是 symlink 时，后面的 tmp + rename 会把这条 symlink 直接
+    // 替换成普通文件，静默破坏用户自己搭的配置拓扑（有人把 `settings.json` 链到
+    // dotfiles 仓库里）；目录则根本不该走到这条路径上来。宁可早报错。
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "Config path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(FileRevision {
+        exists: true,
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// 从 `start` 往上找第一个含 `.git` 的目录，找不到返回 `None`。
+///
+/// `.git` 是目录还是文件都算 —— git worktree 里它是个写着 `gitdir: …` 的文件。
+pub fn repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// 项目根目录：优先 git root，不是仓库就用 `cwd` 自己。
+///
+/// 找项目级配置（`.mcp.json`、`.cursor/mcp.json`）要用这个，不是 [`repo_root`]。
+/// 各 agent 在非 git 目录下照样读当前目录的项目配置，用 `repo_root` 的话这些目录
+/// 会一条项目来源都报不出来。
+pub fn project_root(start: &Path) -> PathBuf {
+    repo_root(start).unwrap_or_else(|| start.to_path_buf())
+}
+
+/// tmp + rename 的原子写，写前校验指纹。
+///
+/// `expected` 是调用方读取内容时拿到的指纹；对不上说明文件在这期间被改过，直接
+/// 报错，由调用方决定是重试还是让用户看 diff。
+pub fn atomic_write_file(
+    path: &Path,
+    bytes: &[u8],
+    expected: &FileRevision,
+    label: &str,
+) -> Result<(), String> {
+    if file_revision(path)? != *expected {
+        return Err(format!("{label} changed while writing"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create directory for {label}: {error}"))?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("write"),
+        std::process::id(),
+        now_millis()
+    ));
+    let result = (|| {
+        let mut file = fs::File::create(&temp)
+            .map_err(|error| format!("Failed to create temporary file for {label}: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("Failed to write temporary file for {label}: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("Failed to flush temporary file for {label}: {error}"))?;
+        fs::rename(&temp, path)
+            .map_err(|error| format!("Failed to atomically replace {label}: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// 带 `.bak` 备份的 TOML 原子写。
+///
+/// 见 [`atomic_write_backed_up`]；指纹是写之前当场取的，所以这条路径上没有防抢
+/// （调用方自己保证 读→改→写 之间没人动过）。
+pub fn atomic_write_toml(path: &Path, doc: &Document, label: &str) -> Result<(), String> {
+    let expected = file_revision(path)?;
+    atomic_write_backed_up(
+        path,
+        doc.to_string().as_bytes(),
+        &expected,
+        &path.with_extension("toml.bak"),
+        label,
+    )
+}
+
+/// 带备份的原子写。
+///
+/// 比 [`atomic_write_file`] 多三件事：先把原文件复制到 `backup`、保留原权限位、
+/// 以及 Windows 上 `rename` 不覆盖已存在目标时的搬移回退。
+///
+/// `expected` 和 [`atomic_write_file`] 同义：对不上就拒绝落盘，不去覆盖别人（用户的
+/// 编辑器、另一个 agent 进程）刚写进去的内容。备份**留在磁盘上不删** —— 这个函数写的
+/// 是用户的配置文件（`~/.claude.json` 有 187 KB 且装着会话历史），写坏了要有东西可捞。
+pub fn atomic_write_backed_up(
+    path: &Path,
+    bytes: &[u8],
+    expected: &FileRevision,
+    backup: &Path,
+    label: &str,
+) -> Result<(), String> {
+    if file_revision(path)? != *expected {
+        return Err(format!("{label} changed while writing"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} has no parent directory"))?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let original_permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    if path.exists() {
+        fs::copy(path, backup).map_err(|e| format!("Failed to back up {label}: {e}"))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temp = parent.join(format!(
+        ".{file_name}.viewer-{}-{}.tmp",
+        std::process::id(),
+        now_millis()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| format!("Failed to create temp file for {label}: {e}"))?;
+    let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Failed to write {label}: {error}"));
+    }
+    drop(file);
+    if let Some(permissions) = original_permissions {
+        fs::set_permissions(&temp, permissions)
+            .map_err(|e| format!("Failed to preserve permissions for {label}: {e}"))?;
+    }
+
+    if let Err(first_error) = fs::rename(&temp, path) {
+        // std::fs::rename does not replace an existing destination on Windows.
+        let replacement_backup = parent.join(format!(
+            ".{file_name}.viewer-{}-{}.bak",
+            std::process::id(),
+            now_millis()
+        ));
+        if !path.exists() || fs::rename(path, &replacement_backup).is_err() {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to replace {label}: {first_error}"));
+        }
+        if let Err(error) = fs::rename(&temp, path) {
+            let _ = fs::rename(&replacement_backup, path);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to install {label}: {error}"));
+        }
+        let _ = fs::remove_file(replacement_backup);
+    }
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2246,5 +2457,24 @@ Only after the original task is complete, process this follow-up in the order re
         assert_eq!(blocks[1].image_src.as_deref().unwrap(), "/var/folders/8h/ddvbjjrn74q1v55wywphwkdc0000gn/T/clipboard-2026-07-05-123507-F13776EE.png");
         assert_eq!(blocks[1].image_unavailable, Some(true));
         assert_eq!(remaining, "hello");
+    }
+
+    #[test]
+    fn project_root_falls_back_to_the_directory_itself_outside_a_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "csv-projroot-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let deep = dir.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(repo_root(&deep), None);
+        assert_eq!(project_root(&deep), deep);
+
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(project_root(&deep), dir);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

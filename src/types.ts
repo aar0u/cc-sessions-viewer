@@ -607,3 +607,1046 @@ export interface CliUpgradeResult {
   newVersion: string | null
   error: string | null
 }
+
+/**
+ * 一个 agent 的「工具面」：四类工具各自支不支持、配置落在哪个文件。
+ *
+ * 这些都由后端 `tools::ToolSurface` 给出，前端不另存一份 —— 它们是外部世界的事实
+ * （某家把 MCP 从 `config.toml` 挪到 `mcp.json` 就变了），存两份必然漂移。
+ */
+export interface ToolCapabilities {
+  mcp: boolean
+  skills: boolean
+  hooks: boolean
+  globalMemo: boolean
+}
+
+/**
+ * 一个 MCP 配置来源的作用域。项目级的只有传了 cwd 才算得出来。
+ *
+ * `local` 是 Claude 特有的一档：它和 `user` 同住 `~/.claude.json`，但只对某个项目
+ * 生效且优先级高于 `project`。所以那个文件会以两条来源出现，前端按 `path` 分组即可。
+ */
+export type ConfigScope = 'user' | 'local' | 'project'
+
+/**
+ * 这个文件是谁的配置：
+ * - `own` —— agent 自有格式
+ * - `shared` —— 跨 agent 通用的 `.mcp.json`
+ * - `compat` —— 为兼容而扫描的别人家的（grok 默认读 `~/.claude.json` 和 Cursor 的）
+ */
+export type ConfigOrigin = 'own' | 'shared' | 'compat'
+
+/**
+ * 一个 MCP 配置文件的格式。**格式跟着文件走，不跟着 agent 走** —— `.mcp.json` 一个
+ * 文件 claude / grok / kimi / pi 四家都读，而 codex 和 grok 的 user 级配置又都是 TOML。
+ */
+export type McpFormat = 'jsonServers' | 'jsonProjectServers' | 'tomlServers' | 'opencodeJson'
+
+export interface McpSource {
+  path: string
+  scope: ConfigScope
+  origin: ConfigOrigin
+  format: McpFormat
+  /** 工具管理会不会往这里写。目前只写 agent 自有的 user 级文件。 */
+  writable: boolean
+  exists: boolean
+  /**
+   * 合并时的优先级，**数字大的覆盖小的**。同名 server 出现在多个文件里时靠它决定
+   * 谁生效。数组已按它从高到低排好，但渲染覆盖关系时请用这个字段而不是数组下标 ——
+   * 存在并列（grok 的两个 Cursor 来源）。
+   */
+  precedence: number
+  /**
+   * 这个来源是不是**有条件**生效。true 表示它受某个后端判定不了的开关影响
+   * （grok 的项目级 `.mcp.json` 取决于 Claude import marker，而那个 marker 在哪儿
+   * 没有公开说明），UI 该标成「可能未生效」，不要直接画进覆盖链。
+   */
+  conditional: boolean
+}
+
+export interface ToolSurfaceInfo {
+  agent: Agent
+  /** 本机装没装 —— 全局配置目录（`~/.claude`、`$CODEX_HOME` …）在不在。 */
+  installed: boolean
+  capabilities: ToolCapabilities
+  /** 会被写入的那个 user 级文件，也就是 `mcpSources` 里 `writable` 的那一条。 */
+  mcpConfigPath: string | null
+  /** 这个 agent 实际会读到的全部 MCP 来源，按优先级从高到低。 */
+  mcpSources: McpSource[]
+  skillsDir: string | null
+  hooksConfigPath: string | null
+  memoPath: string | null
+  /** 约定路径之外还会被读进来的指令文件（目前只有 opencode 的 `instructions`）。 */
+  memoExtraSources: string[]
+  /** 约定路径缺席时实际生效的文件（opencode / grok 会回退到 `~/.claude/CLAUDE.md`）。 */
+  memoFallback: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · MCP（只读扫描）
+// 后端 `src-tauri/src/tools/mcp.rs`
+// ---------------------------------------------------------------------------
+
+/** 传输方式。`unknown` = 配置里写了个我们不认识的值，不是「没写」。 */
+export type McpTransport = 'stdio' | 'http' | 'sse' | 'ws' | 'unknown'
+
+/** 一条环境变量 / HTTP header。 */
+export interface McpVar {
+  key: string
+  value: string
+  /** 键名看着像凭据。**为 true 时 UI 必须默认打码**，要看得点一下。 */
+  secret: boolean
+}
+
+/** 一个 server 在某一个文件里的定义。 */
+export interface McpServerDef {
+  name: string
+  transport: McpTransport
+  command: string | null
+  args: string[]
+  url: string | null
+  /**
+   * `url` 里能确认是凭据的那几处打了码的样子。**列表和详情页显示这一份。**
+   *
+   * 托管 MCP 的接入地址常常自带密钥（`https://user:tok@host/…`、`?api_key=…`）。
+   * 原文留在 `url` 里给指纹和编辑用，但不默认往屏幕上放。
+   */
+  urlMasked: string | null
+  env: McpVar[]
+  headers: McpVar[]
+  cwd: string | null
+  /** 显式关掉的（`enabled: false` / `disabled: true`）。 */
+  enabled: boolean
+  /** 既没有 command 也没有 url —— 这条根本起不来，别画成正常的。 */
+  incomplete: boolean
+}
+
+export interface McpDefAt {
+  agent: Agent
+  source: McpSource
+  def: McpServerDef
+  /** 这一份是不是这家 agent 实际生效的那份（同名时只有优先级最高的算数）。 */
+  effective: boolean
+}
+
+/** 一个 server（按名字归并）在全机器的样子。 */
+export interface McpEntry {
+  name: string
+  defs: McpDefAt[]
+  /** 真的会加载它的 agent。列表右侧那排角标就是它。 */
+  agents: Agent[]
+  /** 配置里有它、但被关掉或被盖住的 agent。 */
+  inactiveAgents: Agent[]
+  /** 同名但命令行不止一种 —— 各家跑的根本不是同一个东西。 */
+  conflict: boolean
+  /** 生效的定义里出现过的指纹，去重。冲突时拿它列「有哪几种」。 */
+  fingerprints: string[]
+  /** 缓存里量到的工具数。`null` = 没量过，**不是 0**。 */
+  tools: number | null
+  /** 工具定义的 token 估算（4 字符 ≈ 1 token）。 */
+  tokens: number | null
+}
+
+export interface McpSummary {
+  servers: number
+  /** 至少在一家 agent 里生效的。 */
+  active: number
+  conflicts: number
+  /** 生效集合的合计；量不到的条目不计入。 */
+  tools: number
+  tokens: number
+  /** 有工具数缓存的条目数 —— 上面两个数字覆盖了多少条。 */
+  measured: number
+}
+
+export interface McpSourceInfo extends McpSource {
+  servers: number
+  /** 解析失败的原因。有值就说明这个文件整片没读进来。 */
+  error: string | null
+}
+
+export interface McpAgentInfo {
+  agent: Agent
+  installed: boolean
+  supported: boolean
+  /** 可写的那一条，没有就是这家没法改。 */
+  writePath: string | null
+  sources: McpSourceInfo[]
+}
+
+export interface McpScan {
+  home: string
+  servers: McpEntry[]
+  agents: McpAgentInfo[]
+  summary: McpSummary
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · MCP（写：按 agent 同步 / 增删改 / 启停）
+// 后端 `src-tauri/src/tools/mcp_write.rs`
+// ---------------------------------------------------------------------------
+
+/** 一条写请求要做的事。 */
+export type McpOp = 'put' | 'drop' | 'enable' | 'disable'
+
+export interface KeyValue {
+  key: string
+  value: string
+}
+
+/**
+ * 用户填的一份定义。
+ *
+ * 不带 `incomplete` / `enabled` 这类**结论**：那些由后端按形状重算，前端说了不算。
+ */
+export interface McpServerInput {
+  transport: McpTransport
+  command: string | null
+  args: string[]
+  url: string | null
+  env: KeyValue[]
+  headers: KeyValue[]
+  cwd: string | null
+}
+
+export interface McpEdit {
+  agent: Agent
+  name: string
+  op: McpOp
+  /** `put` 要写的定义；其余操作用不上。 */
+  def: McpServerInput | null
+}
+
+export type McpStepKind = 'add' | 'update' | 'remove' | 'enable' | 'disable'
+
+/**
+ * - `newFile` —— 目标文件还不存在，会连它一起建出来
+ * - `shadowed` —— 写进去了，但同一家有优先级更高的来源也定义了它，跑的仍是那一份
+ */
+export type McpStepNote = 'newFile' | 'shadowed'
+
+export interface McpWriteStep {
+  agent: Agent
+  name: string
+  kind: McpStepKind
+  path: string
+  /** 改之前那份的命令行（新增时为 null）。 */
+  before: string | null
+  /** 改之后的命令行（移除时为 null）。 */
+  after: string | null
+  note: McpStepNote | null
+  /** `shadowed` 时是哪个文件盖住了它。 */
+  shadowedBy: string | null
+  /** dry-run 恒为 false；真跑时表示这一步做成了。 */
+  done: boolean
+}
+
+/**
+ * 做不了的原因。**每一条都要在 UI 上说出来** —— 静默跳过就是「显示成功但什么都
+ * 没做」。
+ */
+export type McpBlockReason =
+  | 'unsupported'
+  | 'noWritableSource'
+  /** 要动的那份在别的文件里（项目配置 / 别家的兼容来源），改可写文件也动不到。 */
+  | 'notInWritableSource'
+  /** 这个格式没有确认过的停用开关，只能移除。 */
+  | 'noEnableSwitch'
+  | 'incomplete'
+  /** 远端 server 暂不写：各家的 URL 键不一样（agy 用 `httpUrl`）。 */
+  | 'remoteReadOnly'
+  | 'headersUnsupported'
+
+export interface McpBlocked {
+  agent: Agent
+  name: string
+  reason: McpBlockReason
+  path: string | null
+}
+
+/** 一个目标文件在排计划那一刻的样子。前端只负责原样带回去，不解读 `stamp`。 */
+export interface McpFileStamp {
+  path: string
+  stamp: string
+}
+
+/** `stale` = 确认期间这个文件被别处改过了；`write` = 写的时候出错了。 */
+export type McpFailKind = 'stale' | 'write'
+
+export interface McpFailure {
+  kind: McpFailKind
+  path: string
+  /** `write` 时的底层报错原文。 */
+  detail: string | null
+}
+
+export interface McpWriteReport {
+  dryRun: boolean
+  steps: McpWriteStep[]
+  blocked: McpBlocked[]
+  /** 这份计划要碰的每个文件的当时样子。点确认时原样回传，对不上后端会拒。 */
+  stamps: McpFileStamp[]
+  /**
+   * 真跑中途停下来的原因。
+   *
+   * **`steps` 里 `done` 为真的那几步已经落盘了。** 只说一句「失败了」的话，用户不
+   * 知道自己现在有几份配置已经被改了。
+   */
+  failed: McpFailure | null
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · Skills（只读扫描）
+// 后端 `src-tauri/src/tools/skills.rs` / `tools/risk.rs`
+// ---------------------------------------------------------------------------
+
+/** 风险等级。顺序有意义，取最高用 `RISK_ORDER`。 */
+export type RiskLevel = 'none' | 'low' | 'medium' | 'high' | 'critical'
+
+/**
+ * 命中点在什么上下文里，决定了降几级。
+ * SKILL.md 正文里拿 `rm -rf /` 当反面例子太常见，不降权的话说明文档全是 Critical。
+ */
+export type RiskContext = 'executable' | 'comment' | 'codeBlock' | 'prose'
+
+export interface RiskFinding {
+  rule: string
+  /** 规则本身的等级，**降级前**。UI 要能解释「为什么它不是 Critical」。 */
+  baseLevel: RiskLevel
+  /** 降级后的实际等级，角标用这个。 */
+  level: RiskLevel
+  context: RiskContext
+  /** 相对 skill 目录的路径。 */
+  file: string
+  line: number
+  excerpt: string
+}
+
+/**
+ * 扫描时能判定的条目状态。
+ * 和后端 `link.rs` 的 `LinkHealth` 不是一回事 —— 那个要先知道「应该指向哪」，
+ * 而扫描发生在用户指定主 store 之前。
+ */
+export type RefHealth =
+  | { state: 'realDir' }
+  | { state: 'linked' }
+  /** `detail` 是链上第一个不存在的路径。 */
+  | { state: 'broken'; detail: string }
+  | { state: 'cyclic' }
+  /** 受管副本，且和源一致。`detail` 是副本记录的源。 */
+  | { state: 'managedCopy'; detail: string }
+  /**
+   * 受管副本，但**源**已经变了 —— 这个 agent 读到的是旧版本。`detail` 是源。
+   *
+   * 少了这一态就是 Skills-Manager 的那个坑：降级成拷贝之后源改了，界面一路显示健康。
+   */
+  | { state: 'copyStale'; detail: string }
+  /** 受管副本，**副本**被就地改过。重拷会抹掉这些修改，所以不给一键。 */
+  | { state: 'copyEdited'; detail: string }
+  /** 受管副本，源和副本**都**变了。自动挑一边必然吃掉另一边。 */
+  | { state: 'copyDiverged'; detail: string }
+  /** 受管副本，但它记录的源已经没了。 */
+  | { state: 'copyOrphaned'; detail: string }
+  /**
+   * 链接解析到了东西，但那不是目录 —— 没有任何内容可用。
+   * 只判断「存在」会把它报成健康，用户看到一个「好端端却用不了」的 skill。
+   */
+  | { state: 'notADirectory'; detail: string }
+
+export interface LinkHop {
+  from: string
+  to: string
+  exists: boolean
+}
+
+export interface SkillRef {
+  path: string
+  store: string
+  /**
+   * 会读到**这条引用所在 store** 的所有 agent。同一个目录常常不止一家读（grok 的 compat）。
+   *
+   * 「这家 agent 从哪个入口够到这个 skill」问的是它（见 `agentReach`）。
+   * 「这份内容还有没有人在读」问的是 `reachedBy`。
+   */
+  agents: Agent[]
+  /**
+   * 谁真的能读到这条引用背后的内容 —— 直接读，或者顺着别人的链走到这儿。
+   *
+   * 实体目录尤其需要它：`~/.skills-manager/skills/X` 没有任何 agent 直接读
+   * `.skills-manager`，`agents` 是空的，但两条链的终点都在它身上。按 `agents` 判
+   * 「没人读它、可以删」会让用户亲手打断那两条链。
+   */
+  reachedBy: Agent[]
+  health: RefHealth
+  /** 完整链路，实体目录为空数组。两跳链必须整条画出来。 */
+  hops: LinkHop[]
+  resolved: string | null
+}
+
+export interface SkillBody {
+  path: string
+  store: string | null
+  files: number
+  bytes: number
+  /** 毫秒。 */
+  modified: number | null
+  risk: RiskLevel
+  /**
+   * 这份内容**没被完整扫完**（文件数/深度触顶，或有文件太大、读不了、是二进制）。
+   * `risk` 因此只是下限：危险脚本可能就在没扫到的那部分里。UI 必须说「至少」而不是「就是」。
+   */
+  truncated: boolean
+}
+
+export type SkillBadge = 'duplicate' | 'twoHop' | 'cyclic' | 'broken' | 'copyStale'
+
+export interface SkillEntry {
+  name: string
+  refs: SkillRef[]
+  /** 多于一份就是「同名重复」—— 改哪份生效全看链接指向谁。 */
+  bodies: SkillBody[]
+  badges: SkillBadge[]
+  risk: RiskLevel
+  /** 任一 body 没扫完。`risk` 只是下限，不是结论。 */
+  truncated: boolean
+  description: string | null
+  /** 主 body 是个带 remote 的 clone 时给出它的来源；否则 null。 */
+  git: SkillGit | null
+}
+
+export interface StoreCandidate {
+  path: string
+  /** 会读这个目录的**所有** agent。第三方 store（`~/.agents` 等）为空数组。 */
+  agents: Agent[]
+  scope: ConfigScope
+  origin: ConfigOrigin
+  exists: boolean
+  total: number
+  links: number
+  /** 只有实体目录才是内容，主 store 该从这一栏多的里面挑。 */
+  realDirs: number
+  broken: number
+  /**
+   * 够不够格当主 store。判定在后端（`can_be_main`）：只有用户级的跨 agent 共享目录
+   * 够格 —— 项目目录跟着仓库走，agent 自有目录是链接落脚的地方，两类都不能装内容。
+   */
+  canBeMain: boolean
+}
+
+export interface ScanSummary {
+  total: number
+  broken: number
+  twoHop: number
+  duplicate: number
+  cyclic: number
+  /** 受管副本和源对不上的有几个。非 Windows 上恒为 0（那儿根本不会降级到复制）。 */
+  copyStale: number
+  /** 从远端 clone 来的有几个 —— 只有这些还能拉到新版本。 */
+  fromGit: number
+}
+
+export interface SkillScan {
+  /** 用户 home，用来把绝对路径缩写成 `~/…`。 */
+  home: string
+  /** 一个候选都挑不出来时的兜底主 store（`~/.agents/skills`）。 */
+  defaultMain: string
+  stores: StoreCandidate[]
+  /** 建议的主 store：够格的候选里实体目录最多的那个；一个都没有就是 `defaultMain`。 */
+  suggestedMain: string
+  skills: SkillEntry[]
+  summary: ScanSummary
+}
+
+export interface FrontmatterField {
+  key: string
+  value: string
+}
+
+export interface SkillFrontmatter {
+  name: string | null
+  description: string | null
+  allowedTools: string[]
+  /** 认不出来的字段原样保留，不猜也不丢。 */
+  extra: FrontmatterField[]
+}
+
+export interface SkillFile {
+  /** 相对 skill 目录。 */
+  path: string
+  bytes: number
+}
+
+/** 一个文件的版本标识。保存时原样回传，后端用它挡「外部改过了还盲写」。 */
+export interface FileRev {
+  exists: boolean
+  bytes: number
+  modifiedMs: number | null
+}
+
+/** 编辑器读到的一个文件。后端 `tools/files.rs`。 */
+export interface SkillFileText {
+  rel: string
+  /** `binary` 或 `truncated` 时这只是**部分内容**，不能拿去保存。 */
+  text: string
+  bytes: number
+  /** 含 NUL 字节，不给编辑。 */
+  binary: boolean
+  /** 超过后端的单文件上限，只读到开头一段。 */
+  truncated: boolean
+  rev: FileRev
+}
+
+export interface SkillFileList {
+  files: SkillFile[]
+  /** 文件太多没列完。 */
+  truncated: boolean
+}
+
+export interface SkillDetail {
+  name: string
+  refs: SkillRef[]
+  bodies: SkillBody[]
+  /** 被引用最多的那份 body；文件清单和 frontmatter 都取自它。 */
+  primary: string | null
+  frontmatter: SkillFrontmatter | null
+  files: SkillFile[]
+  findings: RiskFinding[]
+  risk: RiskLevel
+  /** 主 body 没扫完，`risk` / `files` 都不完整。 */
+  truncated: boolean
+  /** 主 body 是个能从远端更新的 clone 时给出它的 remote；否则 null。 */
+  git: SkillGit | null
+}
+
+/** 一份从远端 clone 下来的内容。后端 `tools/skills_git.rs`。 */
+export interface SkillGit {
+  /** origin 的 URL，原样显示 —— 弹框里要说清楚「从哪儿拉」。 */
+  remote: string
+  branch: string
+}
+
+/** `git fetch` 之后的对比结果，只用来填那个二次确认框。 */
+export interface SkillUpdateCheck {
+  remote: string
+  branch: string
+  /** 本地 HEAD 的短 sha。 */
+  local: string
+  /** 远端最新的短 sha。 */
+  latest: string
+  /** 落后几个提交。0 表示已经是最新的。 */
+  behind: number
+  /** 会被 `reset --hard` 冲掉的、改过的已跟踪文件。 */
+  changed: string[]
+  /** 没被 git 跟踪的文件个数 —— 这些不会被动。 */
+  untracked: number
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · Skills（写：收编 / 启停 / 删除 / 修复）
+// 后端 `src-tauri/src/tools/skills_write.rs`
+// ---------------------------------------------------------------------------
+
+/** 一步写操作的种类。`deleteDir` 不可逆，后端保证它永远排在最后。 */
+export type StepKind = 'ensureDir' | 'move' | 'backup' | 'link' | 'unlink' | 'deleteDir'
+
+/** 步骤旁边那一句补充说明。走 code 是为了让四种语言各自出文案。 */
+export type StepNote = 'deadLink'
+
+export interface WriteStep {
+  kind: StepKind
+  path: string
+  /** 链接指向谁 / 移动到哪。 */
+  target: string | null
+  note: StepNote | null
+  /** dry-run 恒为 false；真跑时表示这一步做成了。 */
+  done: boolean
+}
+
+export interface WriteReport {
+  dryRun: boolean
+  steps: WriteStep[]
+  /** 需要三选一的同名冲突。**带冲突的条目一步都没做**，不是静默跳过。 */
+  conflicts: AdoptConflict[]
+}
+
+/** 同名冲突的三选一。内容一致时后端不会问，直接按 `keepMain` 合并。 */
+export type Resolution =
+  | { kind: 'keepMain' }
+  | { kind: 'useExternal' }
+  /** `value` 是外部那份进主 store 时用的新名字。 */
+  | { kind: 'keepBoth'; value: string }
+
+export interface AdoptRequest {
+  name: string
+  /** 要收编的实体目录。 */
+  body: string
+  /** 冲突的处置；null = 还没选，后端会把它报回冲突列表。 */
+  resolution: Resolution | null
+}
+
+export interface ConflictSide {
+  path: string
+  files: number
+  bytes: number
+  /** 毫秒。 */
+  modified: number | null
+  /** 这一侧没看全，所以**不能**判定两边一致。 */
+  truncated: boolean
+}
+
+export type FileStatus = 'onlyMain' | 'onlyExternal' | 'same' | 'different'
+
+export interface FileDiff {
+  path: string
+  status: FileStatus
+  mainBytes: number | null
+  externalBytes: number | null
+}
+
+export interface LineDiff {
+  plus: number
+  minus: number
+  /** 行数超限没逐行比。0 **不表示**没差异。 */
+  truncated: boolean
+  /** 逐行差异（带上下文），直接喂 `DiffBlock.vue`。空 = 两边一模一样。 */
+  hunks: DiffHunk[]
+  /** `hunks` 被砍短了，后面还有没显示的。 */
+  clipped: boolean
+}
+
+export interface AdoptConflict {
+  name: string
+  main: ConflictSide
+  external: ConflictSide
+  files: FileDiff[]
+  skillMd: LineDiff | null
+  /** 「都留着」时建议的新名字，已避开主 store 里已有的。 */
+  suggestedRename: string
+}
+
+export interface DeleteOptions {
+  /** 只解链，保留实体目录。 */
+  keepBodies: boolean
+}
+
+/** 改指向某个实体目录（两跳压一跳 / 死链接回），或直接删掉死链。 */
+export type RepairAction = { kind: 'relink'; value: string } | { kind: 'unlink' }
+
+export interface RepairRequest {
+  path: string
+  action: RepairAction
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · Hooks（扫描 + 写）
+// 后端 `src-tauri/src/tools/hooks.rs` / `tools/hooks_write.rs`
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个 hook 配置文件的格式。和 `McpFormat` 一样**跟着文件走，不跟着 agent 走** ——
+ * codex 一家就同时有 `hooks.json`（groupedJson）和 `config.toml`（tomlGrouped）。
+ */
+export type HookFormat = 'groupedJson' | 'tomlGrouped' | 'tomlList' | 'agyJson'
+
+/**
+ * 一个 agent 实际会读到的一个 hook 配置文件。
+ *
+ * **没有 `precedence`**：hook 是叠加语义不是覆盖语义 —— user 级配一条、项目里再配一条，
+ * 两条都会跑。照搬 MCP 那套优先级会画出一个不存在的「被覆盖」关系。
+ */
+export interface HookSource {
+  path: string
+  scope: ConfigScope
+  origin: ConfigOrigin
+  format: HookFormat
+  writable: boolean
+  exists: boolean
+  /** 受某个后端判定不了的开关影响（codex 的项目配置要过信任闸）。 */
+  conditional: boolean
+}
+
+/** 一条 hook 在某一个文件里的定义。 */
+export interface HookDef {
+  event: string
+  /** 匹配器（工具名 / 通知类型）。null = 这个事件全都匹配。 */
+  matcher: string | null
+  /** agy 比别家多的那一层：它的根上是一个个**有名字的** hook。别家恒为 null。 */
+  group: string | null
+  /** `command` / `prompt` / …。认不出来的原样保留。 */
+  kind: string
+  command: string
+  /** 秒。**各家单位不统一，后端原样报不换算** —— 猜单位比不显示更糟。 */
+  timeout: number | null
+  enabled: boolean
+}
+
+/** 一条定义连同它来自哪儿。 */
+export interface HookAt {
+  agent: Agent
+  source: HookSource
+  def: HookDef
+}
+
+/** 按命令归并之后的一条 hook。列表一行就是一条。 */
+export interface HookEntry {
+  /** 命令指纹（去空白后的命令），同时当列表的 key。 */
+  fingerprint: string
+  /** 原样的命令。列表标题就是它 —— 不从命令里猜名字。 */
+  command: string
+  hooks: HookAt[]
+  agents: Agent[]
+  /** 它挂在哪些事件上，去重后按首次出现顺序。 */
+  events: string[]
+  /** 本 app 自己装的回合信号：**不可删不可改**。 */
+  managed: boolean
+  /** 至少有一条没被关掉。 */
+  enabled: boolean
+}
+
+/** 一个事件在各家的支持情况。「添加 hook」的事件列表照它渲染。 */
+export interface HookEventInfo {
+  name: string
+  /** 支持它的 agent。 */
+  agents: Agent[]
+  /** 已经配了几条。 */
+  configured: number
+}
+
+export interface HookSourceInfo extends HookSource {
+  hooks: number
+  error: string | null
+}
+
+export interface HookAgentInfo {
+  agent: Agent
+  installed: boolean
+  supported: boolean
+  writePath: string | null
+  events: string[]
+  sources: HookSourceInfo[]
+}
+
+export interface HookSummary {
+  /** 列表上的行数（归并之后）。 */
+  hooks: number
+  /**
+   * 配置文件里的条数（归并之前）。两个数差很多是正常的 —— 一条命令常常挂在好几家的
+   * 好几个事件上。
+   */
+  defs: number
+  managed: number
+  disabled: number
+  /** 配了 hook 的事件数。 */
+  events: number
+}
+
+export interface HookScan {
+  home: string
+  hooks: HookEntry[]
+  agents: HookAgentInfo[]
+  /** 全部已实证事件的并集，附各家支持情况。 */
+  events: HookEventInfo[]
+  summary: HookSummary
+}
+
+export type HookOp = 'add' | 'remove'
+
+export interface HookEdit {
+  agent: Agent
+  op: HookOp
+  event: string
+  matcher: string | null
+  command: string
+  /** 秒。原样写，不替用户换算。 */
+  timeout: number | null
+}
+
+export type HookStepKind = 'add' | 'remove'
+
+export interface HookWriteStep {
+  agent: Agent
+  kind: HookStepKind
+  path: string
+  event: string
+  matcher: string | null
+  command: string
+  /** 目标文件还不存在，会连它一起建出来。 */
+  newFile: boolean
+  /** dry-run 恒为 false；真跑时表示这一步做成了。 */
+  done: boolean
+}
+
+/** 做不了的原因。**每一条都要在 UI 上说出来** —— 静默跳过就是「显示成功但没做」。 */
+export type HookBlockReason =
+  | 'unsupported'
+  | 'noWritableSource'
+  /** 回合信号，不许在这儿动 —— 删掉 GUI 聊天就收不到回合结束事件。 */
+  | 'protected'
+  /** 这家不认这个事件：写得进去，但永远不会触发。 */
+  | 'unknownEvent'
+  | 'notInWritableSource'
+  | 'emptyCommand'
+  /** 可写文件里已经有一条一模一样的。再加一条就是同一个 hook 挂两遍，每次触发两次。 */
+  | 'alreadyThere'
+
+export interface HookBlocked {
+  agent: Agent
+  event: string
+  reason: HookBlockReason
+  path: string | null
+}
+
+export interface HookWriteReport {
+  dryRun: boolean
+  steps: HookWriteStep[]
+  blocked: HookBlocked[]
+}
+
+/** 试跑一条 hook 的结果。 */
+export interface HookTestResult {
+  /** 实际喂给它的那份 JSON。**一定要给用户看** —— 写不对多半是字段长得和想的不一样。 */
+  payload: string
+  stdout: string
+  stderr: string
+  /** 进程退出码。被信号打断（含超时杀掉）时为 null。 */
+  exitCode: number | null
+  durationMs: number
+  /** 撞上墙钟上限被杀掉的。 */
+  timedOut: boolean
+  /** 退出码 2：各家都拿它当「拦住这一步」。 */
+  blocking: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 工具管理 · 全局配置（后端 `src-tauri/src/tools/memo.rs`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个文件在某个 agent 眼里的身份。
+ * - `own` —— 这家自己的约定路径
+ * - `fallback` —— 自己那份缺席时才会读到的
+ * - `extra` —— 配置里显式追加的（opencode 的 `instructions`）
+ */
+export type MemoRole = 'own' | 'fallback' | 'extra'
+
+export interface MemoReader {
+  agent: Agent
+  role: MemoRole
+  /** 这条链路**现在**是不是真的生效。回退目标在自家文件存在时就不生效。 */
+  active: boolean
+}
+
+/** 一行 `@…`。 */
+export interface MemoImport {
+  /** 原样那一行。 */
+  raw: string
+  line: number
+  /** 解析出来的绝对路径。解析不出来为 null。 */
+  path: string | null
+  exists: boolean
+  bytes: number
+  /** 这一层引用的文件自己还有几行 `@…`。**不展开**，只报数。 */
+  nested: number
+}
+
+/**
+ * 文件指纹，给「保存时外部改动检测」用。
+ *
+ * 只到毫秒 —— 纳秒精度在前后端之间来回一趟必然掉精度，反过来让每次保存都误判成冲突。
+ */
+export interface MemoRevision {
+  exists: boolean
+  size: number
+  mtimeMs: number | null
+}
+
+export interface MemoFile {
+  path: string
+  /** 文件名。分叉检测按它分组。 */
+  name: string
+  exists: boolean
+  bytes: number
+  revision: MemoRevision
+  /** 谁会读到它。空数组是可能的：被 import 进来的片段靠引用它的那个文件生效。 */
+  readers: MemoReader[]
+  /** 被谁 import 进来的。顶层文件为 null。 */
+  importedBy: string | null
+  /**
+   * 它是条链接时指向哪儿（原样的 target，不解析到底）。实体文件为 null。
+   *
+   * 合并之后 `~/.claude/RTK.md` 这类位置就是链接了 —— UI 得能把「这儿有一份内容」
+   * 和「这儿只是指过去」分开画，否则合并完看上去和没合一样。
+   */
+  link: string | null
+  imports: MemoImport[]
+  /** 读不了（权限 / 太大 / 不是普通文件）。 */
+  error: string | null
+}
+
+export interface MemoAgentInfo {
+  agent: Agent
+  installed: boolean
+  /** 有没有 home 级约定。false 的那几家在 UI 上是禁用态。 */
+  supported: boolean
+  path: string | null
+  exists: boolean
+  fallback: string | null
+  /** 实际生效的那个文件。自己那份在就是自己的，不在就是回退目标，都没有为 null。 */
+  effective: string | null
+  fallenBack: boolean
+  extra: string[]
+}
+
+export interface MemoForkSide {
+  path: string
+  bytes: number
+}
+
+/** 一处分叉：同名、内容不一样。 */
+export interface MemoFork {
+  name: string
+  sides: MemoForkSide[]
+}
+
+/**
+ * 一处重复：同名、内容**一模一样**、而且磁盘上真的是好几份。
+ *
+ * 和 `MemoFork` 是同一枚硬币的两面 —— 分叉是「同名但内容分家了」（只提示），
+ * 重复是「同名而且还没分家」（可以合并掉）。已经合并过的不算重复：几条链接指向
+ * 同一个物理文件时内容当然还是全相同，但那正是终态。
+ */
+export interface MemoDup {
+  name: string
+  /** 每份都一样大（内容相同），所以只有一个数。 */
+  bytes: number
+  /** 涉及的位置，含已经是链接的那些。 */
+  paths: string[]
+  /** 其中还是实体文件的那几个 —— 合并真正要动的就是它们。 */
+  bodies: string[]
+}
+
+export interface MemoSummary {
+  files: number
+  present: number
+  /** 断掉的 `@import`。 */
+  broken: number
+  forks: number
+  /** 有几组同名同内容的重复。 */
+  dups: number
+}
+
+/** 合并计划里一步的种类。后端 `tools/memo_merge.rs`。 */
+export type MemoStepKind = 'ensureDir' | 'move' | 'link' | 'unlink' | 'drop'
+
+export interface MemoStep {
+  kind: MemoStepKind
+  path: string
+  /** `move` / `link` 的另一头。 */
+  target: string | null
+  done: boolean
+  /**
+   * 这一步属于哪一组重复（文件名）。
+   *
+   * 「合并全部重复」一次能出二十来步，平铺开来是一堵墙 —— 计划弹框按它在组之间
+   * 画分割线。
+   */
+  group: string
+}
+
+export interface MemoMergeReport {
+  dryRun: boolean
+  steps: MemoStep[]
+  /** 做不了的那几组，每条一句完整的话。带原因的那几组一步都没做。 */
+  blocked: string[]
+}
+
+export interface MemoScan {
+  home: string
+  agents: MemoAgentInfo[]
+  files: MemoFile[]
+  forks: MemoFork[]
+  dups: MemoDup[]
+  summary: MemoSummary
+}
+
+export interface MemoDoc {
+  path: string
+  text: string
+  revision: MemoRevision
+}
+
+export interface MemoDiff {
+  left: string
+  right: string
+  hunks: DiffHunk[]
+  /** 两边逐字节一样。 */
+  same: boolean
+  /** 太大，没逐行比。 */
+  truncated: boolean
+  clipped: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 配置集（方案 阶段 10）
+// 后端 `src-tauri/src/tools/bundle.rs`
+// ---------------------------------------------------------------------------
+
+export interface BundleInclude {
+  mcp: boolean
+  hooks: boolean
+  memo: boolean
+  skills: boolean
+}
+
+export interface BundleMcp {
+  name: string
+  transport: McpTransport
+  command: string | null
+  args: string[]
+  /** **只有键名**，值一个都不带。导入端自己补。 */
+  envKeys: string[]
+  headerKeys: string[]
+  url: string | null
+  /** 导出那台机器上的工作目录。导入端多半要改。 */
+  cwd: string | null
+  agents: string[]
+}
+
+export interface BundleHook {
+  command: string
+  events: string[]
+  matcher: string | null
+  timeout: number | null
+  agents: string[]
+}
+
+/** 一份全局指令。按**角色**记，不按路径 —— 导入端的用户名都不一样。 */
+export interface BundleMemo {
+  /** 这是哪家的约定文件。`null` = 被 `@` 引用进来的片段。 */
+  agent: string | null
+  /** 片段是被哪家 `@` 进来的 —— 导入端照它决定往哪个目录写。顶层文件为 null。 */
+  parent: string | null
+  name: string
+  text: string
+}
+
+/** 一条 skill **清单**，不含内容。别人的 skill 就是别人写的代码，不一键铺开。 */
+export interface BundleSkill {
+  name: string
+  remote: string | null
+  agents: string[]
+}
+
+export interface Bundle {
+  kind: string
+  version: number
+  createdAt: number
+  app: string
+  mcp: BundleMcp[]
+  hooks: BundleHook[]
+  memo: BundleMemo[]
+  skills: BundleSkill[]
+  /** 哪些位置的值被抹掉了，逐条列出来（`github.env.GITHUB_TOKEN` 这样）。 */
+  redacted: string[]
+}

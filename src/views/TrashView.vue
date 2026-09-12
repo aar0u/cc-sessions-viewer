@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
+import { resetSpotlight } from '../listScroll'
 import type { TrashItem } from '../types'
 import { formatSize, formatTime, highlightSegments, shortName } from '../format'
 import { t } from '../i18n'
@@ -118,6 +119,11 @@ function onListMouseOver(e: MouseEvent) {
 function onListMouseLeave() {
   scrollEl.value?.classList.remove('has-spot')
 }
+
+// 列表换了一批，浮块就作废了 —— 它停在上一批某一行的偏移量上，而它是绝对定位、带
+// 真实高度，算进滚动容器的 scrollHeight：新列表短下来时 `scrollTop` 收不回去，剩下
+// 的几行留在视口**上方**，整个列表看上去是空的（Skills 面板上实测过这一幕）。
+watch(visibleTrash, () => resetSpotlight(scrollEl.value, spotlightEl.value))
 onUnmounted(() => clearTimeout(scrollIdle))
 </script>
 

@@ -3,9 +3,15 @@ import { mount } from '@vue/test-utils'
 import Sidebar from '../../src/components/Sidebar.vue'
 import { vTooltip } from '../../src/tooltip'
 import { setLang } from '../../src/settings'
+import { latestVersion, updateAvailable } from '../../src/updateCheck'
 import type { ProjectInfo } from '../../src/types'
 
-beforeEach(() => setLang('en'))
+beforeEach(() => {
+  setLang('en')
+  // updateAvailable / latestVersion 是 updateCheck.ts 的模块级 ref，不是 prop。
+  updateAvailable.value = false
+  latestVersion.value = null
+})
 
 const project = (over: Partial<ProjectInfo> & { dirName: string }): ProjectInfo => ({
   displayPath: `/projects/${over.dirName}`,
@@ -65,6 +71,32 @@ describe('Sidebar', () => {
     const wrapper = factory({ projects: [project({ dirName: 'p' })] })
     await wrapper.find('.proj-item').trigger('contextmenu')
     expect(wrapper.emitted('context-menu')).toHaveLength(1)
+  })
+
+  it('emits open-tools from the wrench button next to settings', async () => {
+    const wrapper = factory()
+    await wrapper.find('.sidebar-tools-btn').trigger('click')
+    expect(wrapper.emitted('open-tools')).toHaveLength(1)
+    // 它必须是设置按钮的**兄弟**，不是嵌在里面 —— 设置按钮内部已经有一个
+    // <span role="button">（release 入口），再叠一层就是嵌套可交互元素。
+    expect(wrapper.find('.trash-tab .sidebar-tools-btn').exists()).toBe(false)
+    expect(wrapper.find('.sidebar-footer > .sidebar-tools-btn').exists()).toBe(true)
+  })
+
+  it('keeps the release button and update dot inside the settings button', async () => {
+    // 回归风险（方案文档 3.1）：它俩是相对 .trash-tab 绝对定位的。工具管理按钮加进
+    // footer 之后，如果谁把它们挪成 footer 的子节点，位置就会跑到新图标底下。
+    updateAvailable.value = true
+    latestVersion.value = '9.9.9'
+    const wrapper = factory()
+    expect(wrapper.find('.trash-tab .sidebar-release-btn').exists()).toBe(true)
+    expect(wrapper.find('.trash-tab .update-dot').exists()).toBe(true)
+    expect(wrapper.find('.sidebar-footer > .update-dot').exists()).toBe(false)
+
+    // release 入口不该冒泡成「打开通用设置」。
+    await wrapper.find('.sidebar-release-btn').trigger('click')
+    expect(wrapper.emitted('open-settings')).toEqual([['updates']])
+    expect(wrapper.emitted('open-tools')).toBeUndefined()
   })
 
   it('emits open-settings from the footer button', async () => {

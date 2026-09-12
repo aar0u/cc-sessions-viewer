@@ -4,6 +4,7 @@ import type { GitCommit, GitDiffFile, DiffHunk } from '../types'
 import { gitLog, gitDiffFiles, gitDiffFile, gitStatus } from '../api'
 import { t } from '../i18n'
 import { gitWorkingChangesRefreshVersion } from '../gitWorkingChanges'
+import { buildFileTree, flattenTree, treeDepth, type TreeNode } from '../fileTree'
 import DiffBlock from '../components/DiffBlock.vue'
 import { IconRefresh, IconGitBranch } from '../components/icons'
 import { highlightAllCodeBlocks } from '../shikiHighlight'
@@ -39,64 +40,14 @@ const currentLabel = computed(() => {
 
 const expandState = reactive<Record<string, boolean>>({})
 
-const fileTree = computed(() => buildTree(files.value))
-
-interface TreeNode {
-  name: string
-  path: string
-  file?: GitDiffFile
-  children: TreeNode[]
-}
+const fileTree = computed(() => buildFileTree(files.value))
+const flatFileNodes = computed(() => flattenTree(fileTree.value, isExpanded))
 
 function isExpanded(path: string): boolean {
   return expandState[path] !== false
 }
 
-function buildTree(list: GitDiffFile[]): TreeNode[] {
-  const root: TreeNode[] = []
-  for (const f of list) {
-    const parts = f.path.split('/')
-    let nodes = root
-    let pathSoFar = ''
-    for (let i = 0; i < parts.length; i++) {
-      const name = parts[i]
-      pathSoFar = pathSoFar ? `${pathSoFar}/${name}` : name
-      const isLeaf = i === parts.length - 1
-      let node = nodes.find((n) => n.name === name)
-      if (!node) {
-        node = { name, path: pathSoFar, children: [] }
-        if (isLeaf) node.file = f
-        nodes.push(node)
-      }
-      nodes = node.children
-    }
-  }
-  return collapseTree(root)
-}
-
-function collapseTree(nodes: TreeNode[]): TreeNode[] {
-  return nodes.map((n) => {
-    n.children = collapseTree(n.children)
-    if (!n.file && n.children.length === 1 && !n.children[0].file) {
-      const child = n.children[0]
-      return { ...child, name: `${n.name}/${child.name}` }
-    }
-    return n
-  })
-}
-
-function flatNodes(nodes: TreeNode[]): TreeNode[] {
-  const out: TreeNode[] = []
-  for (const n of nodes) {
-    out.push(n)
-    if (n.children.length && isExpanded(n.path)) {
-      out.push(...flatNodes(n.children))
-    }
-  }
-  return out
-}
-
-function toggleDir(node: TreeNode) {
+function toggleDir(node: TreeNode<GitDiffFile>) {
   expandState[node.path] = !isExpanded(node.path)
 }
 
@@ -249,26 +200,26 @@ const selectedDiffFile = computed(() => files.value.find((f) => f.path === selec
         </div>
         <div class="git-file-list">
           <div
-            v-for="node in flatNodes(fileTree)"
+            v-for="node in flatFileNodes"
             :key="node.path"
             class="git-file-row"
             :class="{
               dir: node.children.length > 0,
-              selected: node.file && node.path === selectedFile,
+              selected: node.item && node.path === selectedFile,
             }"
-            :style="{ paddingLeft: (node.path.split('/').length - 1) * 12 + 8 + 'px' }"
-            @click="node.file ? loadDiff(node.path) : toggleDir(node)"
+            :style="{ paddingLeft: treeDepth(node.path) * 12 + 8 + 'px' }"
+            @click="node.item ? loadDiff(node.path) : toggleDir(node)"
           >
             <span v-if="node.children.length" class="git-dir-arrow" :class="{ open: isExpanded(node.path) }">▸</span>
             <span
-              v-if="node.file"
+              v-if="node.item"
               class="git-status"
-              :class="'st-' + node.file.status"
-            >{{ node.file.status }}</span>
+              :class="'st-' + node.item.status"
+            >{{ node.item.status }}</span>
             <span class="git-file-name">{{ node.name }}</span>
-            <span v-if="node.file" class="git-file-stat">
-              <span v-if="node.file.additions" class="git-add">+{{ node.file.additions }}</span>
-              <span v-if="node.file.deletions" class="git-del">-{{ node.file.deletions }}</span>
+            <span v-if="node.item" class="git-file-stat">
+              <span v-if="node.item.additions" class="git-add">+{{ node.item.additions }}</span>
+              <span v-if="node.item.deletions" class="git-del">-{{ node.item.deletions }}</span>
             </span>
           </div>
         </div>

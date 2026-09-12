@@ -46,6 +46,7 @@ import IconUnfoldRaw from '~icons/lucide/chevrons-up-down'
 import IconMinimizeRaw from '~icons/lucide/minus'
 import IconDownloadRaw from '~icons/lucide/download'
 import IconUploadRaw from '~icons/lucide/upload'
+import IconSaveRaw from '~icons/lucide/save'
 import IconMarkdownRaw from '~icons/lucide/file-text'
 import IconFileRaw from '~icons/lucide/file'
 import IconFileDiffRaw from '~icons/lucide/file-diff'
@@ -88,6 +89,7 @@ import IconGitBranchRaw from '~icons/lucide/git-branch'
 import IconClaudeRaw from '~icons/material-icon-theme/claude'
 import IconKeyboardRaw from '~icons/lucide/keyboard'
 import IconSlidersRaw from '~icons/lucide/sliders-horizontal'
+import IconLinkRaw from '~icons/lucide/link'
 import IconWebhookRaw from '~icons/lucide/webhook'
 import IconPaperclipRaw from '~icons/lucide/paperclip'
 import IconSlashSquareRaw from '~icons/lucide/square-slash'
@@ -118,6 +120,7 @@ export const IconEmptyBox = IconEmptyBoxRaw
 export const IconPointLeft = IconPointLeftRaw
 export const IconSidebar = IconSidebarRaw
 export const IconClose = IconCloseRaw
+export const IconSave = IconSaveRaw
 export const IconExitPane = IconExitPaneRaw
 export const IconSun = IconSunRaw
 export const IconMoon = IconMoonRaw
@@ -175,6 +178,7 @@ export const IconEye = IconEyeRaw
 export const IconGitBranch = IconGitBranchRaw
 export const IconKeyboard = IconKeyboardRaw
 export const IconSliders = IconSlidersRaw
+export const IconLink = IconLinkRaw
 export const IconWebhook = IconWebhookRaw
 export const IconPaperclip = IconPaperclipRaw
 export const IconSlashSquare = IconSlashSquareRaw

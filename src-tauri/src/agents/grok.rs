@@ -50,7 +50,7 @@ pub fn find_updates_path(session_id: &str, cwd: Option<&str>) -> Option<PathBuf>
         .map(|record| record.updates_path)
 }
 
-fn grok_home() -> PathBuf {
+pub fn grok_home() -> PathBuf {
     let configured = std::env::var_os("GROK_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);

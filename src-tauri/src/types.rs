@@ -230,7 +230,7 @@ pub struct SessionPage {
     pub sessions: Vec<SessionMeta>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffLine {
     pub kind: String, // ctx | add | del
@@ -239,7 +239,7 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffHunk {
     pub old_start: u32,

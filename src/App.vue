@@ -70,12 +70,16 @@ import type { SearchHit } from './types'
 import ChatSidePanel from './components/ChatSidePanel.vue'
 import CodexSidePanel from './components/CodexSidePanel.vue'
 import SettingsModal from './components/SettingsModal.vue'
-import { IconSearch } from './components/icons'
+import { IconArrowLeft, IconSearch } from './components/icons'
 import WindowsTitlebar, { type WindowMenuGroup } from './components/WindowsTitlebar.vue'
 import ChatTopbar from './components/topbar/ChatTopbar.vue'
 import TuiTopbar from './components/topbar/TuiTopbar.vue'
 import TrashTopbar from './components/topbar/TrashTopbar.vue'
 import SessionsTopbar from './components/topbar/SessionsTopbar.vue'
+import ToolsTopbar from './components/topbar/ToolsTopbar.vue'
+import ToolsNav from './components/ToolsNav.vue'
+import ToolsView from './views/ToolsView.vue'
+import { TAB_LABEL, clampToolsListWidth, resetToolsPanel, setToolsListWidth, toolsListWidth, toolsTab } from './toolsPanel'
 import TrashView from './views/TrashView.vue'
 // 按需视图懒加载：StatsView 拖着重量级图表库 @antv/g2，PricingView / ExportHistoryView 也是
 // 二级页面 —— 都不进首屏主包，进对应页面时再拉各自的 chunk。
@@ -213,6 +217,13 @@ const showStats = ref(false)
 const showExportHistory = ref(false)
 const showPricing = ref(false)
 const showSettings = ref(false)
+// 工具管理：和统计 / 回收站同一档的主区视图，但**不清 activeDir / view tab** ——
+// 它只是盖在上面，关掉就回到原来的会话，一格分屏都不动。
+const showTools = ref(false)
+// 关掉就把壳状态归零 —— 下次打开用户期望的是干净的面板，而不是上次留下的过滤条件。
+watch(showTools, (open) => {
+  if (!open) resetToolsPanel()
+})
 const settingsTab = ref<'general' | 'theme' | 'advanced' | 'storage' | 'hooks' | 'pet' | 'cli' | 'shortcuts' | 'updates'>()
 const sidebarOpen = ref(true)
 const refreshing = ref(false)
@@ -285,6 +296,8 @@ function onSidebarResizePointerUp() {
 
 function onWindowResize() {
   sidebarWidth.value = clampSidebarWidth(sidebarWidth.value)
+  // 工具面板的列表栏上限里含一条「给详情留 420px」，窗口变窄时得重夹一次。
+  setToolsListWidth(clampToolsListWidth(toolsListWidth.value))
 }
 
 const codexSessionOptions = computed(() => ({
@@ -644,6 +657,7 @@ const activeProject = computed(() =>
 )
 const activeAgentLabel = computed(() => agentLabel(agent.value))
 const topbarContextTitle = computed(() => {
+  if (showTools.value) return t('tools.title')
   if (showStats.value) return t('sidebar.stats')
   if (showTrash.value) return t('sidebar.trash')
   if (showExportHistory.value) return t('sidebar.history')
@@ -651,6 +665,8 @@ const topbarContextTitle = computed(() => {
   return activeProject.value ? shortName(activeProject.value.displayPath) : activeAgentLabel.value
 })
 const topbarContextMeta = computed(() => {
+  // 工具管理是跨 agent 的，用当前 agent 当副标题会误导 —— 这里给当前面板名。
+  if (showTools.value) return t(TAB_LABEL[toolsTab.value])
   if (showStats.value || showTrash.value || showExportHistory.value || showPricing.value) {
     return activeAgentLabel.value
   }
@@ -1652,6 +1668,9 @@ function switchAgent(a: Agent) {
 }
 
 async function selectProject(dir: string, opts: { activateTerminal?: boolean } = {}) {
+  // 选项目 = 回会话去。工具管理这时可能盖在主区上（侧栏被它顶掉了，所以进来的只会是
+  // 快捷键 / 全局搜索这类路径），不收掉的话用户点完什么都看不见。
+  showTools.value = false
   const shouldActivateTerminal = opts.activateTerminal === true
   const rememberedTui = activeTuiByProject.get(viewKey(agent.value, dir))
   const sameProject = activeDir.value === dir && !showTrash.value && !showStats.value
@@ -1850,11 +1869,24 @@ async function refreshSessions() {
   }
 }
 
+/**
+ * 进全局视图（统计 / 回收站 / 历史 / 价格）前先把工具管理收掉。
+ *
+ * 返回 true 表示「刚从工具管理出来」—— 这时同名按钮的「再点一次收起」要让位：
+ * 用户眼前是工具面板，点统计的意思是「去统计」，不是「把看不见的统计收起来」。
+ */
+function leaveToolsForGlobalView(): boolean {
+  if (!showTools.value) return false
+  showTools.value = false
+  return true
+}
+
 // 打开统计概览：和回收站 / 会话视图互斥；再点一次同一按钮收起。
 // 数据加载自身在 StatsView 里完成，App 这一层只切顶层状态。
 function openStats() {
   setActiveTui(null)
-  if (showStats.value) {
+  const fromTools = leaveToolsForGlobalView()
+  if (showStats.value && !fromTools) {
     showStats.value = false
     sessionStatsTarget.value = null
     return
@@ -1906,6 +1938,7 @@ async function showTrashRetentionNotice() {
 
 async function loadTrash() {
   setActiveTui(null)
+  leaveToolsForGlobalView()
   showTrash.value = true
   showStats.value = false
   showExportHistory.value = false
@@ -2069,7 +2102,8 @@ async function switchPiLeaf(leafId: string) {
 // 导出历史视图入口（侧栏按钮）—— 和回收站 / 统计 / 价格互斥；再点一次同一按钮收起。
 function openExportHistory() {
   setActiveTui(null)
-  if (showExportHistory.value) {
+  const fromTools = leaveToolsForGlobalView()
+  if (showExportHistory.value && !fromTools) {
     showExportHistory.value = false
     return
   }
@@ -2087,7 +2121,8 @@ function openExportHistory() {
 // 价格视图入口（顶栏 More 菜单）—— 和回收站 / 统计 / 历史互斥；再点一次收起。
 function openPricing() {
   setActiveTui(null)
-  if (showPricing.value) {
+  const fromTools = leaveToolsForGlobalView()
+  if (showPricing.value && !fromTools) {
     showPricing.value = false
     return
   }
@@ -4031,7 +4066,16 @@ onMounted(() => {
     closeCtxMenu()
   })
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && ctxMenu.value) closeCtxMenu()
+    if (e.key !== 'Escape') return
+    if (ctxMenu.value) { closeCtxMenu(); return }
+    // 工具管理是主区视图不是弹窗，所以 Esc 的优先级排在所有弹层**后面**：设置 /
+    // 全局搜索 / 确认框开着时，这一下属于它们。与其在这儿列一串 show* 布尔（每加一个
+    // 弹窗就得回来补一次），不如直接问 DOM 现在有没有弹层挂着。
+    // 正在淡出的那个不算：Transition 的 *-leave-active 期间元素还挂在 DOM 上，
+    // 但它已经是「关掉了」的状态，不该再占着 Esc。
+    const blocked = [...document.querySelectorAll('.app-overlay, .gs-backdrop')]
+      .some((el) => !/leave-active/.test(el.className))
+    if (showTools.value && !blocked) showTools.value = false
   })
   window.addEventListener('blur', closeCtxMenu)
   document.addEventListener('wheel', closeCtxMenu, { passive: true })
@@ -4102,6 +4146,8 @@ onMounted(() => {
         e.preventDefault(); settingsTab.value = undefined; showSettings.value = true
       } else if (key === 't' && e.shiftKey) {
         e.preventDefault(); loadTrash()
+      } else if (key === 'k' && !e.shiftKey) {
+        e.preventDefault(); showTools.value = !showTools.value
       } else if ((key === '/' || key === '?') && !e.shiftKey) {
         e.preventDefault()
         showSettings.value = true
@@ -4560,7 +4606,18 @@ provide<PaneActions>(PaneActionsKey, {
            本身仍是 macOS 拖动区域，组件内部的可交互元素由 CSS 单独标 no-drag。 -->
       <div class="topbar-drag">
         <div class="topbar-context">
-          <span class="topbar-agent-mark" aria-hidden="true">{{ activeAgentLabel.charAt(0) }}</span>
+          <!-- 工具管理占着整个主区，标题前面给一个返回按钮（和最右的 × 同一个动作）——
+               agent 首字母标记这时不显示：面板是跨 agent 的，挂个「C」只会误导。 -->
+          <button
+            v-if="showTools"
+            class="topbar-back-btn"
+            v-tooltip="t('tools.back')"
+            :aria-label="t('tools.back')"
+            @click="showTools = false"
+          >
+            <IconArrowLeft />
+          </button>
+          <span v-else class="topbar-agent-mark" aria-hidden="true">{{ activeAgentLabel.charAt(0) }}</span>
           <span class="topbar-context-text">
             <span class="topbar-context-title">{{ topbarContextTitle }}</span>
             <span v-if="topbarContextMeta" class="topbar-context-meta">
@@ -4568,10 +4625,13 @@ provide<PaneActions>(PaneActionsKey, {
             </span>
           </span>
         </div>
+        <!-- 工具管理盖在整个主区上，顶栏自然也归它：搜索 + 关闭。排第一，
+             否则底下那层视图的工具栏会从面板后面露出来。 -->
+        <ToolsTopbar v-if="showTools" @close="showTools = false" />
         <!-- StatsView 自带顶部控制条，这里就让出空间（保持拖动区域）。
              showStats 优先级要高于 openSession，否则进入会话统计模式时
              还会渲染 ChatTopbar 的「会话统计」按钮，造成视觉重复。 -->
-        <div v-if="showStats || (activeUiId === null && (activeViewTab?.type === 'git' || (liveChat && activeViewTab?.type === 'chat')))" />
+        <div v-else-if="showStats || (activeUiId === null && (activeViewTab?.type === 'git' || (liveChat && activeViewTab?.type === 'chat')))" />
         <TuiTopbar v-else-if="activeUiId !== null" />
         <ChatTopbar v-else-if="openSession && activeViewTab" />
         <TrashTopbar
@@ -4597,9 +4657,16 @@ provide<PaneActions>(PaneActionsKey, {
     </div>
 
     <div class="app-body">
-    <!-- 侧栏 -->
-    <Sidebar
+    <!-- 侧栏。工具管理开着时换成它的导航（四个入口 + agent 过滤器）——
+         Sidebar 只是 v-show 隐藏，滚动位置 / 折叠的 worktree 分组都还在。 -->
+    <ToolsNav
+      v-if="showTools"
       v-show="sidebarOpen"
+      @open-settings="(tab) => { settingsTab = tab; showSettings = true }"
+      @close="showTools = false"
+    />
+    <Sidebar
+      v-show="sidebarOpen && !showTools"
       :agent="agent"
       :projects="projects"
       :active-dir="activeDir"
@@ -4611,6 +4678,7 @@ provide<PaneActions>(PaneActionsKey, {
       @select-project="(dir) => selectProject(dir, { activateTerminal: true })"
       @context-menu="openCtxMenu"
       @open-settings="(tab) => { settingsTab = tab; showSettings = true }"
+      @open-tools="showTools = true"
       @refresh="refreshAll"
       @add-bookmark="addBookmark"
       @batch-delete="batchDeleteProjects"
@@ -4627,11 +4695,25 @@ provide<PaneActions>(PaneActionsKey, {
 
     <!-- 主区 -->
     <main class="main">
+      <!-- 工具管理层。不走下面那套 v-if/v-else —— 它一卸载就把分屏格子里的终端 /
+           会话一起拆了。这里绝对定位盖上去，底下那层只是 visibility:hidden，
+           关掉面板立刻原样回来。 -->
+      <div v-if="showTools" class="tools-layer" :style="{ '--tools-list-w': `${toolsListWidth}px` }">
+        <!-- 回合信号的装卸入口一直在设置的 Hooks 那一页；Hooks 面板上只读，
+             要撤掉就把人送过去，不在两处各开一个开关。 -->
+        <ToolsView
+          :cwd="activeProject?.displayPath"
+          @notify="notify"
+          @open-settings="() => { settingsTab = 'hooks'; showSettings = true }"
+        />
+      </div>
+
       <!-- 全局全区视图（统计 / 回收站 / 导出历史 / 计费）—— 接管整个主区，盖住分屏格子。
            它们是 app 级页面（由侧栏顶栏触发），不属于任何 pane。退出后分屏布局原样恢复。 -->
       <div
         v-if="showStats || showTrash || showExportHistory || showPricing"
         class="view-layer global-view-layer"
+        :class="{ 'is-covered': showTools }"
       >
         <StatsView
           v-if="showStats"
@@ -4660,7 +4742,7 @@ provide<PaneActions>(PaneActionsKey, {
 
       <!-- 分屏格子：递归 PaneGrid 渲染整棵分屏树。每格 strip + 会话/列表/欢迎 + TUI 层由
            PaneContent 按各自 pane 解出。multi class 只在多格子时给聚焦格子加聚焦描边。 -->
-      <div v-else class="pane-grid" :class="{ multi: paneCount > 1 }">
+      <div v-else class="pane-grid" :class="{ multi: paneCount > 1, 'is-covered': showTools }">
         <PaneGrid
           :node="currentLayout.tree"
           :active-project="activeProject"
@@ -4779,13 +4861,13 @@ provide<PaneActions>(PaneActionsKey, {
     <ChatSidePanel
       v-if="sideChat && liveChat?.agent === 'claude'"
       :session="sideChat"
-      :hidden="!liveChat || activeUiId !== null"
+      :hidden="!liveChat || activeUiId !== null || showTools"
     />
     <!-- Codex `/side`：单独组件与 state，使用 ephemeral app-server fork。 -->
     <CodexSidePanel
       v-if="codexSideChat && liveChat?.agent === 'codex'"
       :session="codexSideChat"
-      :hidden="!liveChat || activeUiId !== null"
+      :hidden="!liveChat || activeUiId !== null || showTools"
     />
 
     <!-- toast -->

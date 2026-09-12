@@ -11,6 +11,13 @@ defineProps<{
   /** 取消按钮的文案。默认「取消」；告知类弹窗用「知道了」这种更贴切的说法。 */
   cancelText?: string
   /**
+   * 纯告知：只留一个「知道了」，不给「取消」。
+   *
+   * 没有可撤销的动作时给「取消」是在撒谎 —— 用户会以为刚才那件事还能收回，而这个框
+   * 其实只是在解释「为什么点不动」。
+   */
+  acknowledge?: boolean
+  /**
    * 点遮罩能不能关掉。默认能。
    *
    * 一次性的数据丢失警告要传 false：关掉就等于「已阅」并立刻执行删除，一次误点
@@ -37,7 +44,7 @@ const emit = defineEmits<{
         <h3>{{ title }}</h3>
         <p>{{ message }}</p>
         <div class="modal-actions">
-          <button class="btn" @click="emit('cancel')">
+          <button v-if="!acknowledge" class="btn" @click="emit('cancel')">
             {{ cancelText ?? t('common.cancel') }}
           </button>
           <button

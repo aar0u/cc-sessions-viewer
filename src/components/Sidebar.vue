@@ -3,8 +3,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Agent, ProjectInfo } from '../types'
 import { shortName } from '../format'
 import { t } from '../i18n'
-import { IconDownload, IconRefresh, IconSettings, IconClose, IconCheck, IconTrash, IconSelect, IconGitBranch, agentIcons } from './icons'
-import { latestVersion, updateAvailable } from '../updateCheck'
+import { IconRefresh, IconClose, IconCheck, IconTrash, IconSelect, IconGitBranch, agentIcons } from './icons'
+import SidebarFooter from './SidebarFooter.vue'
 import { visibleAgents } from '../settings'
 import { agentLabel } from '../agentMeta'
 
@@ -25,6 +25,7 @@ const emit = defineEmits<{
   (e: 'select-project', dir: string): void
   (e: 'context-menu', evt: MouseEvent, p: ProjectInfo): void
   (e: 'open-settings', tab?: 'general' | 'updates'): void
+  (e: 'open-tools'): void
   (e: 'refresh'): void
   (e: 'add-bookmark'): void
   (e: 'batch-delete', dirs: string[]): void
@@ -558,34 +559,10 @@ defineExpose({ exitSelect })
       </div>
     </div>
 
-    <div class="sidebar-footer">
-      <button
-        class="trash-tab"
-        :class="{ 'has-update': updateAvailable }"
-        v-tooltip="updateAvailable
-          ? t('sidebar.updateAvailable', { v: latestVersion ?? '' })
-          : t('sidebar.settings')"
-        @click="emit('open-settings')"
-      >
-        <IconSettings /> {{ t('sidebar.settings') }}
-        <!-- 有新版本时，行尾多挂一个"更新"入口按钮：点它直接跳到设置里的「更新」tab
-             （不再直接跳 GitHub）。@click.stop 防止冒泡到外层 button 打开通用设置。 -->
-        <span
-          v-if="updateAvailable"
-          class="sidebar-release-btn"
-          role="button"
-          tabindex="0"
-          v-tooltip="t('sidebar.updateAvailable', { v: latestVersion ?? '' })"
-          :aria-label="t('sidebar.updateAvailable', { v: latestVersion ?? '' })"
-          @click.stop="emit('open-settings', 'updates')"
-          @keydown.enter.stop.prevent="emit('open-settings', 'updates')"
-          @keydown.space.stop.prevent="emit('open-settings', 'updates')"
-        >
-          <IconDownload />
-        </span>
-        <span v-if="updateAvailable" class="update-dot" aria-hidden="true" />
-      </button>
-    </div>
+    <SidebarFooter
+      @open-settings="(tab) => emit('open-settings', tab)"
+      @toggle-tools="emit('open-tools')"
+    />
 
     <Teleport to="body">
       <div
