@@ -21,7 +21,7 @@ import { t } from '../i18n'
 import { elidePath, formatSize, highlightSegments } from '../format'
 import { buildFileTree, flattenTree, treeDepth, type TreeNode } from '../fileTree'
 import { agentLabel } from '../agentMeta'
-import { agentIcons, fileIconFor, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconDownload, IconFolder, IconGithub, IconLink, IconPencil, IconPinUp, IconPlus, IconRefresh, IconTrash, IconWrench } from '../components/icons'
+import { agentIcons, fileIconFor, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconDownload, IconFolder, IconGithub, IconLink, IconPencil, IconPinUp, IconPlus, IconRefresh, IconScopeProject, IconScopeUser, IconTrash, IconWrench } from '../components/icons'
 import {
   panelAgents,
   selectFirstRow,
@@ -31,8 +31,10 @@ import {
   toolsQuery,
 } from '../toolsPanel'
 import { resetSpotlight, revealSelected } from '../listScroll'
+import { useHStrip } from '../hstrip'
 import {
   BADGE_ORDER,
+  SKILL_SCOPES,
   agentsOf,
   chainLines,
   removableLink,
@@ -47,12 +49,16 @@ import {
   type SkillSort,
   queryPath,
   riskIsConclusive,
+  scopeCounts,
   sharedDirRef,
   shortenPath,
   skillFilter,
+  skillScopes,
+  storeScopeMap,
   toggleSkillPin,
   visibleSkills,
   worstBadge,
+  type SkillScope,
 } from '../toolsSkills'
 import {
   addExtraStore,
@@ -122,6 +128,14 @@ const conflictKey = ref('adopt')
 const home = computed(() => scan.value?.home ?? '')
 const main = computed(() => effectiveMainStore(scan.value))
 
+/**
+ * store 路径 → 用户级 / 项目级。行上的记号和健康条那两个筛子都查它。
+ *
+ * 档次是 store 的属性，一次扫描里不会变，所以摊成一张表算一次 —— 每行各自去
+ * `scan.stores` 里线性找是 O(行 × store)。
+ */
+const storeScopes = computed(() => storeScopeMap(scan.value))
+
 const list = computed(() =>
   visibleSkills(
     scan.value?.skills ?? [],
@@ -129,8 +143,16 @@ const list = computed(() =>
     [...toolsAgents.value],
     pinnedSkills.value,
     skillSort.value,
+    storeScopes.value,
   ),
 )
+
+/** 行前面那一到两个档次记号。两档都占的就画两个 —— 那是它的实情。 */
+function scopesOf(entry: SkillEntry): SkillScope[] {
+  return skillScopes(entry, storeScopes.value)
+}
+
+const SCOPE_ICONS = { user: IconScopeUser, project: IconScopeProject } as const
 
 const selected = computed<SkillEntry | null>(
   () => list.value.find((s) => s.name === selectedName.value)
@@ -213,6 +235,63 @@ function toggleBadgeFilter(badge: (typeof BADGE_ORDER)[number]) {
 function toggleFromGit() {
   skillFilter.value = { ...skillFilter.value, fromGit: !skillFilter.value.fromGit }
 }
+
+/** 每档各有几条。两档都占的两边都记 —— 和角标那排同一套算法，加起来可以超过总数。 */
+const scopeTotals = computed(() => scopeCounts(scan.value?.skills ?? [], storeScopes.value))
+
+/**
+ * 档次是两个**独立**开关，默认都开（= 不过滤）。
+ *
+ * 不做成角标那样的单选：用户要的是「只看项目里的」和「只看我自己的」，这是两个子集
+ * 而不是五选一。两个都关掉列表会空 —— 那是字面结果，再点一下就回来，比「关了等于
+ * 没关」好懂。
+ */
+function toggleScope(scope: SkillScope) {
+  const on = skillFilter.value.scopes
+  skillFilter.value = {
+    ...skillFilter.value,
+    scopes: on.includes(scope)
+      ? on.filter((s) => s !== scope)
+      : SKILL_SCOPES.filter((s) => s === scope || on.includes(s)),
+  }
+}
+
+// 六个角标横着排，窗口一窄就装不下。以前它们硬挤在健康条里，把右边的主 store 顶出
+// 屏幕；现在改成吃掉剩余宽度、自己横向滑（和会话页 tab 条同一份实现）。
+const badgeViewportRef = ref<HTMLElement>()
+const badgeTrackRef = ref<HTMLElement>()
+const {
+  panning: badgePanning,
+  canLeft: badgeCanLeft,
+  canRight: badgeCanRight,
+  trackStyle: badgeTrackStyle,
+  revealEl: revealBadge,
+  onWheel: onBadgeWheel,
+  onPanPointerDown: onBadgePanDown,
+} = useHStrip(badgeViewportRef, badgeTrackRef)
+
+/**
+ * 两侧的淡出宽度。
+ *
+ * 不用「铺一层底色渐变盖住边缘」那招（tab 条是那么做的）：健康条自己不铺底色，
+ * 壁纸模式下透出来的是用户的图，盖一层实色渐变会在这一行上糊出两块不透的补丁。
+ * 改用 mask 让内容本身淡掉，底下是什么都不碍事。
+ */
+/**
+ * 点完角标再把它滑回视野里。
+ *
+ * 要等一拍：点下去左边的「43 skills」会变成「1/43 skills」，那几个字一变宽，滑动区
+ * 就跟着窄一截 —— 在同一拍里量，量到的是上一个宽度，露出来的那一项右边还是缺一角。
+ */
+function revealBadgeAfterFilter(ev: MouseEvent) {
+  const el = ev.currentTarget as HTMLElement
+  nextTick(() => revealBadge(el))
+}
+
+const badgeFade = computed(() => ({
+  '--badge-fade-l': badgeCanLeft.value ? '20px' : '0px',
+  '--badge-fade-r': badgeCanRight.value ? '20px' : '0px',
+}))
 
 
 // 候选规则住在 `toolsSkills.ts`（有单测），这儿不再自己抄一遍 —— 抄出来的那份
@@ -352,10 +431,34 @@ function adoptSelected() {
   adopt(adoptTargets(selected.value, main.value), 'adopt')
 }
 
+/**
+ * 「全部搬进主 store」里的「全部」= 列表里现在这些，跟着筛选和搜索走。
+ *
+ * 按钮就钉在角标筛选器旁边，筛到「重复 26」点下去却搬全机器 43 条，是屏幕上写着
+ * 一件事、实际做另一件事。要搬全部就把筛选清掉 —— 列表本来就是全部。
+ */
 function adoptEverything() {
-  if (!scan.value || !main.value) return
-  adopt(adoptAllTargets(scan.value, main.value), 'adoptAll')
+  if (!main.value) return
+  adopt(adoptAllTargets(list.value, main.value), 'adoptAll')
 }
+
+/**
+ * 按钮上那个数：这一下要搬几**份**内容。0 就置灰，省得点了只弹一句「没什么可做的」。
+ *
+ * 它比列表条数大是正常的 —— 一条 skill 在三个地方各存了一份就要各搬一次。数「份」
+ * 不数「条」是因为这个数要往下一屏传：计划框里写的是「移动 62 · 建链 62」，按钮上
+ * 写条数的话两屏对不上。条数另算一个，只用在 tooltip 里把这笔账说清楚。
+ */
+const adoptAllCount = computed(() =>
+  main.value ? adoptAllTargets(list.value, main.value).length : 0,
+)
+
+/** 这些份数来自几条 skill（已经全在主 store 里的那几条不算）。 */
+const adoptAllSkills = computed(() =>
+  main.value
+    ? list.value.filter((s) => adoptTargets(s, main.value as string).length > 0).length
+    : 0,
+)
 
 function repairSelected() {
   const entry = selected.value
@@ -960,37 +1063,77 @@ function rowSubtitle(s: SkillEntry): string {
             total: String(summary.total),
           })"
       >{{ t('tools.skills.total', { n: shownOfTotal(list.length, summary.total) }) }}</span>
+      <!-- 档次不是毛病也不是来源，是「这东西跟着谁走」—— 和右边那排隔开一条线，
+           免得被当成第七种病。两个都默认开着，也就是默认不过滤。
+           它排在角标前面、且**不进滑动区**：角标那排横着一长条，谁先被挤出屏幕
+           由宽度说了算，而「只看项目级」是天天要点的，不能靠滑一段才找得到。 -->
       <button
-        v-for="badge in BADGE_ORDER"
-        :key="badge"
+        v-for="scope in SKILL_SCOPES"
+        :key="scope"
         type="button"
-        class="skill-badge-chip"
-        :class="[badge, { active: skillFilter.badge === badge, zero: summary[badge] === 0 }]"
-        v-tooltip="t(`tools.skills.badgeTip.${badge}`)"
-        @click="toggleBadgeFilter(badge)"
+        class="skill-badge-chip scope"
+        :class="[scope, {
+          active: skillFilter.scopes.includes(scope),
+          zero: scopeTotals[scope] === 0,
+        }]"
+        :aria-pressed="skillFilter.scopes.includes(scope)"
+        v-tooltip="t(`tools.skills.scopeTip.${scope}`)"
+        @click="toggleScope(scope)"
       >
-        {{ t(`tools.skills.badge.${badge}`) }}
-        <b>{{ summary[badge] }}</b>
+        <component :is="SCOPE_ICONS[scope]" class="skill-badge-ic" />
+        {{ t(`tools.scope.${scope}`) }}
+        <b>{{ scopeTotals[scope] }}</b>
       </button>
-      <!-- 来源，不是毛病：只有这些还能拉到新版本，所以和那四个并排最有用。 -->
-      <button
-        type="button"
-        class="skill-badge-chip fromGit"
-        :class="{ active: skillFilter.fromGit, zero: summary.fromGit === 0 }"
-        v-tooltip="t('tools.skills.badgeTip.fromGit')"
-        @click="toggleFromGit"
+      <span class="skill-head-divider" aria-hidden="true" />
+      <!-- 六个角标吃掉剩下的所有宽度，装不下就横着滑（同会话页 tab 条，见 hstrip.ts）。
+           以前它们是硬挤在这一行里的，窗口一窄就把右边的「主 store」整个顶出屏幕 ——
+           而主 store 是搬家动作的落点，不知道自己往哪儿搬，那个按钮就没法点。 -->
+      <div
+        ref="badgeViewportRef"
+        class="skill-badge-scroll"
+        :style="badgeFade"
+        @wheel="onBadgeWheel"
+        @pointerdown="onBadgePanDown"
       >
-        <IconGithub class="skill-badge-ic" />
-        {{ t('tools.skills.badge.fromGit') }}
-        <b>{{ summary.fromGit }}</b>
-      </button>
+        <div
+          ref="badgeTrackRef"
+          class="skill-badge-track"
+          :class="{ panning: badgePanning }"
+          :style="badgeTrackStyle"
+        >
+          <button
+            v-for="badge in BADGE_ORDER"
+            :key="badge"
+            type="button"
+            class="skill-badge-chip"
+            :class="[badge, { active: skillFilter.badge === badge, zero: summary[badge] === 0 }]"
+            v-tooltip="t(`tools.skills.badgeTip.${badge}`)"
+            @click="toggleBadgeFilter(badge); revealBadgeAfterFilter($event)"
+          >
+            {{ t(`tools.skills.badge.${badge}`) }}
+            <b>{{ summary[badge] }}</b>
+          </button>
+          <!-- 来源，不是毛病：只有这些还能拉到新版本，所以和那四个并排最有用。 -->
+          <button
+            type="button"
+            class="skill-badge-chip fromGit"
+            :class="{ active: skillFilter.fromGit, zero: summary.fromGit === 0 }"
+            v-tooltip="t('tools.skills.badgeTip.fromGit')"
+            @click="toggleFromGit(); revealBadgeAfterFilter($event)"
+          >
+            <IconGithub class="skill-badge-ic" />
+            {{ t('tools.skills.badge.fromGit') }}
+            <b>{{ summary.fromGit }}</b>
+          </button>
+        </div>
+      </div>
     </template>
     <template v-else-if="loading">
       <span class="skill-skel-bar" style="width: 58px" />
       <span v-for="i in 4" :key="i" class="skill-skel-bar chip" :style="{ width: SKEL_CHIP[i - 1] }" />
     </template>
 
-    <span class="skill-head-gap" />
+    <span v-if="!summary" class="skill-head-gap" />
 
     <!-- 首扫完成前这个下拉是空的，渲染出来就是个塌掉的小方块，比没有还难看。 -->
     <template v-if="!scan && loading">
@@ -1073,16 +1216,22 @@ function rowSubtitle(s: SkillEntry): string {
           </div>
         </div>
       </div>
+      <!-- 数字不是装饰：它是「这个按钮吃的是筛完的列表」唯一看得见的证据。筛选一变
+           它跟着变，否则用户没法在点之前确认自己筛对了没有。 -->
       <button
         type="button"
         class="skill-head-btn"
         :class="{ running: pending === 'adoptAll' }"
-        :disabled="busy || !main"
-        v-tooltip="t('tools.skills.action.adoptAllTip')"
+        :disabled="busy || !main || adoptAllCount === 0"
+        v-tooltip="t('tools.skills.action.adoptAllTip', {
+          n: String(adoptAllCount),
+          k: String(adoptAllSkills),
+        })"
         @click="adoptEverything"
       >
         <span v-if="pending === 'adoptAll'" class="chip-spinner" aria-hidden="true" />
         {{ t('tools.skills.action.adoptAll') }}
+        <b>{{ adoptAllCount }}</b>
       </button>
     </template>
     <button
@@ -1151,6 +1300,18 @@ function rowSubtitle(s: SkillEntry): string {
             <!-- 名字和来源图标绑在一起：图标要**紧跟名字**，名字长到要省略号时
                  也不能被一起裁掉，所以省略发生在里层，图标在外层 flex 里不收缩。 -->
             <span class="skill-row-title">
+              <!-- 记号在名字**前面**：这一行右边已经排了 agent 图标 + 角标 + 风险三组，
+                   再往那头加只会让名字那半边更挤；而「这是项目里的还是我全局装的」
+                   是读名字之前就要知道的事。 -->
+              <span
+                v-for="sc in scopesOf(s)"
+                :key="sc"
+                class="skill-row-scope"
+                :class="sc"
+                v-tooltip="t(`tools.scope.${sc}`)"
+              >
+                <component :is="SCOPE_ICONS[sc]" />
+              </span>
               <span class="skill-row-name"><span
                 v-for="(seg, i) in hl(s.name)"
                 :key="i"
@@ -1609,6 +1770,46 @@ function rowSubtitle(s: SkillEntry): string {
 .skill-head-gap {
   flex: 1;
 }
+/* 角标的滑动区：吃掉健康条剩下的宽度，装不下就横着滑（实现见 `hstrip.ts`）。
+   `min-width: 0` 不能省 —— flex 子项默认 `min-width: auto`，六个不换行的药丸会把
+   容器顶到内容那么宽，于是「吃掉剩余宽度」变成「把右边挤出去」，等于没改。 */
+.skill-badge-scroll {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  /* 被切掉的那半个药丸淡出，顺带就是「这边还有」的提示。两侧的宽度由 JS 按
+     「还能不能往这边滑」给，滑到头就收回 0，免得凭空吃掉一个药丸的可读性。 */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--badge-fade-l, 0px),
+    #000 calc(100% - var(--badge-fade-r, 0px)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--badge-fade-l, 0px),
+    #000 calc(100% - var(--badge-fade-r, 0px)),
+    transparent 100%
+  );
+}
+.skill-badge-track {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  transform: translateX(0);
+  transition: transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: transform;
+}
+/* 滚轮 / 拖拽进行中：关掉动画，1:1 跟手 */
+.skill-badge-track.panning {
+  transition: none;
+}
 .skill-badge-chip {
   display: inline-flex;
   align-items: center;
@@ -1640,6 +1841,33 @@ function rowSubtitle(s: SkillEntry): string {
   width: 12px;
   height: 12px;
   opacity: 0.8;
+}
+/* 档次和左边那排「毛病」隔开一条竖线（同 `.list-head-branch-divider` 那一套）。 */
+.skill-head-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+/* 选中态借行里那两个记号的颜色 —— 药丸和行前的小图标说的是同一件事，
+   颜色对不上就得靠读字才知道哪个筛子对应哪个记号。 */
+.skill-badge-chip.scope.user.active {
+  border-color: var(--scope-user);
+  color: var(--text);
+}
+.skill-badge-chip.scope.project.active {
+  border-color: var(--scope-project);
+  color: var(--text);
+}
+.skill-badge-chip.scope.active .skill-badge-ic {
+  opacity: 1;
+}
+.skill-badge-chip.scope.user.active .skill-badge-ic {
+  color: var(--scope-user);
+}
+.skill-badge-chip.scope.project.active .skill-badge-ic {
+  color: var(--scope-project);
 }
 
 .skill-main-store {
@@ -1755,6 +1983,14 @@ function rowSubtitle(s: SkillEntry): string {
 .skill-head-btn:disabled {
   opacity: 0.4;
   cursor: default;
+}
+/* 按钮上那个数：和角标里的 `<b>` 同一套 —— 数字用亮色、等宽，变动的时候按钮不抖。 */
+.skill-head-btn b {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.skill-head-btn:disabled b {
+  color: inherit;
 }
 .skill-head-btn.icon {
   padding: 4px 7px;
@@ -1881,6 +2117,27 @@ function rowSubtitle(s: SkillEntry): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 档次记号。
+ *
+ * `flex-shrink: 0` 是必须的：名字长到要省略号时，收缩的必须是 `.skill-row-name`
+ * 里层那段文字，而不是把这个 12px 的图标压成一条线。
+ *
+ * 不给它加底色药丸 —— 一行里已经有角标和风险两种药丸了，第三种会把名字挤到没边。 */
+.skill-row-scope {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+}
+.skill-row-scope :deep(svg) {
+  width: 12px;
+  height: 12px;
+}
+.skill-row-scope.user {
+  color: var(--scope-user);
+}
+.skill-row-scope.project {
+  color: var(--scope-project);
 }
 /* 压暗：它是出身，不是状态。和右边那排角标抢注意力就本末倒置了。 */
 .skill-row-git {

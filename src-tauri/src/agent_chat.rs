@@ -447,7 +447,7 @@ struct QuestionPayload {
 /// interactive shell 启动时，若被放入独立进程组，会卡在 `initialize` 的首个 JSON-RPC
 /// 请求而不返回任何 stdout；它必须继承父进程组。
 #[cfg(unix)]
-fn build_piped_command(
+pub(crate) fn build_piped_command(
     cwd: &str,
     command: &AgentCommand,
     use_reclaude: bool,
@@ -487,7 +487,7 @@ fn build_piped_command(
 }
 
 #[cfg(windows)]
-fn build_piped_command(
+pub(crate) fn build_piped_command(
     cwd: &str,
     command: &AgentCommand,
     use_reclaude: bool,

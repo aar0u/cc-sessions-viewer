@@ -497,6 +497,21 @@ export interface AccountUsage {
   sevenDaySonnet?: UsageWindow | null
 }
 
+/** Codex 单个额度窗口（与 Rust codex_usage::CodexUsageWindow 同形）。 */
+export interface CodexUsageWindow {
+  /** 已用百分比 0–100。 */
+  usedPercent: number
+  /** 窗口长度（分钟）：300 = 5 小时，10080 = 7 天。标签据此选。 */
+  windowMinutes: number
+  /** ISO8601 重置时间（后端已把 app-server 的 unix 秒转成字符串）。 */
+  resetsAt?: string
+}
+/** Codex 账号额度快照（与 Rust codex_usage::CodexAccountUsage 同形）。 */
+export interface CodexAccountUsage {
+  primary?: CodexUsageWindow | null
+  secondary?: CodexUsageWindow | null
+}
+
 /** 设置页「存储占用」的一行。`key` 同时是 `clearStorage` 的入参。 */
 export interface StorageUsageEntry {
   key: string
@@ -1223,6 +1238,13 @@ export interface AdoptConflict {
   skillMd: LineDiff | null
   /** 「都留着」时建议的新名字，已避开主 store 里已有的。 */
   suggestedRename: string
+  /**
+   * A 那一侧是不是**已经**在主 store 里。
+   *
+   * 一次收编里同名的第二份，比的是这一批的第一份 —— 它此刻还在别的 store 里，只是
+   * 这一批结束之后会成为主 store 那份。false 时冲突框换 A 的标签。
+   */
+  mainInStore: boolean
 }
 
 export interface DeleteOptions {

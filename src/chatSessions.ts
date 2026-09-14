@@ -29,6 +29,7 @@ import {
 } from './chatQuestion'
 import { useReclaude } from './settings'
 import { bumpUsage } from './usage'
+import { bumpCodexUsage } from './codexUsage'
 import { markProjectsDirty } from './projectsRefresh'
 import { snapshotMsgs } from './msgSnapshot'
 import { humanizeRestoreError, humanizeSessionError, isRetryableSessionError } from './sessionError'
@@ -634,7 +635,9 @@ function onResult(s: ChatSession, p: ChatResultPayload) {
   s.lastTurnOutcome = p.ok === false ? 'failed' : 'completed'
   endTurn(s)
   // 一轮结束 → 账号 5h/周额度刚被这次对话消耗、值会变 → 事件驱动强制刷新（慢轮询之外的实时补位）。
-  bumpUsage()
+  // 两家各刷各的（数据源不同），且各自内部只在「有徽标在看」时才真的取数。
+  if (s.agent === 'claude') bumpUsage()
+  else if (s.agent === 'codex') bumpCodexUsage()
   maybePromptForCodexPlanImplementation(s)
   // 本轮结束 → 若有待发消息，按序发下一条（type-while-running 队列）。
   if (!s.pendingQuestions.some((q) => q.keepAfterTurn)) drainQueue(s)

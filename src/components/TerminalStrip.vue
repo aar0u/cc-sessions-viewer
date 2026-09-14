@@ -14,6 +14,7 @@ import {
   savedTabs,
   removeSavedTab,
 } from '../terminals'
+import { useHStrip } from '../hstrip'
 import { statusKind } from '../tabStatus'
 import { markViewTabViewed, viewTabStatusKind, type ViewTab } from '../viewTabs'
 import type { Pane } from '../panes'
@@ -26,6 +27,7 @@ import {
   IconList,
   IconPlus,
   IconReader,
+  IconExitPane,
   IconSplitH,
   IconSplitV,
   IconTerminal,
@@ -286,81 +288,22 @@ function dropSideAt(orderIndex: number): 'before' | 'after' | null {
 }
 
 // ---- 横向滑动（无原生滚动条）: translateX + CSS transition ----
-// 拿掉丑陋的横向滚动条，把 tab 条做成一个可滑动的遮罩区：所有 tab 放进 .term-strip-track，
-// 用 transform: translateX(-scrollX) 平移；滚轮 / 拖空白处改 scrollX（跟手、关 transition），
-// 点临近边缘的 tab / 新建 tab 则带 transition 平滑滑入。
+// 所有 tab 放进 .term-strip-track，靠平移露出被裁掉的部分；实现在 `hstrip.ts`，
+// 工具管理页健康条那排角标用的是同一条。tab 本体的按下要留给排序拖拽，所以把它们
+// 从「拖空白处平移」里排除掉。
 const viewportRef = ref<HTMLElement>()
 const trackRef = ref<HTMLElement>()
-const scrollX = ref(0)
-const maxScroll = ref(0)
-// panning=true 时关掉 transition，让滚轮 / 拖拽 1:1 跟手；程序化滑动时为 false 走动画。
-const panning = ref(false)
-const canLeft = computed(() => scrollX.value > 0.5)
-const canRight = computed(() => scrollX.value < maxScroll.value - 0.5)
-const trackStyle = computed(() => ({ transform: `translateX(${-scrollX.value}px)` }))
+const {
+  panning,
+  canLeft,
+  canRight,
+  trackStyle,
+  measure,
+  revealEl,
+  onWheel,
+  onPanPointerDown,
+} = useHStrip(viewportRef, trackRef, { grabExclude: '.term-tab, .term-tab-new' })
 
-function measure() {
-  const vp = viewportRef.value
-  const tr = trackRef.value
-  maxScroll.value = vp && tr ? Math.max(0, tr.scrollWidth - vp.clientWidth) : 0
-  if (scrollX.value > maxScroll.value) scrollX.value = maxScroll.value
-}
-function setScroll(x: number) {
-  scrollX.value = Math.max(0, Math.min(x, maxScroll.value))
-}
-
-// 滚轮 / 触控板 → 横向平移（取代原生横向滚动）
-let wheelIdleTimer = 0
-function onWheel(ev: WheelEvent) {
-  if (maxScroll.value <= 0) return
-  const delta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY
-  if (!delta) return
-  ev.preventDefault()
-  panning.value = true
-  setScroll(scrollX.value + delta)
-  window.clearTimeout(wheelIdleTimer)
-  wheelIdleTimer = window.setTimeout(() => (panning.value = false), 140)
-}
-
-// 拖拽空白处 → 平移（tab 本体的拖拽留给排序逻辑，不在此响应）
-let pan: { startX: number; startScroll: number } | null = null
-function onPanPointerDown(ev: PointerEvent) {
-  if (ev.button !== 0 || maxScroll.value <= 0) return
-  const target = ev.target as HTMLElement | null
-  if (target?.closest('.term-tab, .term-tab-new')) return
-  pan = { startX: ev.clientX, startScroll: scrollX.value }
-  panning.value = true
-  window.addEventListener('pointermove', onPanPointerMove)
-  window.addEventListener('pointerup', onPanPointerUp)
-  window.addEventListener('pointercancel', onPanPointerUp)
-}
-function onPanPointerMove(ev: PointerEvent) {
-  if (!pan) return
-  setScroll(pan.startScroll - (ev.clientX - pan.startX))
-}
-function onPanPointerUp() {
-  pan = null
-  panning.value = false
-  window.removeEventListener('pointermove', onPanPointerMove)
-  window.removeEventListener('pointerup', onPanPointerUp)
-  window.removeEventListener('pointercancel', onPanPointerUp)
-}
-
-// 把某个 tab 完整滑入视野；点临近边缘（被遮挡）的 tab 时露出它被切掉的部分
-function revealEl(el: HTMLElement | null | undefined) {
-  measure()
-  const vp = viewportRef.value
-  if (!vp || !el || maxScroll.value <= 0) return
-  const tabRect = el.getBoundingClientRect()
-  const vpRect = vp.getBoundingClientRect()
-  const margin = 16
-  let dx = 0
-  if (tabRect.left < vpRect.left + margin) dx = tabRect.left - (vpRect.left + margin)
-  else if (tabRect.right > vpRect.right - margin) dx = tabRect.right - (vpRect.right - margin)
-  if (dx === 0) return
-  panning.value = false // 程序化滑动：保留 transition 动画
-  setScroll(scrollX.value + dx)
-}
 function revealActiveTab() {
   nextTick(() => {
     const el = trackRef.value?.querySelector<HTMLElement>(
@@ -370,22 +313,6 @@ function revealActiveTab() {
   })
 }
 
-let stripRo: ResizeObserver | null = null
-watch(
-  viewportRef,
-  (el) => {
-    stripRo?.disconnect()
-    stripRo = null
-    if (!el || typeof ResizeObserver === 'undefined') return
-    stripRo = new ResizeObserver(() => measure())
-    stripRo.observe(el)
-    nextTick(() => {
-      if (trackRef.value && stripRo) stripRo.observe(trackRef.value)
-      measure()
-    })
-  },
-  { immediate: true },
-)
 watch([() => visibleTabs.value.length, () => visibleSaved.value.length, () => props.viewTabs.length], () => {
   nextTick(() => {
     measure()
@@ -411,13 +338,6 @@ watch(() => props.activeViewTabId, (id, previousId) => {
     const el = trackRef.value?.querySelector<HTMLElement>(`.term-tab[data-tab-ui-id="${id}"]`)
     revealEl(el)
   })
-})
-onUnmounted(() => {
-  stripRo?.disconnect()
-  window.clearTimeout(wheelIdleTimer)
-  window.removeEventListener('pointermove', onPanPointerMove)
-  window.removeEventListener('pointerup', onPanPointerUp)
-  window.removeEventListener('pointercancel', onPanPointerUp)
 })
 
 // ---- 新建会话下拉菜单（+ 按钮） ----
@@ -1445,6 +1365,18 @@ onUnmounted(() => {
       tabindex="0"
       @click="pa.splitV()"
     ><IconSplitV /></div>
+    <!-- 退出分屏：和 SessionsView 的 list-head 一样，只在真的分了屏时出现。
+         那边是纯列表态（一个 tab 都没开）的入口，这条 strip 才是开着 tab 时唯一能看到的
+         那排按钮 —— 两处都得有，否则进了会话/终端就没法退出这一格。 -->
+    <div
+      v-if="paneCount > 1"
+      class="term-tab-new"
+      style="flex-shrink:0"
+      v-tooltip:bottom="t('pane.exit')"
+      role="button"
+      tabindex="0"
+      @click="pa.exitPane(pane.id)"
+    ><IconExitPane /></div>
 
     <div
       v-if="stripCtx"

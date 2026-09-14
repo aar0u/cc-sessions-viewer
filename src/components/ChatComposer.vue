@@ -67,6 +67,14 @@ import {
   stopUsagePolling,
 } from '../usage'
 import {
+  codexUsage,
+  codexUsageWindows,
+  codexWindowLabel,
+  codexNowMs,
+  startCodexUsagePolling,
+  stopCodexUsagePolling,
+} from '../codexUsage'
+import {
   codexPluginMentionRanges,
 } from '../codexPluginMentions'
 import { formatInlineFileMention, inlineFileMentions } from '../inlineFileMentions'
@@ -115,8 +123,13 @@ const dragOver = ref(false)
 let dropUnlisten: UnlistenFn | null = null
 
 // 进入 live chat 即订阅账号额度轮询，离开退订（引用计数，多个 composer 共享一个定时器）。
+// 两家的取数完全独立：Claude 打 OAuth 用量接口，Codex 借 codex app-server 读 —— 只订阅
+// 当前会话这一家，别让 Codex 会话顺手去打 Anthropic 的接口（那边对密集调用会 429）。
+const pollsClaudeUsage = props.session.agent === 'claude'
+const pollsCodexUsage = props.session.agent === 'codex'
 onMounted(() => {
-  startUsagePolling()
+  if (pollsClaudeUsage) startUsagePolling()
+  if (pollsCodexUsage) startCodexUsagePolling()
   window.addEventListener('keydown', onGlobalKeydown)
   void getCurrentWebview()
     .onDragDropEvent((e) => {
@@ -166,7 +179,8 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   saveDraft(props.session)
-  stopUsagePolling()
+  if (pollsClaudeUsage) stopUsagePolling()
+  if (pollsCodexUsage) stopCodexUsagePolling()
   window.removeEventListener('keydown', onGlobalKeydown)
   if (mentionTimer !== null) clearTimeout(mentionTimer)
   dropUnlisten?.()
@@ -450,6 +464,33 @@ const rateBadges = computed(() => {
       level: usageLevel(w.percent),
       // 悬浮显示绝对重置时刻（与行内相对倒计时互补）。
       tooltip: reset ? t('chat.composer.limit.resets', { time: reset }) : `${label} ${w.percent}%`,
+    }
+  })
+})
+
+// Codex 的额度徽标自成一套：数据源是 codex app-server 的 account/rateLimits/read，窗口长度
+// 由服务端给（plus/pro 是 300 / 10080 分钟），可见性由后端把关 —— 非官方订阅登录（API key /
+// 第三方 provider）那条命令直接报错、快照保持为空，这里自然就没有徽标，与需求「第三方 apikey
+// 保持现状」一致。所以这里不需要再判一次 apiKeySource。
+const codexRateBadges = computed(() => {
+  if (props.session.agent !== 'codex') return []
+  const now = codexNowMs.value // 读响应式心跳 → 倒计时每跳重算。
+  return codexUsageWindows(codexUsage.value).map((w) => {
+    // 常见的两档对齐 Claude 的说法（5h / 周），别的套餐长度回落到按分钟算的紧凑标签。
+    const label =
+      w.minutes === 300
+        ? t('chat.composer.limit.fiveHour')
+        : w.minutes === 10080
+          ? t('chat.composer.limit.weekly')
+          : codexWindowLabel(w.minutes)
+    const remaining = formatRemaining(w.resetsAt, now)
+    const reset = rlResetText(w.resetsAt)
+    const head = label ? `${label} ${w.percent}%` : `${w.percent}%`
+    return {
+      key: w.key,
+      text: remaining ? `${head} · ${remaining}` : head,
+      level: usageLevel(w.percent),
+      tooltip: reset ? t('chat.composer.limit.resets', { time: reset }) : head,
     }
   })
 })
@@ -2116,6 +2157,13 @@ function queuedLabel(q: QueuedMessage): string {
         >{{ ctxPercent }}%</span>
         <span
           v-for="b in rateBadges"
+          :key="b.key"
+          class="cc-ratelimit"
+          :class="{ warn: b.level === 'warn', danger: b.level === 'danger' }"
+          v-tooltip="b.tooltip"
+        >{{ b.text }}</span>
+        <span
+          v-for="b in codexRateBadges"
           :key="b.key"
           class="cc-ratelimit"
           :class="{ warn: b.level === 'warn', danger: b.level === 'danger' }"

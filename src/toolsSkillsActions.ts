@@ -149,9 +149,17 @@ export function adoptTargets(entry: SkillEntry, main: string): AdoptRequest[] {
     .map((b) => ({ name: entry.name, body: b.path, resolution: null }))
 }
 
-/** 整批收编：全机器所有不在主 store 里的实体内容。 */
-export function adoptAllTargets(scan: SkillScan, main: string): AdoptRequest[] {
-  return scan.skills.flatMap((s) => adoptTargets(s, main))
+/**
+ * 整批收编：**列表里当前这些** skill 的外部实体内容。
+ *
+ * 吃的是筛完、搜完之后的那份列表，不是整份扫描结果。理由是这个按钮就钉在健康条上，
+ * 和角标筛选器并排 —— 筛到「重复 26」只想收编这 26 条，点下去却把全机器 43 条都搬了，
+ * 那是屏幕上写的一件事、实际做的另一件事。
+ *
+ * 想收编全部：把筛选清掉，列表本来就是全部。
+ */
+export function adoptAllTargets(skills: SkillEntry[], main: string): AdoptRequest[] {
+  return skills.flatMap((s) => adoptTargets(s, main))
 }
 
 // ---------------------------------------------------------------------------

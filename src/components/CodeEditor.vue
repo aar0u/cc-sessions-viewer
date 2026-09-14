@@ -140,7 +140,7 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-/** 两层同步滚动。高亮层自己不滚（`overflow: hidden`），位置完全跟着 textarea。 */
+/** 两层同步滚动。高亮层不接受输入，滚动位置完全跟着 textarea 走。 */
 function onScroll() {
   const ta = taEl.value
   const hl = hlEl.value
@@ -224,7 +224,17 @@ defineExpose({ focus: () => taEl.value?.focus() })
   border: 0;
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 12.5px;
-  line-height: 1.65;
+  /* **必须是整数 px，不能写 1.65 这种比例。**
+     12.5 × 1.65 = 20.625px —— `<pre>` 老老实实按 20.625 排每一行，而 `<textarea>`
+     的行盒会被取整到 21px（WebKit 对文本控件的处理）。每行差 0.375px 看不出来，
+     累起来就是灾难：本机实测这份 77 行的 SKILL.md，高亮层 scrollHeight 1861、
+     textarea 1820，差 41px（正好 66 个未折行的行 × 0.625）。
+     后果有两个：
+     1. 滚动位置由 textarea 定，它到底了高亮层还差 41px —— 最后两行永远露不出来，
+        看上去就是「编辑器底部被框截掉了」。
+     2. 光标和字从上往下越走越偏，中段就能看出来错半行。
+     21px 时两层完全一致（实测 scrollHeight 都是 1910，各 90 个行盒）。 */
+  line-height: 21px;
   letter-spacing: 0;
   tab-size: 2;
   white-space: pre-wrap;
@@ -234,9 +244,25 @@ defineExpose({ focus: () => taEl.value?.focus() })
 
 .ce-hl {
   overflow: hidden;
+  /* 滚动条那 5px 两层都得留出来。
+     全局 `::-webkit-scrollbar` 是 5px 宽的**实体**滚动条（不是覆盖式），textarea 一
+     溢出就被它吃掉 5px 内容宽度，而高亮层 `overflow: hidden` 不会 —— 两层的折行宽度
+     于是差 5px，长行的折行点对不上。本机实测同一个 SKILL.md：高亮层 scrollHeight
+     1861、textarea 1820，差 41px（两行）。
+     后果有两个，第二个更要命：
+     1. 滚到底还有两行高亮文字露不出来 —— 滚动位置由 textarea 定，它到头了，高亮层
+        还差 41px。看上去就是「编辑器底部被框截掉了」。
+     2. 折行之后光标和字对不齐，越往下越歪。
+     `overflow-y: scroll` 而不是 `auto`：`auto` 只在内容溢出时才留槽，短文件又会反过来
+     差 5px。两层都恒定留槽，任何长度都对齐。 */
+  overflow-y: scroll;
   color: var(--text);
   pointer-events: none;
   counter-reset: ce-line;
+}
+/* 高亮层的滚动条只是用来占位的，别真画出来 —— 它和 textarea 那条完全重合。 */
+.ce-hl::-webkit-scrollbar-thumb {
+  background: transparent;
 }
 
 /* 一行一个块。空行也得占一行的高 —— 空盒子高度是 0，下面所有行就往上串一行。
@@ -264,6 +290,8 @@ defineExpose({ focus: () => taEl.value?.focus() })
 
 .ce-ta {
   overflow: auto;
+  /* 和高亮层一样恒定留槽（见 `.ce-hl`）。`auto` 会让短文件比长文件宽 5px。 */
+  overflow-y: scroll;
   resize: none;
   background: transparent;
   /* 字本身透明，只留光标 —— 看到的字全部来自底下那层。 */

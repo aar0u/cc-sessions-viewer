@@ -30,3 +30,6 @@ coverage
 openspec/*
 docs/plans/*
 docs/superpowers/*
+
+# 我的文章草稿，不进仓库
+my-articles/

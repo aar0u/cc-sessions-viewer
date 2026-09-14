@@ -97,6 +97,8 @@ import IconPaperclipRaw from '~icons/lucide/paperclip'
 import IconSlashSquareRaw from '~icons/lucide/square-slash'
 import IconSkillRaw from '~icons/lucide/box'
 import IconContextWindowRaw from '~icons/lucide/layout-grid'
+import IconScopeUserRaw from '~icons/lucide/user'
+import IconScopeProjectRaw from '~icons/lucide/folder-code'
 import IconExitPaneRaw from '~icons/lucide/log-out'
 import piLogo from '../assets/pi.svg'
 
@@ -189,6 +191,13 @@ export const IconPaperclip = IconPaperclipRaw
 export const IconSlashSquare = IconSlashSquareRaw
 export const IconSkill = IconSkillRaw
 export const IconContextWindow = IconContextWindowRaw
+/* Skills 的档次记号：`user` = 用户级（`~/` 下面，跟着人走），`folder-code` = 项目级
+   （跟着仓库走）。用户级不用 `house` —— 「家」和「文件夹」都是容器，12px 下两个记号
+   要盯着看才分得清是哪一档；人形和文件夹一眼就是两回事。
+   项目级不复用 `IconFolder` —— 那个已经是行里「在 Finder 里打开」的按钮，同一行两个
+   一模一样的文件夹指两件事。 */
+export const IconScopeUser = IconScopeUserRaw
+export const IconScopeProject = IconScopeProjectRaw
 // 「已 pin」状态的小圆点指示器；6×6 实心圆，自己拼比拉一整个集合便宜。
 import { defineComponent, h, type Component } from 'vue'
 

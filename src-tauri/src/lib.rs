@@ -21,6 +21,7 @@ mod background_media;
 mod bookmarks;
 mod claude_config;
 mod cli_env;
+mod codex_usage;
 mod desktop_pet_assets;
 mod diagnostics;
 mod git;
@@ -540,15 +541,8 @@ fn claude_runtime_info() -> Result<ClaudeRuntimeInfo, String> {
 fn codex_runtime_info() -> CodexRuntimeInfo {
     let config_path = util::home().join(".codex").join("config.toml");
     let content = fs::read_to_string(&config_path).unwrap_or_default();
-    let uses_api_key = content.lines().any(|l| {
-        let l = l.trim();
-        l.starts_with("model_provider")
-            && l.contains('=')
-            && !l.starts_with('#')
-            && !l.starts_with('[')
-    });
     CodexRuntimeInfo {
-        uses_api_key,
+        uses_api_key: codex_usage::uses_custom_provider(&content),
         model: top_level_toml_string(&content, "model"),
         effort: top_level_toml_string(&content, "model_reasoning_effort"),
     }
@@ -2544,6 +2538,21 @@ async fn account_usage(force: Option<bool>) -> Result<usage_api::AccountUsage, S
         .map_err(|e| format!("join: {e}"))?
 }
 
+/// Codex 账号额度（5 小时 / 周）—— 借 `codex app-server` 的 `account/rateLimits/read`
+/// 读一次官方订阅的额度窗口。返回 `null` = 额度窗口不适用（API key / 第三方 provider /
+/// 已退登），前端据此抹掉徽标；`Err` 才是「这次没取到」。
+/// async + spawn_blocking：内部要起一个短命 codex 子进程（~2s），不能阻塞 webview 主线程。
+/// `force=true`：绕过 20s 缓存强制拉新（一轮对话结束后用，拿刚变化的值）。
+#[tauri::command]
+async fn codex_account_usage(
+    force: Option<bool>,
+) -> Result<Option<codex_usage::CodexAccountUsage>, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || codex_usage::codex_account_usage_blocking(force))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+}
+
 /// 托盘弹窗用的快速统计：一次扫描三个时间窗口，返回 per-agent 的 token + cost。
 /// async + spawn_blocking —— 扫描耗时取决于会话数量（几百毫秒到几秒），不能阻塞主线程。
 #[tauri::command]
@@ -2777,6 +2786,7 @@ pub fn run() {
             pricing_status,
             list_pricing,
             account_usage,
+            codex_account_usage,
             tray_quick_stats,
             set_tray_enabled_agents,
             check_cli_versions,

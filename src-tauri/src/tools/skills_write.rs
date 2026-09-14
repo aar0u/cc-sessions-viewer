@@ -20,7 +20,7 @@
 use super::textdiff::{lcs_len, line_hunks, MAX_DIFF_LINES};
 use crate::types::DiffHunk;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -179,6 +179,12 @@ pub struct AdoptConflict {
     pub skill_md: Option<LineDiff>,
     /// 「都留着」时建议的新名字，已经避开主 store 里已有的名字。
     pub suggested_rename: String,
+    /// A 那一侧是不是**已经**在主 store 里。
+    ///
+    /// 同一批收编里同名的第二份，比的是这一批的第一份 —— 它此刻还躺在别的 store 里，
+    /// 只是结束之后会成为主 store 那份。冲突框据此换 A 的标签，不然会写出
+    /// 「主 store 里的 ~/.cc-switch/skills/dm-watch」这种自相矛盾的一行。
+    pub main_in_store: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +328,16 @@ pub fn adopt(
     // 计划阶段就要知道主 store 里将会有哪些名字：同一批里两条都选「都留着」时，
     // 建议的新名字不能撞在一起。
     let mut taken = existing_names(main_store);
+    // 这一批已经计划让**谁**落在主 store 的**哪个位置**上（目的地 → 那份内容现在在哪）。
+    //
+    // 没有这张表的话，同名的第二份会看到「目的地在磁盘上还不存在」，于是又排一次
+    // `MoveDir` 搬到同一个位置 —— 执行到第二步撞上「目标已存在」，整批回滚。本机实测：
+    // `dm-watch` 在 `~/.cc-switch/skills` 和 `~/.skills-manager/skills` 各有一份，点
+    // 「搬进主 store」直接报 `Move target already exists`，一个字节都没搬成。
+    //
+    // 表比磁盘优先：磁盘看到的是这一批动手**之前**的样子，而第二份要比的是第一份搬完
+    // 之后那个位置上的东西。
+    let mut planned: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     if !main_store.exists() {
         ops.push(Op::EnsureDir {
@@ -358,10 +374,11 @@ pub fn adopt(
                 backup: false,
             });
             ops.push(Op::Link {
-                at: body,
-                target: dest,
+                at: body.clone(),
+                target: dest.clone(),
             });
             taken.push(item.name.clone());
+            planned.insert(dest, body);
             continue;
         }
 
@@ -371,28 +388,40 @@ pub fn adopt(
             continue;
         }
 
-        if !dest.exists() {
+        // 那个位置上「将会是」什么：这一批已经安排过就用安排的那份，否则看磁盘。
+        let reference = planned
+            .get(&dest)
+            .cloned()
+            .or_else(|| dest.exists().then(|| dest.clone()));
+
+        let Some(reference) = reference else {
+            // 没人占着，直接搬。
             ops.push(Op::MoveDir {
                 from: body.clone(),
                 to: dest.clone(),
                 backup: false,
             });
             ops.push(Op::Link {
-                at: body,
-                target: dest,
+                at: body.clone(),
+                target: dest.clone(),
             });
             taken.push(item.name.clone());
+            planned.insert(dest, body);
             continue;
-        }
+        };
 
-        if !dest.is_dir() {
+        if dest.exists() && !dest.is_dir() {
             return Err(format!(
                 "Main store already has a non-directory at {}",
                 dest.display()
             ));
         }
 
-        let (identical, conflict) = compare(&item.name, &dest, &body, &taken)?;
+        // 比较对象是 `reference` 而不是 `dest`：同一批里的第二份要比的是第一份，
+        // 那时候 `dest` 在磁盘上还是空的，拿它去比会读出一个空目录、判成「不一致」，
+        // 然后弹一个两边都看不出所以然的冲突框。
+        let in_store = reference == dest;
+        let (identical, conflict) = compare(&item.name, &reference, &body, &taken, in_store)?;
         if identical {
             // 内容一样，没什么好问的：删掉外部那份，原位改成链接。
             ops.extend(link_over(&body, &dest));
@@ -420,14 +449,16 @@ pub fn adopt(
                     backup: false,
                 });
                 ops.push(Op::Link {
-                    at: body,
-                    target: dest,
+                    at: body.clone(),
+                    target: dest.clone(),
                 });
                 ops.push(Op::DeleteDir { path: backup });
+                // 这个位置上的内容换人了：批里第三份同名的要跟这一份比，不是跟被挪走的那份。
+                planned.insert(dest, body);
             }
             Resolution::KeepBoth(new_name) => {
                 let renamed = main_store.join(&new_name);
-                if renamed.exists() {
+                if renamed.exists() || planned.contains_key(&renamed) {
                     return Err(format!("Main store already has {}", renamed.display()));
                 }
                 ops.push(Op::MoveDir {
@@ -436,10 +467,11 @@ pub fn adopt(
                     backup: false,
                 });
                 ops.push(Op::Link {
-                    at: body,
-                    target: renamed,
+                    at: body.clone(),
+                    target: renamed.clone(),
                 });
                 taken.push(new_name);
+                planned.insert(renamed, body);
             }
         }
     }
@@ -1140,11 +1172,18 @@ fn walk_content(
 }
 
 /// 两边一样吗，以及不一样的话差在哪。
+/// 两份同名内容的逐文件比对。
+///
+/// `main` 不一定真的在主 store 里 —— 同一批收编里，第二份要比的是**第一份**（它还在
+/// 原处，但这一批结束后它就是主 store 里的那份）。`main_in_store` 把这件事告诉前端，
+/// 冲突框据此换掉 A 那一侧的标签；否则会出现「主 store 里的 ~/.cc-switch/skills/…」
+/// 这种自相矛盾的一行。
 fn compare(
     name: &str,
     main: &Path,
     external: &Path,
     taken: &[String],
+    main_in_store: bool,
 ) -> Result<(bool, AdoptConflict), String> {
     let (main_map, main_truncated) = content_map(main);
     let (ext_map, ext_truncated) = content_map(external);
@@ -1181,6 +1220,7 @@ fn compare(
             files,
             skill_md: skill_md_diff(main, external),
             suggested_rename: suggest_rename(name, external, taken),
+            main_in_store,
         },
     ))
 }
@@ -1446,6 +1486,122 @@ mod tests {
         // 没选之前一步都不做。
         assert!(report.steps.is_empty());
         assert!(!link::is_link(&body));
+    }
+
+    /// 同一批里同名的两份、内容一样：第二份只改成链接，**不能**再排一次搬运。
+    ///
+    /// 本机实测的那一幕：`dm-watch` 在 `~/.cc-switch/skills` 和 `~/.skills-manager/skills`
+    /// 各躺一份，点「搬进主 store」→ `Move target already exists: …/dm-watch`，
+    /// 整批回滚，一个字节都没搬成。原因是计划阶段拿 `dest.exists()` 问的是**磁盘**，
+    /// 而磁盘看到的是这一批动手之前的样子 —— 第二份于是又排了一次 `MoveDir` 到同一个
+    /// 位置。26 条重复里每条都是这个形状，也就是「全部搬进主 store」必炸。
+    #[test]
+    fn two_copies_of_one_name_in_the_same_batch_move_once_and_link_the_rest() {
+        let root = temp_root("batch-same");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        let a = root.join("store-a");
+        let b = root.join("store-b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let first = skill(&a, "dm-watch", "same body\n");
+        let second = skill(&b, "dm-watch", "same body\n");
+
+        let report = adopt(
+            &[req("dm-watch", &first, None), req("dm-watch", &second, None)],
+            &main,
+            false,
+        )
+        .unwrap();
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert!(report.steps.iter().all(|s| s.done), "{:?}", report.steps);
+        // 主 store 里是**真目录**，两处原位都成了指过来的链接。
+        let dest = main.join("dm-watch");
+        assert!(!link::is_link(&dest));
+        assert_eq!(
+            fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "same body\n"
+        );
+        for old in [&first, &second] {
+            assert!(link::is_link(old), "{} 应该变成链接", old.display());
+            let (_, resolved) = link::resolve_chain(old, 16);
+            assert!(link::same_path(&resolved.unwrap(), &dest));
+        }
+    }
+
+    /// 同一批里同名的两份、内容不一样：问，而不是搬两次撞车。
+    ///
+    /// A 那一侧是这一批的第一份 —— 它此刻还在别的 store 里，所以 `main_in_store` 是
+    /// false，冲突框据此换标签，不然会写出「主 store 里的 <另一个 store 的路径>」。
+    #[test]
+    fn two_differing_copies_in_one_batch_ask_instead_of_colliding() {
+        let root = temp_root("batch-diff");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        let a = root.join("store-a");
+        let b = root.join("store-b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let first = skill(&a, "dm-watch", "one\n");
+        let second = skill(&b, "dm-watch", "one\ntwo\n");
+
+        let report = adopt(
+            &[req("dm-watch", &first, None), req("dm-watch", &second, None)],
+            &main,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.conflicts.len(), 1);
+        let c = &report.conflicts[0];
+        assert_eq!(c.name, "dm-watch");
+        assert!(!c.main_in_store, "A 还没进主 store，标签不能写成「主 store 里的」");
+        assert_eq!(c.main.path, first.to_string_lossy());
+        assert_eq!(c.external.path, second.to_string_lossy());
+        // 第一份照搬（计划里有它的两步），第二份等用户选，所以不许出现第二次搬运。
+        let moves: Vec<&WriteStep> = report
+            .steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Move)
+            .collect();
+        assert_eq!(moves.len(), 1, "{:?}", report.steps);
+        assert_eq!(moves[0].path, first.to_string_lossy());
+    }
+
+    /// 选了「留 A」之后，第二份就地改成链接 —— 两处旧路径都还能用。
+    #[test]
+    fn resolving_a_same_batch_clash_keeps_one_body_and_links_both_old_spots() {
+        let root = temp_root("batch-resolve");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        let a = root.join("store-a");
+        let b = root.join("store-b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let first = skill(&a, "dm-watch", "one\n");
+        let second = skill(&b, "dm-watch", "one\ntwo\n");
+
+        let report = adopt(
+            &[
+                req("dm-watch", &first, Some(Resolution::KeepMain)),
+                req("dm-watch", &second, Some(Resolution::KeepMain)),
+            ],
+            &main,
+            false,
+        )
+        .unwrap();
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert!(report.steps.iter().all(|s| s.done));
+        let dest = main.join("dm-watch");
+        // 留下的是第一份的内容。
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "one\n");
+        for old in [&first, &second] {
+            assert!(link::is_link(old), "{} 应该变成链接", old.display());
+        }
+        // 备份位不留垃圾。
+        assert!(!backup_path(&second).exists());
     }
 
     #[test]

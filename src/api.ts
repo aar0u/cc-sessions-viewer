@@ -6,6 +6,7 @@ import type {
   ChatImageInput,
   ChatTextElement,
   ClaudeRuntimeInfo,
+  CodexAccountUsage,
   CodexRuntimeInfo,
   ChatStartInfo,
   RunningChatInfo,
@@ -658,6 +659,12 @@ export const setTrayEnabledAgents = (agents: Agent[]) =>
 
 /** 账号额度（5 小时 / 周 / 各模型分项）—— 走 OAuth 用量接口，每窗口含精确利用率 + 重置时间。 */
 export const accountUsage = (force = false) => invoke<AccountUsage>('account_usage', { force })
+
+/** Codex 账号额度（5 小时 / 周）—— 借 `codex app-server` 读官方订阅的额度窗口。
+ *  `null` = 额度窗口不适用（第三方 API key / provider / 已退登），调用方据此抹掉徽标；
+ *  reject 才是「这次没取到」（留着上一次的值别闪空）。 */
+export const codexAccountUsage = (force = false) =>
+  invoke<CodexAccountUsage | null>('codex_account_usage', { force })
 
 export interface UpdateInfo {
   current: string

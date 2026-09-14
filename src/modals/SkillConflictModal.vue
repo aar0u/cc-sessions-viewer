@@ -87,7 +87,12 @@ function confirm() {
 
         <div class="skill-conflict-sides">
           <div class="skill-conflict-side">
-            <span class="skill-conflict-tag">A · {{ t('tools.skills.conflict.mainSide') }}</span>
+            <!-- A 不一定已经在主 store 里：同一批收编里同名的第二份，比的是这一批的
+                 第一份，它此刻还在别的 store。标签写死「主 store 里的」会和它下面那行
+                 路径当场对不上。 -->
+            <span class="skill-conflict-tag">A · {{ t(conflict.mainInStore
+              ? 'tools.skills.conflict.mainSide'
+              : 'tools.skills.conflict.incomingSide') }}</span>
             <span class="skill-conflict-path">{{ short(conflict.main.path) }}</span>
             <span class="skill-conflict-meta">
               {{ t('tools.skills.fileCount', { n: String(conflict.main.files) }) }} ·

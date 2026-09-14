@@ -59,6 +59,11 @@
   --status-done: #10b981;
   --status-blocked: #f59e0b;
   --status-error: #ef4444;
+  /* Skills 行前的档次记号。用户级是绝大多数，压成中性 —— 每行都亮一下等于没标；
+     项目级是少数，给个扫得到的色。两个都从主题已有的 token 派生，所以 dark /
+     codex / dracula 不用各写一遍（它们和 :root 挂在同一个根元素上）。 */
+  --scope-user: var(--text-mute);
+  --scope-project: var(--status-running);
   --user-bubble: #f5f5f5;
   --assistant-bubble: transparent;
   --code-bg: hsl(0 0% 97%);
@@ -441,6 +446,14 @@ button {
 :root.has-custom-background .skill-plan-modal,
 :root.has-custom-background .skill-conflict-modal {
   background: color-mix(in srgb, var(--surface) 80%, transparent);
+}
+
+/* 排序条 sticky 钉在列表顶上，底色是用来挡住从它下面滚过去的行的，所以不能全透明
+   （那几行字会和「Newest / Oldest / Name」叠在一起）。但 `--surface` 是实色，壁纸模式
+   下它在列表顶部横出一条不透明的暗带 —— 整列都透着壁纸，就这一条不透。
+   留 70%：底下滚过的行糊成一片读不出字，同时壁纸的明暗还看得见。 */
+:root.has-custom-background .skill-sort {
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
 }
 
 /* Git diff 默认用 --bg 铺底，会遮住主界面的壁纸。文件选择态和 ref 控件保留

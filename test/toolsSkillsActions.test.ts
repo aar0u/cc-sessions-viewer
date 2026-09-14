@@ -117,6 +117,7 @@ const conflict = (name: string): AdoptConflict => ({
   files: [],
   skillMd: { plus: 2, minus: 1, truncated: false, hunks: [], clipped: false },
   suggestedRename: `${name}-from-cc-switch`,
+  mainInStore: true,
 })
 
 beforeEach(() => {
@@ -200,17 +201,37 @@ describe('收编计划', () => {
     expect(inMainStore(`${win}-backup\\pinme`, win)).toBe(false)
   })
 
-  it('整批收编把所有 skill 的外部内容汇到一起', () => {
-    const s = scan({
-      skills: [
-        entry({ name: 'a', bodies: [body({ path: '/ext/a' }), body({ path: `${MAIN}/a` })] }),
-        entry({ name: 'b', bodies: [body({ path: '/ext/b' })] }),
-      ],
-    })
-    expect(adoptAllTargets(s, MAIN).map((r) => `${r.name}:${r.body}`)).toEqual([
+  it('整批收编把列表里每条 skill 的外部内容汇到一起', () => {
+    const skills = [
+      entry({ name: 'a', bodies: [body({ path: '/ext/a' }), body({ path: `${MAIN}/a` })] }),
+      entry({ name: 'b', bodies: [body({ path: '/ext/b' })] }),
+    ]
+    expect(adoptAllTargets(skills, MAIN).map((r) => `${r.name}:${r.body}`)).toEqual([
       'a:/ext/a',
       'b:/ext/b',
     ])
+  })
+
+  /**
+   * 吃的是**筛完的那份列表**，不是整份扫描结果。按钮钉在角标筛选器旁边，筛到
+   * 「重复 26」点下去却搬全机器 43 条，是屏幕上写一件事、实际做另一件事。
+   */
+  it('列表被筛短了，就只收编筛出来的那几条', () => {
+    const all = [
+      entry({ name: 'a', bodies: [body({ path: '/ext/a' })] }),
+      entry({ name: 'b', bodies: [body({ path: '/ext/b' })] }),
+      entry({ name: 'c', bodies: [body({ path: '/ext/c' })] }),
+    ]
+    const shown = all.filter((e) => e.name !== 'b')
+    expect(adoptAllTargets(shown, MAIN).map((r) => r.name)).toEqual(['a', 'c'])
+  })
+
+  /** 列表被筛空（或者筛出来的全在主 store 里）→ 没有目标，UI 据此把按钮置灰。 */
+  it('列表空的时候没有任何目标', () => {
+    expect(adoptAllTargets([], MAIN)).toEqual([])
+    expect(
+      adoptAllTargets([entry({ name: 'a', bodies: [body({ path: `${MAIN}/a` })] })], MAIN),
+    ).toEqual([])
   })
 })
 

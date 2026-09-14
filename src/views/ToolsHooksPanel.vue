@@ -12,6 +12,7 @@
 //    一下」。所以给一个拿假事件真跑一遍的入口，把喂进去的 JSON 和输出都摊开。
 import { computed, nextTick, ref, watch } from 'vue'
 import { revealSelected } from '../listScroll'
+import { useHStrip } from '../hstrip'
 import { highlightSegments } from '../format'
 import type { Agent, HookEdit, HookEntry, HookScan, HookWriteReport } from '../types'
 import * as api from '../api'
@@ -85,6 +86,39 @@ const badSources = computed(() => sourceErrors(scan.value))
 
 /** 健康条上那排事件角标：只列已经配了 hook 的。全量目录在「添加」里。 */
 const configuredEvents = computed(() => (scan.value?.events ?? []).filter((e) => e.configured > 0))
+
+// 事件常有十几个，健康条里从来塞不下。吃掉剩余宽度、自己横向滑（和会话页 tab 条、
+// Skills 的角标条同一份实现，见 `hstrip.ts`）。
+// 以前这儿是原生 `overflow-x: auto` + 藏掉滚动条：只有触控板横扫才动得了，鼠标滚轮
+// 滚下去一点反应都没有，等于右边那几个事件根本点不到。
+const eventsViewportRef = ref<HTMLElement>()
+const eventsTrackRef = ref<HTMLElement>()
+const {
+  panning: eventsPanning,
+  canLeft: eventsCanLeft,
+  canRight: eventsCanRight,
+  trackStyle: eventsTrackStyle,
+  revealEl: revealEvent,
+  onWheel: onEventsWheel,
+  onPanPointerDown: onEventsPanDown,
+} = useHStrip(eventsViewportRef, eventsTrackRef)
+
+/**
+ * 点完事件再把它滑回视野。
+ *
+ * 要等一拍：点下去左边的「12 hooks」会变成「3/12 hooks」，那几个字一变宽，滑动区就
+ * 跟着窄一截 —— 同一拍量到的是上一个宽度，露出来的那一项右边还是缺一角。
+ */
+function revealEventAfterFilter(ev: MouseEvent) {
+  const el = ev.currentTarget as HTMLElement
+  nextTick(() => revealEvent(el))
+}
+
+/** 两侧淡出多少。滑到头那侧收回 0，免得凭空吃掉一个角标的可读性。 */
+const eventsFade = computed(() => ({
+  '--events-fade-l': eventsCanLeft.value ? '20px' : '0px',
+  '--events-fade-r': eventsCanRight.value ? '20px' : '0px',
+}))
 
 function short(path: string) {
   return shortenPath(path, home.value)
@@ -272,21 +306,36 @@ function openTest(entry: HookEntry) {
         <b>{{ counts[state] }}</b>
       </button>
 
-      <span class="tools-gap" />
-
-      <div class="hook-events" v-tooltip="t('tools.hooks.eventsTip')">
-        <span class="hook-events-label">{{ t('tools.hooks.events') }}</span>
-        <button
-          v-for="e in configuredEvents"
-          :key="e.name"
-          type="button"
-          class="hook-event"
-          :class="{ active: filter.event === e.name }"
-          @click="filter = toggleEvent(filter, e.name)"
+      <!-- 「Events」这个字留在滑动区外面：它一起滑走的话，剩下一排光秃秃的
+           PreToolUse / Notification，得先猜这排是什么才能点。 -->
+      <span class="hook-events-label" v-tooltip="t('tools.hooks.eventsTip')">
+        {{ t('tools.hooks.events') }}
+      </span>
+      <div
+        ref="eventsViewportRef"
+        class="hook-events"
+        :style="eventsFade"
+        @wheel="onEventsWheel"
+        @pointerdown="onEventsPanDown"
+      >
+        <div
+          ref="eventsTrackRef"
+          class="hook-events-track"
+          :class="{ panning: eventsPanning }"
+          :style="eventsTrackStyle"
         >
-          {{ e.name }}
-          <b>{{ e.configured }}</b>
-        </button>
+          <button
+            v-for="e in configuredEvents"
+            :key="e.name"
+            type="button"
+            class="hook-event"
+            :class="{ active: filter.event === e.name }"
+            @click="filter = toggleEvent(filter, e.name); revealEventAfterFilter($event)"
+          >
+            {{ e.name }}
+            <b>{{ e.configured }}</b>
+          </button>
+        </div>
       </div>
     </template>
     <span v-else-if="loading" class="tools-health-empty">{{ t('tools.hooks.loading') }}</span>
@@ -565,28 +614,54 @@ function openTest(entry: HookEntry) {
 .hook-defs {
   /* 和 `.tools-health-total` 一样不换行。健康条是一条 flex，窄下来时这一项会被压到
      文字宽度以下，于是「36 处落点」当场断成两行 —— 而旁边那一项是 nowrap 的，
-     两行一高一低更难看。挤出去的那部分交给 `.hook-events` 吸收，它本来就是
-     `min-width: 0` + `overflow-x: auto`。 */
+     两行一高一低更难看。挤出去的那部分交给 `.hook-events` 吸收 —— 那一格是
+     `flex: 1` + `min-width: 0`，本来就是这一行里唯一该被压缩的。 */
   flex-shrink: 0;
   white-space: nowrap;
   font-size: 11.5px;
   color: var(--text-mute);
 }
-/* 事件常有十几个，健康条里塞不下。横向滚 + 右边一道渐隐 —— 硬切一半的
-   「SessionSta」读起来像渲染坏了，渐隐读起来才是「右边还有」。 */
+/* 事件常有十几个，健康条里塞不下。吃掉这一行剩下的宽度，装不下就横着滑
+   （实现在 `hstrip.ts`，和会话页 tab 条、Skills 的角标条同一份）。
+   `min-width: 0` 不能省 —— flex 子项默认 `min-width: auto`，十几个不换行的角标会把
+   容器顶到内容那么宽，于是「吃掉剩余宽度」变成「把右边的 + / ⟳ 挤出去」。 */
 .hook-events {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  /* 被切掉的那半个角标淡出，顺带就是「这边还有」的提示 —— 硬切一半的
+     「SessionSta」读起来像渲染坏了。两侧的宽度由 JS 按「还能不能往这边滑」给：
+     以前右边那道渐隐是写死的，滑到底了还在淡，最后一个事件永远像没显示全。 */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--events-fade-l, 0px),
+    #000 calc(100% - var(--events-fade-r, 0px)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--events-fade-l, 0px),
+    #000 calc(100% - var(--events-fade-r, 0px)),
+    transparent 100%
+  );
+}
+.hook-events-track {
   display: flex;
   align-items: center;
   gap: 4px;
-  min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-  padding-right: 8px;
+  flex: 0 0 auto;
+  transform: translateX(0);
+  transition: transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: transform;
 }
-.hook-events::-webkit-scrollbar {
-  display: none;
+/* 滚轮 / 拖拽进行中：关掉动画，1:1 跟手 */
+.hook-events-track.panning {
+  transition: none;
 }
 .hook-events-label {
   flex-shrink: 0;

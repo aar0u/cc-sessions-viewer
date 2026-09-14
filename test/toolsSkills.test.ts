@@ -23,6 +23,12 @@ import {
   queryRank,
   resetSkillFilter,
   riskRank,
+  matchesScopes,
+  scopeCounts,
+  skillScopes,
+  storeScopeMap,
+  SKILL_SCOPES,
+  type SkillScope,
   shortenPath,
   skillFilter,
   isSkillPinned,
@@ -454,6 +460,7 @@ describe('搜索与过滤', () => {
 
   it('多个条件同时生效', () => {
     const out = filterSkills(skills, {
+      ...emptyFilter(),
       query: 'hyper',
       agent: 'claude',
       badge: 'duplicate',
@@ -483,6 +490,117 @@ describe('来源过滤', () => {
     expect(filterSkills(mixed, { ...emptyFilter(), badge: 'duplicate' }).map((s) => s.name)).toEqual([
       'hyperframes',
     ])
+  })
+})
+
+describe('用户级 / 项目级', () => {
+  const PROJ = '/Users/wuchao/develop/sales-app/.agents/skills'
+  const scopes = storeScopeMap(scan)
+
+  /** 只在项目目录里 —— 换个项目就没了。 */
+  const projectOnly: SkillEntry = {
+    name: 'sales-report',
+    refs: [realDir(PROJ, 'sales-report', ['claude'])],
+    bodies: [body(PROJ, 'sales-report')],
+    badges: [],
+    risk: 'none',
+    truncated: false,
+    description: null,
+    git: null,
+  }
+
+  /** 两边各一份：全局装过，项目里又装了一遍。 */
+  const bothScopes: SkillEntry = {
+    name: 'api-add',
+    refs: [realDir(MAIN, 'api-add'), realDir(PROJ, 'api-add', ['claude'])],
+    bodies: [body(MAIN, 'api-add'), body(PROJ, 'api-add')],
+    badges: ['duplicate'],
+    risk: 'none',
+    truncated: false,
+    description: null,
+    git: null,
+  }
+
+  const mixed = [...skills, projectOnly, bothScopes]
+
+  it('档次来自 store，不是 skill 自己', () => {
+    expect(storeScopeMap(scan).get(MAIN)).toBe('user')
+    expect(storeScopeMap(scan).get(PROJ)).toBe('project')
+  })
+
+  it('null scan 得到空表', () => {
+    expect(storeScopeMap(null).size).toBe(0)
+  })
+
+  it('两边都有的那条两档都算', () => {
+    expect(skillScopes(gitPush, scopes)).toEqual(['user'])
+    expect(skillScopes(projectOnly, scopes)).toEqual(['project'])
+    expect(skillScopes(bothScopes, scopes)).toEqual(['user', 'project'])
+  })
+
+  it('永远按 SKILL_SCOPES 的次序返回 —— 行上那两个记号不能一行一个顺序', () => {
+    expect(skillScopes(bothScopes, scopes)).toEqual([...SKILL_SCOPES])
+  })
+
+  it('只有内容没有引用也算 —— 项目里躺着一份没人链的，它照样跟着仓库走', () => {
+    const orphan: SkillEntry = { ...projectOnly, refs: [] }
+    expect(skillScopes(orphan, scopes)).toEqual(['project'])
+  })
+
+  it('认不出来的 store 不硬归进任一档', () => {
+    expect(skillScopes(gitPush, new Map())).toEqual([])
+  })
+
+  it('两档都占的两边各记一次，所以两个数加起来可以超过总数', () => {
+    const counts = scopeCounts(mixed, scopes)
+    expect(counts).toEqual({ user: 4, project: 2 })
+    expect(counts.user + counts.project).toBeGreaterThan(mixed.length)
+  })
+
+  it('两档都勾 = 不过滤', () => {
+    expect(filterSkills(mixed, emptyFilter(), scopes)).toHaveLength(mixed.length)
+  })
+
+  it('默认就是两档都勾', () => {
+    expect([...emptyFilter().scopes].sort()).toEqual([...SKILL_SCOPES].sort())
+  })
+
+  it('只勾项目级：项目独有的和两边都有的都留下', () => {
+    const only = filterSkills(mixed, { ...emptyFilter(), scopes: ['project'] }, scopes)
+    expect(only.map((s) => s.name)).toEqual(['sales-report', 'api-add'])
+  })
+
+  it('只勾用户级：项目独有的那条被挡掉', () => {
+    const only = filterSkills(mixed, { ...emptyFilter(), scopes: ['user'] }, scopes)
+    expect(only.map((s) => s.name)).not.toContain('sales-report')
+    expect(only.map((s) => s.name)).toContain('api-add')
+  })
+
+  it('一档都不勾就是空列表 —— 字面结果，不偷偷当成不过滤', () => {
+    expect(filterSkills(mixed, { ...emptyFilter(), scopes: [] }, scopes)).toHaveLength(0)
+  })
+
+  it('不传 store 表时一条都不挡 —— 认不出档次不该让行凭空消失', () => {
+    const only: SkillScope[] = ['project']
+    expect(filterSkills(mixed, { ...emptyFilter(), scopes: only })).toHaveLength(mixed.length)
+    expect(matchesScopes(gitPush, [], new Map())).toBe(true)
+  })
+
+  it('和别的筛子叠加而不是互相顶掉', () => {
+    const both = filterSkills(mixed, { ...emptyFilter(), scopes: ['project'], badge: 'duplicate' }, scopes)
+    expect(both.map((s) => s.name)).toEqual(['api-add'])
+  })
+
+  it('visibleSkills 一路把 store 表带到过滤那一层', () => {
+    const shown = visibleSkills(
+      mixed,
+      { ...emptyFilter(), scopes: ['project'] },
+      [],
+      [],
+      'name',
+      scopes,
+    )
+    expect(shown.map((s) => s.name)).toEqual(['api-add', 'sales-report'])
   })
 })
 

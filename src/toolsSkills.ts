@@ -260,6 +260,97 @@ export function healthTip(health: RefHealth, home: string): { key: string; vars?
 }
 
 // ---------------------------------------------------------------------------
+// 用户级 / 项目级
+// ---------------------------------------------------------------------------
+
+/**
+ * 一条 skill 所在的档。
+ *
+ * 后端的 `ConfigScope` 有三档，但 skill 的 store 只会是 `user` 或 `project`
+ * （`local` 是 claude 那个「和 user 同住一个文件、只对某个项目生效」的 MCP 特例，
+ * skills 没有对应物）。真出现了也并进 `project` —— 它跟着项目走，这是用户要分的那刀。
+ */
+export type SkillScope = 'user' | 'project'
+
+export const SKILL_SCOPES: readonly SkillScope[] = ['user', 'project'] as const
+
+/**
+ * store 路径 → 它是哪一档。
+ *
+ * 档次是 **store 的属性，不是 skill 的**：同一条 skill 可以一份躺在 `~/.agents/skills`、
+ * 另一份躺在 `<repo>/.claude/skills`，那它两档都算。所以这里先把扫描结果里的 store
+ * 摊成一张表，判定一条 skill 时再回来查。
+ */
+export function storeScopeMap(scan: SkillScan | null): Map<string, SkillScope> {
+  const out = new Map<string, SkillScope>()
+  for (const store of scan?.stores ?? []) {
+    out.set(store.path, store.scope === 'user' ? 'user' : 'project')
+  }
+  return out
+}
+
+/**
+ * 这条 skill 出现在哪几档，按 `SKILL_SCOPES` 的次序。
+ *
+ * 引用和内容**都算**。只看引用会漏掉「项目目录里躺着一份实体、还没有谁链过去」的那种
+ * —— 它照样是跟着这个仓库走的东西，换个项目就没了。
+ *
+ * 认不出来的 store 不算任何一档（返回空数组），由调用方决定怎么处理。把它硬归进
+ * user 会让列表里冒出一条没有依据的「用户级」。
+ */
+export function skillScopes(
+  entry: SkillEntry,
+  storeScopes: ReadonlyMap<string, SkillScope>,
+): SkillScope[] {
+  let user = false
+  let project = false
+  const mark = (store: string | null) => {
+    const scope = store == null ? undefined : storeScopes.get(store)
+    if (scope === 'user') user = true
+    else if (scope === 'project') project = true
+  }
+  for (const ref of entry.refs) mark(ref.store)
+  for (const body of entry.bodies) mark(body.store)
+  return SKILL_SCOPES.filter((s) => (s === 'user' ? user : project))
+}
+
+/**
+ * 每一档各有几条。两档都占的那条**两边都记一次** —— 和角标那排一样（一条 skill 可以
+ * 既重复又两跳），所以两个数加起来可以超过总数。
+ */
+export function scopeCounts(
+  skills: SkillEntry[],
+  storeScopes: ReadonlyMap<string, SkillScope>,
+): Record<SkillScope, number> {
+  const out: Record<SkillScope, number> = { user: 0, project: 0 }
+  for (const entry of skills) {
+    for (const scope of skillScopes(entry, storeScopes)) out[scope] += 1
+  }
+  return out
+}
+
+/**
+ * 档次过滤。
+ *
+ * 两档都勾 = 不过滤，这是默认态，也是绝大多数时候的样子 —— 所以先短路掉，不用去查表。
+ * 一档都不勾确实会得到空列表：那是用户自己点出来的字面结果，再点一下就回来了，比
+ * 「勾了等于没勾」好懂。
+ *
+ * 认不出 store 的（`skillScopes` 返回空）一律放行：不知道它是哪一档，就不该拿档次
+ * 把它藏起来。
+ */
+export function matchesScopes(
+  entry: SkillEntry,
+  scopes: SkillScope[],
+  storeScopes: ReadonlyMap<string, SkillScope>,
+): boolean {
+  if (scopes.length >= SKILL_SCOPES.length) return true
+  const mine = skillScopes(entry, storeScopes)
+  if (mine.length === 0) return true
+  return mine.some((s) => scopes.includes(s))
+}
+
+// ---------------------------------------------------------------------------
 // 过滤 / 搜索 / 排序
 // ---------------------------------------------------------------------------
 
@@ -274,6 +365,8 @@ export interface SkillFilter {
   fromGit: boolean
   /** 只看风险不低于该等级的。'none' = 不过滤。 */
   minRisk: RiskLevel
+  /** 只看这几档的。两档都在 = 不过滤（也是默认）。 */
+  scopes: SkillScope[]
 }
 
 export const emptyFilter = (): SkillFilter => ({
@@ -282,6 +375,7 @@ export const emptyFilter = (): SkillFilter => ({
   badge: null,
   fromGit: false,
   minRisk: 'none',
+  scopes: [...SKILL_SCOPES],
 })
 
 export function matchesQuery(entry: SkillEntry, query: string): boolean {
@@ -332,7 +426,11 @@ export function queryPath(entry: SkillEntry, query: string): string | null {
   )
 }
 
-export function filterSkills(skills: SkillEntry[], filter: SkillFilter): SkillEntry[] {
+export function filterSkills(
+  skills: SkillEntry[],
+  filter: SkillFilter,
+  storeScopes: ReadonlyMap<string, SkillScope> = new Map(),
+): SkillEntry[] {
   const floor = riskRank(filter.minRisk)
   return skills.filter((s) => {
     if (!matchesQuery(s, filter.query)) return false
@@ -340,6 +438,7 @@ export function filterSkills(skills: SkillEntry[], filter: SkillFilter): SkillEn
     if (filter.badge && !s.badges.includes(filter.badge)) return false
     if (filter.fromGit && !s.git) return false
     if (floor > 0 && riskRank(s.risk) < floor) return false
+    if (!matchesScopes(s, filter.scopes, storeScopes)) return false
     return true
   })
 }
@@ -363,9 +462,10 @@ export function visibleSkills(
   agents: Agent[],
   pinned: string[] = [],
   sort: SkillSort = 'newest',
+  storeScopes: ReadonlyMap<string, SkillScope> = new Map(),
 ): SkillEntry[] {
   return sortSkills(
-    filterSkills(skills, filter).filter((s) => matchesAgents(s, agents)),
+    filterSkills(skills, filter, storeScopes).filter((s) => matchesAgents(s, agents)),
     pinned,
     filter.query,
     sort,
