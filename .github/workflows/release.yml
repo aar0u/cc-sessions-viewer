@@ -163,6 +163,61 @@ jobs:
           ./appimagetool squashfs-root "$APPIMAGE"
           rm -rf squashfs-root appimagetool
 
+      - name: Package Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          node <<'SCRIPT'
+          const fs = require('fs')
+          const path = require('path')
+          const { execSync } = require('child_process')
+
+          const pkg = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'))
+          const version = pkg.version
+          const targetDir = path.resolve('src-tauri/target/release')
+          const bundleDir = path.resolve('src-tauri/target/release/bundle')
+          fs.mkdirSync(bundleDir, { recursive: true })
+
+          const candidates = ['Sessions Viewer.exe', 'cc-sessions-viewer.exe']
+          let exePath = null
+          for (const name of candidates) {
+            const p = path.join(targetDir, name)
+            if (fs.existsSync(p)) {
+              exePath = p
+              break
+            }
+          }
+
+          if (!exePath) {
+            for (const f of fs.readdirSync(targetDir)) {
+              if (f.endsWith('.exe') && !f.includes('build') && !f.includes('setup')) {
+                exePath = path.join(targetDir, f)
+                break
+              }
+            }
+          }
+
+          if (!exePath) {
+            throw new Error(`Could not find compiled binary in ${targetDir}`)
+          }
+
+          const tempDir = fs.mkdtempSync(path.join(bundleDir, 'portable-'))
+          const destExe = path.join(tempDir, 'Sessions Viewer.exe')
+          fs.copyFileSync(exePath, destExe)
+
+          const zipName = `Sessions.Viewer_${version}_x64_portable.zip`
+          const zipPath = path.join(bundleDir, zipName)
+
+          try {
+            execSync(`7z a -tzip "${zipPath}" "Sessions Viewer.exe"`, { cwd: tempDir, stdio: 'inherit' })
+          } catch {
+            execSync(`powershell -Command "Compress-Archive -Path 'Sessions Viewer.exe' -DestinationPath '${zipPath}' -Force"`, { cwd: tempDir, stdio: 'inherit' })
+          }
+
+          fs.rmSync(tempDir, { recursive: true, force: true })
+          console.log(`Created portable zip: ${zipPath}`)
+          SCRIPT
+
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -176,6 +231,7 @@ jobs:
             src-tauri/target/**/release/bundle/**/*.AppImage
             src-tauri/target/**/release/bundle/**/*.sig
             src-tauri/target/**/release/bundle/**/latest.json
+            src-tauri/target/**/release/bundle/**/*.zip
           if-no-files-found: error
 
   publish:
